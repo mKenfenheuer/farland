@@ -20,6 +20,7 @@ Checks: >
   -modernize-use-trailing-return-type,
   -modernize-use-designated-initializers,
   performance-*,
+  -performance-enum-size,
   portability-*,
   -portability-avoid-pragma-once,
   readability-*,

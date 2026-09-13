@@ -219,3 +219,12 @@ TEST_CASE("Nested constructed values: MCS Connect-Initial prefix ([MS-RDPBCGR] 2
     });
     CHECK(to_hex(w.view()) == wire);
 }
+
+TEST_CASE("Raw unsigned decoding tolerates a missing sign octet (mstsc MCS parameters)")
+{
+    const auto bytes = hex("02 02 ff ff 02 03 00 ff f8 02 01 00");
+    Reader r(bytes);
+    CHECK(ber::decode_raw_unsigned(ber::read_tlv(r, Rules::ber).value()).value() == 0xFFFF);
+    CHECK(ber::decode_raw_unsigned(ber::read_tlv(r, Rules::ber).value()).value() == 0xFFF8);
+    CHECK(ber::decode_raw_unsigned(ber::read_tlv(r, Rules::ber).value()).value() == 0);
+}

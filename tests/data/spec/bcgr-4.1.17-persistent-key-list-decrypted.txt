@@ -1,0 +1,32 @@
+# [MS-RDPBCGR] 4.1.17 Client Persistent Key List PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - MCS userData length and TPKT length recomputed (TPKT 269 -> 257)
+#   - every other byte is unchanged from the spec's decrypted dump
+#    0  TPKT length 257; 4 X.224 DT; 7 MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 242
+#   15  share control: totalLength 242, pduType 0x0017 (DATAPDU | version), pduSource 1007
+#   21  share data: shareID 0x000103ea, pad1 0x00, streamId 1, uncompressedLength 0,
+#       pduType2 43, compressedType 0, compressedLength 0
+#   33  numEntriesCache0..4 = 0, 0, 25, 0, 0
+#   43  totalEntriesCache0..4 = 0, 0, 25, 0, 0
+#   53  bBitMask 0x03 (PERSIST_FIRST_PDU | PERSIST_LAST_PDU); Pad2; Pad3
+#   57  25 x 8-byte cache-2 keys (Key1, Key2)
+
+C> 03 00 01 01 02 f0 80 64 00 06 03 eb 70 80 f2 f2
+   00 17 00 ef 03 ea 03 01 00 00 01 00 00 2b 00 00
+   00 00 00 00 00 19 00 00 00 00 00 00 00 00 00 19
+   00 00 00 00 00 03 00 00 00 a3 1e 51 16 48 29 22
+   78 61 f7 89 9c cd a9 66 a8 44 4e b7 bd b4 6d 9e
+   f6 39 91 64 af bc c3 70 02 9f aa fa fd 6e ba 58
+   dc 7b af de 06 56 3a c2 ce 68 ba 54 b6 bf 9e bc
+   d6 d1 22 c0 98 63 e9 41 fe 38 6c 50 35 0e db b3
+   f5 45 cc 18 2d 30 44 fc 88 e5 c3 5d 23 63 f6 cf
+   53 0a a8 01 b6 10 51 a5 28 70 81 6c 59 19 29 00
+   c9 e2 b5 e7 a7 46 04 4e 1b 72 8d 4a dd 81 bb 14
+   16 53 6a 4e 3c 48 72 66 c9 6c 77 4b 4a 32 48 2c
+   c6 02 54 56 f2 81 c9 85 56 2c 0a 3d 54 86 9d 2b
+   97 63 0f 0a 36 f8 63 79 3e c9 70 41 4b ec a8 7c
+   7b 79 28 b6 b4 a6 43 24 de cb 9c ff a2 29 3c 02
+   56 64 df 80 b0 0d 6e e7 1a 83 c7 54 31 aa 8a 90
+   b3

@@ -1,0 +1,48 @@
+# [MS-RDPBCGR] 4.3.2 Plain Notify
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 625; 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 610 (82 62)
+#   15  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x0302 (junk)
+#   19  dataSignature (8-byte MAC)
+#   27  RC4-encrypted payload, 598 bytes
+
+S> 03 00 02 71 02 f0 80 68 00 01 03 eb 70 82 62 08
+   08 02 03 90 94 9a cc a2 38 22 3b 03 6e a4 a2 e3
+   1c 4d 55 aa 56 d3 ca f8 e6 52 99 1e b5 f1 a0 42
+   4e 89 64 83 54 1f da 89 a7 f5 53 8b 61 bb 73 b5
+   58 d4 6b bc 28 c2 84 c3 90 b4 45 b5 97 d5 d2 05
+   bc 66 a4 d4 73 31 7e 0e 4d 42 12 0a 95 88 18 ff
+   f6 87 07 71 38 5b 3e 48 e6 d4 d0 2f c2 80 4c 7f
+   7d 88 78 5f ec 06 cf 8d cb 91 d6 d3 7c 56 45 59
+   7c 26 05 ed 14 92 a4 a5 a7 d8 98 1b f0 bf be b0
+   bf e3 35 e8 38 8a ad 12 ec e1 72 9c 89 0a 1e a5
+   dc 19 48 5e 2a 7f 9e d0 11 92 70 cc 01 45 50 d5
+   1e c7 f9 ff 74 c1 74 45 04 4e 4f 5d 49 ce 41 b3
+   ed 7f 5c 0e bb 37 50 d0 f7 79 e9 d7 c0 55 4a 1c
+   54 29 84 62 3f c9 68 04 5f b3 51 41 89 2b 36 a6
+   65 0a 4e da 92 61 38 a5 73 16 a5 b4 cd 87 db 84
+   10 3e b9 1f ad 3e df 50 37 5b 8e ac cb e9 e5 51
+   90 bf e1 e5 0f 16 f2 70 b9 dc 89 2a 46 53 c1 fa
+   e2 ef 0a bb ce 16 a1 2a 2d 24 1e 21 fe b9 b6 54
+   2a 6e ff e5 b7 d3 84 52 19 dd 41 eb eb 4b 81 ab
+   20 11 8c 18 19 45 e9 23 00 58 a5 71 94 6c c0 58
+   70 9b 1d 75 f6 e4 f7 18 17 f9 8c 1d e9 c1 9b 76
+   21 a3 6e f6 3e 4b 82 54 f2 16 96 21 0e 1c 54 e9
+   d1 65 18 0f e5 f9 45 bf d7 f9 24 a9 7e 3e 6a 73
+   23 fc 3c 0a 04 52 c4 ee fa 13 64 21 a1 47 2d 4a
+   4f 00 c0 80 8b 9c a6 ec e9 94 57 a4 3d 88 77 e5
+   b6 71 e6 a1 15 a4 c6 02 64 a1 af 34 b9 73 87 e1
+   22 1b 33 a5 bf bb 7e 96 bc 31 92 f8 4a bc ab f8
+   3f 5b 85 1b 23 75 46 45 b7 31 08 45 ca de 1f df
+   49 3e 37 f1 2e af 16 d2 5c 3e 2e 30 68 36 d1 ae
+   9e 0d bf ff 53 ce 96 f6 6f 31 60 f1 40 e0 6f 0c
+   a1 b3 b3 6b 04 99 a1 f6 b9 cf 69 21 e4 a2 bc 07
+   81 c4 36 dc 9e 99 9d 50 da 62 55 71 f0 5d 3d fd
+   08 73 54 b6 cb 48 dd 5d 54 1a 08 09 ae 9f 98 b0
+   3b e3 2a a8 e8 61 1f 4f e5 11 d4 4f 8e e0 96 8d
+   c8 ed d1 9e f2 27 1f c6 79 dc a2 df 52 01 21 be
+   13 7f c6 55 bb 08 b1 d3 2d de e3 7b 8b 11 95 53
+   af 4b bf 80 e9 5f 54 d4 96 f1 da 35 ee d4 50 e8
+   28 58 aa 59 86 db f3 e5 44 a3 8b 3c 40 fd f5 b5
+   9f 1d b8 1c 30 43 52 9f 4b 34 4b c7 59 6b b6 06
+   e7

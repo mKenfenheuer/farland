@@ -1,0 +1,8 @@
+# [MS-RDPBCGR] 4.2.3 MCS Disconnect Provider Ultimatum PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 9; 4 X.224 DT
+#    7  PER disconnectProviderUltimatum (0x21 0x80): reason rn-user-requested (3)
+# The spec does not say which side sent it. In a client-initiated disconnect the
+# client sends it, so this file records it as C>.
+
+C> 03 00 00 09 02 f0 80 21 80

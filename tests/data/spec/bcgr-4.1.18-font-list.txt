@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.1.18 Client Font List PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 52; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 38 (26)
+#   14  TS_SECURITY_HEADER1: flags 0x0008 (SEC_ENCRYPT), flagsHi 0xfe80 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 26 bytes
+
+C> 03 00 00 34 02 f0 80 64 00 06 03 eb 70 26 08 00
+   80 fe 98 19 5c fb 92 92 f5 97 18 b2 b7 c3 13 dc
+   03 fb 64 45 c0 43 6d 91 37 26 fd 8e 71 e6 f2 2a
+   1e ae 35 03

@@ -1,0 +1,16 @@
+# [MS-RDPBCGR] 4.2.2 Server Shutdown Request Denied PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# SPEC ERRATUM: the dump's TPKT length is 0x0024 (36), and the annotation agrees, but the
+# dump holds 44 bytes and MCS userData length 30 implies 44. The wire file keeps the bytes
+# as printed and fails the TPKT length check on purpose. The -decrypted rebuild
+# uses the real size 44 as its 'before' value.
+# Spec annotation also says flags 0x0008; the dump bytes are 08 08 (0x0808); bytes kept.
+#    0  TPKT length 44; 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 30 (1e)
+#   14  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x0010 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 18 bytes
+
+S> 03 00 00 24 02 f0 80 68 00 01 03 eb 70 1e 08 08
+   10 00 31 19 b0 6c e3 cf 5e 0a df b6 5f 69 ce 41
+   e3 23 f1 f6 50 4a 59 2e af e8 80 fb

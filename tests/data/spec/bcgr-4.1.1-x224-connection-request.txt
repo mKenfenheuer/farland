@@ -1,0 +1,11 @@
+# [MS-RDPBCGR] 4.1.1 Client X.224 Connection Request PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# Offsets are decimal, from the first byte of the record.
+#    0  TPKT: version 3, length 44
+#    4  X.224 CR: LI 39, code 0xe0, dst-ref 0, src-ref 0, class 0
+#   11  routing token: "Cookie: mstshash=eltons" + CR LF (25 bytes)
+#   36  RDP_NEG_REQ: type 1, flags 0, length 8, requestedProtocols 0 (PROTOCOL_RDP)
+
+C> 03 00 00 2c 27 e0 00 00 00 00 00 43 6f 6f 6b 69
+   65 3a 20 6d 73 74 73 68 61 73 68 3d 65 6c 74 6f
+   6e 73 0d 0a 01 00 08 00 00 00 00 00

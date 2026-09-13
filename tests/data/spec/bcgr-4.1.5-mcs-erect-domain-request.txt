@@ -1,0 +1,6 @@
+# [MS-RDPBCGR] 4.1.5 Client MCS Erect Domain Request PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 12; 4 X.224 DT
+#    7  PER erectDomainRequest (0x04); 8 subHeight len 1 value 0; 10 subInterval len 1 value 0
+
+C> 03 00 00 0c 02 f0 80 04 01 00 01 00

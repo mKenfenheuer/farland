@@ -1,0 +1,7 @@
+# [MS-RDPBCGR] 4.1.7 Server MCS Attach-User Confirm PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 11; 4 X.224 DT
+#    7  PER attachUserConfirm with initiator (0x2e); 8 result rt-successful (0)
+#    9  initiator 0x0006 + 1001 = 1007 (user channel ID)
+
+S> 03 00 00 0b 02 f0 80 2e 00 00 06

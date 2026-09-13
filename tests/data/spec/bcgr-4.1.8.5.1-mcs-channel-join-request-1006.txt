@@ -1,0 +1,8 @@
+# [MS-RDPBCGR] 4.1.8.5.1 Client Join Request PDU for Channel 1006 (rdpsnd Channel)
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 12; 4 X.224 DT
+#    7  PER channelJoinRequest (0x38)
+#    8  initiator 0x0006 + 1001 = 1007
+#   10  channelId 1006 (rdpsnd)
+
+C> 03 00 00 0c 02 f0 80 38 00 06 03 ee

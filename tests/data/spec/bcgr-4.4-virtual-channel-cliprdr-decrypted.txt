@@ -1,0 +1,14 @@
+# [MS-RDPBCGR] 4.4 Annotated Server-to-Client Virtual Channel PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - MCS userData length and TPKT length recomputed (TPKT 42 -> 30)
+#   - every other byte is unchanged from the spec's decrypted dump
+#   (the correct wire length 42 was used as the 'before' value here, not the bogus 0x2e)
+#    0  TPKT length 30; 4 X.224 DT; 7 MCS SendDataIndication (0x68): initiator 1002, channel 1005 (cliprdr), prio low (0xf0), begin|end, length 16 (10)
+#   14  CHANNEL_PDU_HEADER: length 8, flags 0x00000003 (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST)
+#   22  channel data (8): 03 00 01 00 00 00 00 00; per [MS-RDPECLIP] this is msgType 3
+#       (Format List Response), msgFlags 1 (CB_RESPONSE_OK), dataLen 0
+
+S> 03 00 00 1e 02 f0 80 68 00 01 03 ed f0 10 08 00
+   00 00 03 00 00 00 03 00 01 00 00 00 00 00

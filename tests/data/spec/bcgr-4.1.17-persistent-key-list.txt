@@ -1,0 +1,25 @@
+# [MS-RDPBCGR] 4.1.17 Client Persistent Key List PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 269; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 254 (80 fe)
+#   15  TS_SECURITY_HEADER1: flags 0x0008 (SEC_ENCRYPT), flagsHi 0x1690 (junk)
+#   19  dataSignature (8-byte MAC)
+#   27  RC4-encrypted payload, 242 bytes
+
+C> 03 00 01 0d 02 f0 80 64 00 06 03 eb 70 80 fe 08
+   00 90 16 ce c6 4a 69 d9 d3 49 9e 10 a5 04 0f cf
+   ab 4f 6a 3b da 31 03 4f 29 bd 64 3e 98 46 ec 0a
+   1d cd 9c ad 13 58 a3 bd 8b 9d ae f1 e9 9d 43 96
+   53 f5 d0 b7 50 88 f3 81 f1 cb ad 17 55 75 9c 5f
+   ef ec a9 35 40 b3 74 06 d1 ae d1 15 9f ed 91 49
+   a6 3d 1f c1 31 b1 17 58 da 0e 24 df 1f 87 86 39
+   d1 46 66 ea 0e 98 d0 4b 5b 7b 01 b9 8a e8 68 32
+   80 da b9 58 a6 9f 4f b5 ba 79 04 ae d9 63 c0 6a
+   a8 81 51 97 25 0b 3f c3 d2 47 fa 0a 7a 22 1f bd
+   5f 4e b8 00 ea 32 06 e6 af 15 e4 6f b3 d3 c1 4c
+   cb 0a 8e dd a7 29 07 03 59 c1 c1 08 1b aa 56 3c
+   f5 d0 89 e3 cd cf 26 8b 65 59 0a cb 7e 81 b6 33
+   bb 4d 9a 13 80 e7 57 2a 0d 1d 11 b4 18 c4 31 2f
+   4f 89 77 09 94 2e c3 8e bf fd 6a 39 2b 47 74 0e
+   12 74 ec 45 14 c3 6b 27 d6 b6 93 11 a4 bc 46 de
+   69 4a b4 54 c7 24 24 99 8f 60 b7 21 59

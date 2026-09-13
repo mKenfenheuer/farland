@@ -1,0 +1,45 @@
+# [MS-RDPBCGR] 4.1.4 Server MCS Connect Response PDU with GCC Conference Create Response
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 337; 4 X.224 DT
+#    7  BER Connect-Response (7f 66), length 325 (82 01 45)
+#   12  result rt-successful (0a 01 00); 15 calledConnectId 0 (02 01 00)
+#   18  domainParameters (30 1a): maxChannelIds 34, maxUserIds 3, maxTokenIds 0,
+#       numPriorities 1, minThroughput 0, maxHeight 1,
+#       maxMCSPDUsize 65528 (02 03 00 ff f8, 3-byte INTEGER), protocolVersion 2
+#   46  userData OCTET STRING, length 287 (04 82 01 1f)
+#   50  GCC ConnectData key OID 0.0.20.124.0.1
+#   57  connectPDU length byte 0x2a (42) although 279 bytes follow: clients ignore it
+#   58  ConferenceCreateResponse: 14 76 0a 01 01 00 01 c0 00 (nodeID 31219, tag 1, success)
+#       (the spec annotation shows an extra 00 before McDn; the wire bytes above are correct)
+#   67  H.221 key "McDn"; 71 userData value length 264 (81 08)
+#   73  SC_CORE (0x0c01) length 12: version 0x00080004, clientRequestedProtocols 0
+#       (12-byte variant: no earlyCapabilityFlags)
+#   85  SC_NET (0x0c03) length 16: MCSChannelId 1003, count 3, ids 1004 1005 1006, pad 0
+#  101  SC_SECURITY (0x0c02) length 236: encryptionMethod 2 (128-bit), level 2
+#       (client compatible), serverRandomLen 32, serverCertLen 184
+#  121  serverRandom (32 bytes)
+#  153  proprietary certificate (184): version 1, sigAlg 1, keyAlg 1, pubkey blob type 6
+#       len 92 (RSA1, 512-bit, e=65537), signature blob type 8 len 72
+
+S> 03 00 01 51 02 f0 80 7f 66 82 01 45 0a 01 00 02
+   01 00 30 1a 02 01 22 02 01 03 02 01 00 02 01 01
+   02 01 00 02 01 01 02 03 00 ff f8 02 01 02 04 82
+   01 1f 00 05 00 14 7c 00 01 2a 14 76 0a 01 01 00
+   01 c0 00 4d 63 44 6e 81 08 01 0c 0c 00 04 00 08
+   00 00 00 00 00 03 0c 10 00 eb 03 03 00 ec 03 ed
+   03 ee 03 00 00 02 0c ec 00 02 00 00 00 02 00 00
+   00 20 00 00 00 b8 00 00 00 10 11 77 20 30 61 0a
+   12 e4 34 a1 1e f2 c3 9f 31 7d a4 5f 01 89 34 96
+   e0 ff 11 08 69 7f 1a c3 d2 01 00 00 00 01 00 00
+   00 01 00 00 00 06 00 5c 00 52 53 41 31 48 00 00
+   00 00 02 00 00 3f 00 00 00 01 00 01 00 cb 81 fe
+   ba 6d 61 c3 55 05 d5 5f 2e 87 f8 71 94 d6 f1 a5
+   cb f1 5f 0c 3d f8 70 02 96 c4 fb 9b c8 3c 2d 55
+   ae e8 ff 32 75 ea 68 79 e5 a2 01 fd 31 a0 b1 1f
+   55 a6 1f c1 f6 d1 83 88 63 26 56 12 bc 00 00 00
+   00 00 00 00 00 08 00 48 00 e9 e1 d6 28 46 8b 4e
+   f5 0a df fd ee 21 99 ac b4 e1 8f 5f 81 57 82 ef
+   9d 96 52 63 27 18 29 db b3 4a fd 9a da 42 ad b5
+   69 21 89 0e 1d c0 4c 1a a8 aa 71 3e 0f 54 b9 9a
+   e4 99 68 3f 6c d6 76 84 61 00 00 00 00 00 00 00
+   00

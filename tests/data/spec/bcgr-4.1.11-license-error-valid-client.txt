@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.1.11 Server License Error PDU - Valid Client
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 42; 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 28 (1c)
+#   14  TS_SECURITY_HEADER1: flags 0x0288 (SEC_ENCRYPT | SEC_LICENSE_PKT | SEC_LICENSE_ENCRYPT_CS), flagsHi 0x0302 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 16 bytes
+# Encrypted payload is the 16-byte licensing message, shown in the -decrypted file.
+
+S> 03 00 00 2a 02 f0 80 68 00 01 03 eb 70 1c 88 02
+   02 03 8d 43 9a ab d5 2a 31 39 62 4d c1 ec 0d 99
+   88 e6 da ab 2c 02 72 4d 49 90

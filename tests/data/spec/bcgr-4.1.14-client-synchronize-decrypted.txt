@@ -1,0 +1,16 @@
+# [MS-RDPBCGR] 4.1.14 Client Synchronize PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - MCS userData length and TPKT length recomputed (TPKT 48 -> 36)
+#   - every other byte is unchanged from the spec's decrypted dump
+#    0  TPKT length 36; 4 X.224 DT; 7 MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 22
+#   14  share control: totalLength 22, pduType 0x0017 (DATAPDU | version), pduSource 1007
+#   20  share data: shareID 0x000103ea, pad1 0x00, streamId 1, uncompressedLength 8,
+#       pduType2 31, compressedType 0, compressedLength 0
+#   32  messageType 1 (SYNCMSGTYPE_SYNC)
+#   34  targetUser 0x03ea (1002)
+
+C> 03 00 00 24 02 f0 80 64 00 06 03 eb 70 16 16 00
+   17 00 ef 03 ea 03 01 00 00 01 08 00 1f 00 00 00
+   01 00 ea 03

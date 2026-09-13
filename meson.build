@@ -92,7 +92,11 @@ endif
 
 farland_inc = include_directories('src')
 
+# TLS and the cryptographic primitives (docs/PLAN.md §2).
+openssl_dep = dependency('openssl', version: '>= 3.0')
+
 subdir('src')
+subdir('apps')
 
 catch2_dep = dependency(
   'catch2-with-main',

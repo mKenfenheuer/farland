@@ -176,6 +176,25 @@ Result<std::uint64_t> decode_unsigned(const Tlv& tlv, Rules rules)
     return value;
 }
 
+Result<std::uint64_t> decode_raw_unsigned(const Tlv& tlv)
+{
+    if (tlv.value.empty()) {
+        return fail(Errc::invalid_length, "INTEGER has no content octets", tlv.value_offset);
+    }
+    auto digits = tlv.value;
+    while (digits.size() > 1 && std::to_integer<unsigned>(digits[0]) == 0) {
+        digits = digits.subspan(1);
+    }
+    if (digits.size() > sizeof(std::uint64_t)) {
+        return fail(Errc::limit_exceeded, "INTEGER does not fit in 64 bits", tlv.value_offset);
+    }
+    std::uint64_t value = 0;
+    for (const std::byte octet : digits) {
+        value = (value << 8U) | std::to_integer<std::uint64_t>(octet);
+    }
+    return value;
+}
+
 Result<bool> read_boolean(Reader& r, Rules rules, Tag tag)
 {
     FARLAND_TRY(const Tlv tlv, expect_tlv(r, tag, rules));

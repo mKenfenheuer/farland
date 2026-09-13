@@ -1,0 +1,8 @@
+# [MS-RDPBCGR] 4.1.2 Server X.224 Connection Confirm PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT: version 3, length 19
+#    4  X.224 CC: LI 14, code 0xd0, dst-ref 0, src-ref 0x1234, class 0
+#   11  RDP_NEG_RSP: type 2, flags 0, length 8, selectedProtocol 0 (PROTOCOL_RDP)
+
+S> 03 00 00 13 0e d0 00 00 12 34 00 02 00 08 00 00
+   00 00 00

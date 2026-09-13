@@ -1,0 +1,7 @@
+# [MS-RDPBCGR] 4.1.8.2.2 Server Join Confirm PDU for Channel 1003 (I/O Channel)
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 15; 4 X.224 DT
+#    7  PER channelJoinConfirm with channelId (0x3e); 8 result rt-successful (0)
+#    9  initiator 1007; 11 requested 1003; 13 channelId 1003
+
+S> 03 00 00 0f 02 f0 80 3e 00 00 06 03 eb 03 eb

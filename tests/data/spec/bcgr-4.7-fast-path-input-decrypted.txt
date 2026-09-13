@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.7 Annotated Fast-Path Input Event PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example:
+#   - fpInputHeader 0xc4 -> 0x04 (encryption flags cleared; action 0 and numEvents 1 kept)
+#   - removed the 8-byte dataSignature
+#   - length1 17 -> 9
+#   - the event bytes are unchanged from the spec's decrypted dump
+#    0  fpInputHeader 0x04; 1 length 9
+#    2  eventHeader 0x20: eventCode 1 (FASTPATH_INPUT_EVENT_MOUSE), eventFlags 0
+#    3  pointerFlags 0x0800 (PTRFLAGS_MOVE); 5 xPos 683; 7 yPos 367
+
+C> 04 09 20 00 08 ab 02 6f 01

@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.1.15 Client Control PDU - Cooperate
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 52; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 38 (26)
+#   14  TS_SECURITY_HEADER1: flags 0x0008 (SEC_ENCRYPT), flagsHi 0xf881 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 26 bytes
+
+C> 03 00 00 34 02 f0 80 64 00 06 03 eb 70 26 08 00
+   81 f8 04 03 de f7 91 a3 7c af 3f 7a 62 4e 3b fe
+   b6 7a 28 bf 0d 4f 31 27 03 b9 4a f1 e6 26 f0 bd
+   c5 71 0a 53

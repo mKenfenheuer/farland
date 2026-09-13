@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang libssl-dev
       - name: Allow sanitizer shadow memory on current kernels
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang libclang-rt-18-dev
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang libclang-rt-18-dev libssl-dev
       - name: Allow sanitizer shadow memory on current kernels
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Build fuzz targets
@@ -80,7 +80,7 @@ jobs:
           seconds=60
           if [ "${{ github.event_name }}" = schedule ]; then seconds=900; fi
           mkdir -p artifacts
-          for target in ber per; do
+          for target in ber per planar x224 mcs_gcc share input server; do
             mkdir -p "corpus-$target" && cp fuzz/corpus/$target/* "corpus-$target/"
             "./build-fuzz/fuzz/fuzz-$target" -max_total_time=$seconds -artifact_prefix=artifacts/ "corpus-$target"
           done
@@ -108,7 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang clang-tidy libssl-dev
       - name: Configure
         run: CC=clang CXX=clang++ meson setup build
       - name: clang-tidy

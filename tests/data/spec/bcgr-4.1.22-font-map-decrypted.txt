@@ -1,0 +1,18 @@
+# [MS-RDPBCGR] 4.1.22 Server Font Map PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - MCS userData length and TPKT length recomputed (TPKT 52 -> 40)
+#   - every other byte is unchanged from the spec's decrypted dump
+#    0  TPKT length 40; 4 X.224 DT; 7 MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 26
+#   14  share control: totalLength 26, pduType 0x0017 (DATAPDU | version), pduSource 1002
+#   20  share data: shareID 0x000103ea, pad1 0x45, streamId 2, uncompressedLength 26,
+#       pduType2 40, compressedType 0, compressedLength 0
+#   32  numberEntries 0
+#   34  totalNumEntries 0
+#   36  mapFlags 0x0003 (FIRST | LAST)
+#   38  entrySize 4
+
+S> 03 00 00 28 02 f0 80 68 00 01 03 eb 70 1a 1a 00
+   17 00 ea 03 ea 03 01 00 45 02 1a 00 28 00 00 00
+   00 00 00 00 03 00 04 00

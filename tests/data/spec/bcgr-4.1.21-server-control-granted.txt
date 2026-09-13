@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.1.21 Server Control PDU - Granted Control
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 52; 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 38 (26)
+#   14  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x0302 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 26 bytes
+
+S> 03 00 00 34 02 f0 80 68 00 01 03 eb 70 26 08 08
+   02 03 c3 90 ba eb 39 68 dd ed 60 54 ad 97 a5 a5
+   ec 44 e6 63 45 20 bd c9 66 4e 12 de 01 d3 3c 39
+   09 0c 99 f8

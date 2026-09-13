@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.1.22 Server Font Map PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 52; 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 38 (26)
+#   14  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x0302 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 26 bytes
+
+S> 03 00 00 34 02 f0 80 68 00 01 03 eb 70 26 08 08
+   02 03 41 e9 b7 a2 62 9e bb d3 a0 be 09 9e d4 de
+   8c 6d b6 79 64 4c bf 9d 21 46 32 7f 3b e4 dc 7f
+   08 39 23 c1

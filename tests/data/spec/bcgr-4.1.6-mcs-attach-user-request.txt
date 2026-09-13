@@ -1,0 +1,6 @@
+# [MS-RDPBCGR] 4.1.6 Client MCS Attach User Request PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 8; 4 X.224 DT
+#    7  PER attachUserRequest (0x28)
+
+C> 03 00 00 08 02 f0 80 28

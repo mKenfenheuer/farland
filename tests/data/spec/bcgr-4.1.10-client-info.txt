@@ -1,0 +1,36 @@
+# [MS-RDPBCGR] 4.1.10 Client Info PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 427; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 412 (81 9c)
+#   15  TS_SECURITY_HEADER1: flags 0x0048 (SEC_INFO_PKT | SEC_ENCRYPT), flagsHi 0
+#   19  dataSignature (8-byte MAC)
+#   27  RC4-encrypted payload, 400 bytes
+# The -decrypted file has the plaintext TS_INFO_PACKET.
+
+C> 03 00 01 ab 02 f0 80 64 00 06 03 eb 70 81 9c 48
+   00 00 00 45 ca 46 fa 5e a7 be bc 74 21 d3 65 e9
+   ba 76 12 7c 55 4b 9d 84 3b 3e 07 29 20 73 25 7b
+   e6 9a bb e8 41 8a a0 69 3f 26 9a cd bc a6 03 27
+   f5 ce bb a8 c2 ff 0f 38 a3 bf 74 81 ac cb c9 08
+   49 0a 43 cf 91 31 36 cd ba 3d 16 4f 11 d7 69 12
+   c8 e9 57 c0 b8 0f c4 72 66 79 bd 86 ba 30 60 76
+   b4 cd 52 5e 79 8e 88 95 f0 9a 43 20 d9 96 74 1d
+   5c 8a 9a e3 8a 5d d2 55 17 8c f2 66 6b 3f 3d 3a
+   e3 2a d4 ff d5 11 30 30 e2 ff e2 e4 11 0c 7f 6a
+   1e a3 f4 2f dd 4f 89 8c c0 ca d3 8a 49 d7 00 d9
+   09 40 ab 79 1a 72 f9 89 42 af 20 aa 50 c7 cd d0
+   b8 1e ab d3 eb 10 01 82 68 9f f5 c9 05 fe 20 bb
+   7c 68 b4 72 cd 37 53 df 43 0a 6d de cb be 5f 80
+   05 1e b8 f3 5d 04 0c c6 66 3b 39 5f 5d a2 da b9
+   ea c9 da ba 7c 9d 4e 4a 4f 4a 16 04 ea 4e 23 d3
+   6d 2c 2b 42 58 19 69 10 23 d4 e1 af 46 34 fc 23
+   81 59 54 65 5f 6c 67 57 14 62 57 94 f1 81 86 00
+   fe 1c 27 f6 76 e2 00 ea c5 f7 b5 e9 b2 ad ef 7f
+   87 8b 8a b0 d3 1e 43 54 4b ab f6 ba 7f 5a b9 e5
+   2d 5f 81 ab 2a 15 c4 97 bc d3 92 9a da be 8a b0
+   fb a4 1a a0 96 26 86 23 10 1b 21 0a 91 05 22 4d
+   6c 4d 01 4c 84 f3 50 56 4f 3a e4 c0 24 bf 35 f6
+   f5 8b 3f 20 55 98 91 05 4d ee 46 95 44 6d 06 33
+   42 1f 9f 84 91 e7 c5 9f 04 11 de cf a5 07 5f 27
+   dd c0 ac b1 a7 98 9d 6d 79 00 70 33 bf 4e 16 23
+   57 f5 c7 88 82 d1 c6 a3 b4 0b 29

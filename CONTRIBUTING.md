@@ -16,7 +16,7 @@ Useful configurations:
 | Fuzzing | `CC=clang CXX=clang++ meson setup build-fuzz -Dfuzzing=true -Dhardening=false -Db_sanitize=address,undefined -Db_lundef=false`, then `./build-fuzz/fuzz/fuzz-ber fuzz/corpus/ber` |
 | Warnings as errors (as in CI) | add `-Dwerror=true` |
 
-On macOS, Apple clang has no libFuzzer; use Homebrew LLVM (`CC=$(brew --prefix llvm)/bin/clang`) with `-Db_sanitize=undefined`. Homebrew LLVM 20's AddressSanitizer runtime deadlocks at startup on macOS 26, inside `AsanInitInternal`, so ASan fuzzing only works on Linux. farland itself targets Linux, and macOS is only for working on the platform-independent libraries.
+On macOS, use Apple clang for the sanitizer builds (ASan, UBSan and TSan all work). Apple clang has no libFuzzer, though, so fuzz with Homebrew LLVM (`CC=$(brew --prefix llvm)/bin/clang`) and `-Db_sanitize=undefined` only: Homebrew LLVM 20's AddressSanitizer runtime deadlocks at startup on macOS 26, inside `AsanInitInternal`. ASan fuzzing therefore only works on Linux. farland itself targets Linux, and macOS is only for working on the platform-independent libraries.
 
 Install the git hooks once with `pre-commit install`. They run clang-format, the REUSE license check and whitespace fixes.
 

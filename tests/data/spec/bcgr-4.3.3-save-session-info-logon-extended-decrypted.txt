@@ -1,0 +1,57 @@
+# [MS-RDPBCGR] 4.3.3 Logon Info Extended
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - MCS userData length and TPKT length recomputed (TPKT 657 -> 645)
+#   - every other byte is unchanged from the spec's decrypted dump
+#    0  TPKT length 645; 4 X.224 DT; 7 MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 630
+#   15  share control: totalLength 630, pduType 0x0017 (DATAPDU | version), pduSource 1002
+#   21  share data: shareID 0x000203ea, pad1 0x00, streamId 1, uncompressedLength 630,
+#       pduType2 38, compressedType 0, compressedLength 0
+#   33  infoType 3 (INFOTYPE_LOGON_EXTENDED_INFO)
+#   37  TS_LOGON_INFO_EXTENDED: Length 38, FieldsPresent 0x1 (AUTORECONNECTCOOKIE) @+2
+#   43  TS_LOGON_INFO_FIELD cbFieldData 28
+#   47  ARC_SC_PRIVATE_PACKET: cbLen 28, Version 1 @+4, LogonId 2 @+8, ArcRandomBits (16) @+12
+#   75  Pad (570 zero bytes)
+
+S> 03 00 02 85 02 f0 80 68 00 01 03 eb 70 82 76 76
+   02 17 00 ea 03 ea 03 02 00 00 01 76 02 26 00 00
+   00 03 00 00 00 26 00 01 00 00 00 1c 00 00 00 1c
+   00 00 00 01 00 00 00 02 00 00 00 a8 02 e7 25 e2
+   4c 82 b7 52 a5 53 50 34 98 a1 a8 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   00 00 00 00 00

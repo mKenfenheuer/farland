@@ -8,6 +8,7 @@ farland_base_lib = static_library(
   'hexdump.cpp',
   'log.cpp',
   'per.cpp',
+  'text.cpp',
   include_directories: farland_inc,
   cpp_args: farland_safe_buffer_args,
 )

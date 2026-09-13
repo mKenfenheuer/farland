@@ -4,26 +4,32 @@
 test_support_lib = static_library(
   'farland-test-support',
   'support/bytes.cpp',
+  'support/client_pdus.cpp',
   'support/transcript.cpp',
-  dependencies: farland_base_dep,
+  dependencies: farland_proto_dep,
 )
 
 test_support_dep = declare_dependency(
   link_with: test_support_lib,
   include_directories: include_directories('.'),
-  dependencies: farland_base_dep,
+  dependencies: farland_proto_dep,
 )
+
+# Each library's test directory appends its sources and dependencies here.
+unit_test_sources = files('support/test_transcript.cpp')
+unit_test_deps = [test_support_dep, catch2_dep]
+
+subdir('base')
+subdir('proto')
+subdir('codec')
+subdir('auth')
+subdir('server')
+subdir('integration')
 
 unit_tests = executable(
   'farland-unit-tests',
-  'base/test_ber.cpp',
-  'base/test_hexdump.cpp',
-  'base/test_log.cpp',
-  'base/test_per.cpp',
-  'base/test_reader.cpp',
-  'base/test_writer.cpp',
-  'support/test_transcript.cpp',
-  dependencies: [test_support_dep, catch2_dep],
+  unit_test_sources,
+  dependencies: unit_test_deps,
   cpp_args: '-DFARLAND_TEST_DATA_DIR="@0@"'.format(meson.current_source_dir() / 'data'),
 )
 

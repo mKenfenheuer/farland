@@ -1,0 +1,18 @@
+# [MS-RDPBCGR] 4.1.11 Server License Error PDU - Valid Client
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# TLS-mode rebuild of the RC4 example (the spec's decrypted dump plus new framing):
+#   - removed the 12-byte non-FIPS security header (flags, flagsHi, 8-byte MAC)
+#   - inserted a 4-byte basic security header instead: flags 0x0080 (SEC_LICENSE_PKT), flagsHi 0; SEC_ENCRYPT and SEC_LICENSE_ENCRYPT_CS dropped. Under Enhanced RDP
+#     Security this header stays in this PDU; only SEC_ENCRYPT and the MAC go
+#   - MCS userData length and TPKT length recomputed (TPKT 42 -> 34)
+#   - every other byte is unchanged from the spec's decrypted dump
+#    0  TPKT length 34; 4 X.224 DT; 7 MCS SendDataIndication (0x68): initiator 1002, channel 1003, prio high, begin|end, length 20 (14)
+#   14  basic security header 80 00 00 00
+#   18  LICENSE_PREAMBLE: bMsgType 0xff (ERROR_ALERT), flags 0x03 (PREAMBLE_VERSION_3_0), wMsgSize 16
+#   22  dwErrorCode 7 (STATUS_VALID_CLIENT)
+#   26  dwStateTransition 2 (ST_NO_TRANSITION)
+#   30  bbErrorInfo: wBlobType 4 (BB_ERROR_BLOB), wBlobLen 0
+
+S> 03 00 00 22 02 f0 80 68 00 01 03 eb 70 14 80 00
+   00 00 ff 03 10 00 07 00 00 00 02 00 00 00 04 00
+   00 00

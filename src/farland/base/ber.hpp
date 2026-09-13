@@ -89,6 +89,12 @@ struct Tlv {
 /// INTEGER that must be non-negative, up to 2^64 - 1.
 [[nodiscard]] Result<std::uint64_t> decode_unsigned(const Tlv& tlv, Rules rules);
 
+/// The content octets as an unsigned big-endian number, ignoring the sign
+/// bit. For peers that encode unsigned values without the leading zero
+/// octet: mstsc sends the MCS domain parameter 65535 as 02 02 ff ff
+/// ([MS-RDPBCGR] 4.1.3), which strict BER reads as -1.
+[[nodiscard]] Result<std::uint64_t> decode_raw_unsigned(const Tlv& tlv);
+
 [[nodiscard]] Result<bool> read_boolean(Reader& r, Rules rules, Tag tag = tags::boolean);
 [[nodiscard]] Result<std::int64_t> read_integer(Reader& r, Rules rules, Tag tag = tags::integer);
 [[nodiscard]] Result<std::uint64_t> read_unsigned(Reader& r, Rules rules, Tag tag = tags::integer);

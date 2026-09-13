@@ -1,0 +1,11 @@
+# [MS-RDPBCGR] 4.1.14 Client Synchronize PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 48; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 34 (22)
+#   14  TS_SECURITY_HEADER1: flags 0x0028 (SEC_IGNORE_SEQNO | SEC_ENCRYPT), flagsHi 0xf881 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 22 bytes
+
+C> 03 00 00 30 02 f0 80 64 00 06 03 eb 70 22 28 00
+   81 f8 59 ff cb 2f 73 57 2b 42 db 88 2e 23 a9 97
+   c2 b1 f5 74 bc 49 cc 8a d8 fd 60 8a 7a f6 44 75

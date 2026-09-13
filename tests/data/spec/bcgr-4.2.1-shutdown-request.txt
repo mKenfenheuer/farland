@@ -1,0 +1,12 @@
+# [MS-RDPBCGR] 4.2.1 Client Shutdown Request PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# Spec annotation says flags 0x0008, but the dump bytes are 08 08 (0x0808); bytes kept.
+#    0  TPKT length 44; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end, length 30 (1e)
+#   14  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x5270 (junk)
+#   18  dataSignature (8-byte MAC)
+#   26  RC4-encrypted payload, 18 bytes
+
+C> 03 00 00 2c 02 f0 80 64 00 06 03 eb 70 1e 08 08
+   70 52 ca 3d ba 05 20 60 e6 57 43 2c f1 41 f0 3b
+   0c a0 33 ff 04 55 d4 e6 9b 3c 28 f6

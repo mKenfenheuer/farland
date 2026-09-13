@@ -1,0 +1,10 @@
+# [MS-RDPBCGR] 4.7 Annotated Fast-Path Input Event PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  fpInputHeader 0xc4: action 0 (FASTPATH), numEvents 1,
+#       flags 0x3 (FASTPATH_INPUT_SECURE_CHECKSUM | FASTPATH_INPUT_ENCRYPTED)
+#    1  length1 0x11 = 17 (1-byte form)
+#    2  dataSignature (8-byte MAC)
+#   10  RC4-encrypted fpInputEvents (7 bytes)
+
+C> c4 11 30 35 6b 5b b5 34 c8 47 26 18 5e 76 0e de
+   28

@@ -12,13 +12,13 @@ case "$ID" in
 debian | ubuntu)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang
+    apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang libssl-dev
     ;;
 fedora)
-    dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang
+    dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang openssl-devel
     ;;
 arch)
-    pacman -Syu --noconfirm --needed git meson ninja pkgconf gcc clang
+    pacman -Syu --noconfirm --needed git meson ninja pkgconf gcc clang openssl
     ;;
 *)
     echo "unsupported distribution: $ID" >&2

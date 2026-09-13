@@ -1,0 +1,13 @@
+# [MS-RDPBCGR] 4.4 Annotated Server-to-Client Virtual Channel PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+# SPEC ERRATUM: the dump's TPKT length is 0x002e (46), but the dump holds 42 bytes and
+# the spec annotation says 0x2a. The bytes are copied as the spec prints them, so this
+# file fails the TPKT length check on purpose.
+#    0  TPKT length field 46 (should be 42); 4 X.224 DT
+#    7  MCS SendDataIndication (0x68): initiator 1002, channel 1005 (cliprdr), prio low (0xf0), begin|end, length 28 (1c)
+#   14  TS_SECURITY_HEADER1: flags 0x0808 (SEC_SECURE_CHECKSUM | SEC_ENCRYPT), flagsHi 0x0001 (junk)
+#   18  dataSignature (8-byte MAC); 26 RC4-encrypted channel PDU (16 bytes)
+
+S> 03 00 00 2e 02 f0 80 68 00 01 03 ed f0 1c 08 08
+   01 00 47 bd eb cb 29 51 ae 0a f6 07 33 ce fc a5
+   f7 09 de 67 4e a3 2a 2c 38 29

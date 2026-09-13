@@ -33,7 +33,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - Honour skip-channel-join.
 - **Client Info PDU:** fully parsed, including autologon, time zone, extended info and the ARC cookie.
 - **Licensing:** `STATUS_VALID_CLIENT`.
-- **Capability exchange:** Demand Active with General, Bitmap (32 bpp), Order, Pointer (+LargePointer), Input, VirtualChannel, MultifragmentUpdate, SurfaceCommands, BitmapCodecs and FrameAcknowledge. The client's Confirm Active is fully parsed into the `Negotiated` object.
+- **Capability exchange:** Demand Active with General, Bitmap (32 bpp), Order, Pointer, Input, VirtualChannel, Share, Font and MultifragmentUpdate. The client's Confirm Active is fully parsed into the session. SurfaceCommands, BitmapCodecs and FrameAcknowledge are advertised only once they are used (M3), and LargePointer with the cursor pipeline (M4): advertising a capability the server never exercises only widens the attack and interop surface.
 - **Finalization:** wait for the client's Synchronize/Control/FontList before replying; Set Error Info on disconnect; Deactivate-All/reactivation.
 - **Fast-path and slow-path input**, Refresh Rect, Suppress Output, Shutdown Request, heartbeat.
 - **Legacy output:** fast-path bitmap updates with the **planar** codec, as the first working pixels.

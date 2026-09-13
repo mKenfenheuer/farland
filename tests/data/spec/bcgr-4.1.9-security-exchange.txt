@@ -1,0 +1,15 @@
+# [MS-RDPBCGR] 4.1.9 Client Security Exchange PDU
+# Annotated example between an RDP 5.1 client and server (Standard RDP Security).
+#    0  TPKT length 94; 4 X.224 DT
+#    7  MCS SendDataRequest (0x64): initiator 1007, channel 1003, prio high, begin|end,
+#       userData length 80 (50)
+#   14  security header: flags 0x0201 (SEC_EXCHANGE_PKT | SEC_LICENSE_ENCRYPT_SC), flagsHi 0
+#   18  length 72; 22 RSA-encrypted client random (64 bytes, little-endian); 86 padding (8 zero bytes)
+# Not RC4-encrypted. This PDU does not exist under TLS/CredSSP, so there is no -decrypted file.
+
+C> 03 00 00 5e 02 f0 80 64 00 06 03 eb 70 50 01 02
+   00 00 48 00 00 00 91 ac 0c 8f 64 8c 39 f4 e7 ff
+   0a 3b 79 11 5c 13 51 2a cb 72 8f 9d b7 42 2e f7
+   08 4c 8e ae 55 99 62 d2 81 81 e4 66 c8 05 ea d4
+   73 06 3f c8 5f af 2a fd fc f1 64 b3 3f 0a 15 1d
+   db 2c 10 9d 30 11 00 00 00 00 00 00 00 00
