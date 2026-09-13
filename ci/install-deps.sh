@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# Installs the build dependencies inside a CI container (run as root).
+# Catch2 is not installed on purpose: the build falls back to the wrap, so every
+# distribution tests against the same Catch2 version.
+set -eu
+
+. /etc/os-release
+case "$ID" in
+debian | ubuntu)
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang
+    ;;
+fedora)
+    dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang
+    ;;
+arch)
+    pacman -Syu --noconfirm --needed git meson ninja pkgconf gcc clang
+    ;;
+*)
+    echo "unsupported distribution: $ID" >&2
+    exit 1
+    ;;
+esac

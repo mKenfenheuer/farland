@@ -1,0 +1,19 @@
+/build*/
+/subprojects/*/
+/subprojects/packagecache/
+/subprojects/.wraplock
+/corpus-*/
+/artifacts/
+
+# libFuzzer output
+crash-*
+leak-*
+oom-*
+slow-unit-*
+timeout-*
+
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+.DS_Store

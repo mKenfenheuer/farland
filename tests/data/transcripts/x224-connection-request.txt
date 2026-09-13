@@ -1,0 +1,6 @@
+# X.224 Connection Request with RDP_NEG_REQ, as mstsc sends it without a cookie.
+# requestedProtocols = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX (0x0000000b)
+# [MS-RDPBCGR] 2.2.1.1 / 2.2.1.1.1
+C> 03 00 00 13                  # TPKT: version 3, length 19
+   0e e0 00 00 00 00 00         # X.224 CR TPDU: LI 14, CR, dst-ref, src-ref, class 0
+   01 00 08 00 0b 00 00 00      # RDP_NEG_REQ: type, flags, length 8, requestedProtocols

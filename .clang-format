@@ -1,0 +1,25 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit: 120
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: All
+AlwaysBreakTemplateDeclarations: Yes
+PointerAlignment: Left
+SpacesBeforeTrailingComments: 2
+FixNamespaceComments: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<farland/'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 2
+  - Regex: '^<(catch2|pipewire|spa|libei|openssl|gssapi)/'
+    Priority: 3
+  - Regex: '^<'
+    Priority: 4
