@@ -7,3 +7,5 @@ option('fuzzing', type: 'boolean', value: false,
   description: 'Build fuzz targets against libFuzzer (clang only). When false they are built as corpus-replay programs and run as tests.')
 option('hardening', type: 'boolean', value: true,
   description: 'Hardened build: library assertions, stack protector, zero-initialised locals, FORTIFY_SOURCE=3, full RELRO')
+option('x264', type: 'feature', value: 'disabled',
+  description: 'x264 H.264 encoder backend. libx264 is GPLv2+: binaries built with it must be distributed under the GPL (docs/PLAN.md §2). Never on by default')

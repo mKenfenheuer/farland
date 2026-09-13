@@ -21,6 +21,7 @@ enum class Errc : std::uint8_t {
     unsupported,     ///< Valid per the specification, but farland does not implement it.
     limit_exceeded,  ///< A size or count is above a farland resource limit.
     trailing_data,   ///< Bytes are left over where a structure must fill its container.
+    io,              ///< A file or other local resource could not be read or written.
 };
 
 [[nodiscard]] std::string_view to_string(Errc code) noexcept;

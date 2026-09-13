@@ -25,6 +25,8 @@ std::string_view to_string(Errc code) noexcept
         return "limit exceeded";
     case Errc::trailing_data:
         return "trailing data";
+    case Errc::io:
+        return "I/O error";
     }
     return "unknown error";
 }

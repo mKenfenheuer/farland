@@ -43,7 +43,13 @@ ossl::Ssl new_client_ssl(const TlsClientOptions& options)
     ossl::Ssl ssl(SSL_new(ctx));
     FARLAND_ASSERT(ssl != nullptr);
     if (!options.server_name.empty()) {
-        FARLAND_ASSERT(SSL_set_tlsext_host_name(ssl.get(), options.server_name.c_str()) == 1);
+        // SSL_set_tlsext_host_name is a macro around SSL_ctrl with a C-style
+        // cast; calling SSL_ctrl directly keeps -Wold-style-cast quiet. OpenSSL
+        // copies the name and never writes through the pointer.
+        const long set =
+            SSL_ctrl(ssl.get(), SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
+                     const_cast<char*>(options.server_name.c_str()));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+        FARLAND_ASSERT(set == 1);
     }
     return ssl;
 }

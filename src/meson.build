@@ -4,6 +4,8 @@
 # Libraries follow docs/PLAN.md §3.1.
 subdir('farland/base')
 subdir('farland/proto')
+subdir('farland/channels')
 subdir('farland/codec')
+subdir('farland/video')
 subdir('farland/auth')
 subdir('farland/server')

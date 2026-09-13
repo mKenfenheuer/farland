@@ -11,6 +11,7 @@
 #include <farland/server/connection.hpp>
 
 #include <algorithm>
+#include <utility>
 
 namespace farland::server {
 
@@ -81,10 +82,6 @@ caps::CapabilitySets server_capabilities(const Session& session)
 std::string_view to_string(State state) noexcept
 {
     switch (state) {
-    case State::wait_connection_request:
-        return "wait-connection-request";
-    case State::wait_tls:
-        return "wait-tls";
     case State::wait_connect_initial:
         return "wait-connect-initial";
     case State::wait_erect_domain:
@@ -105,17 +102,35 @@ std::string_view to_string(State state) noexcept
     return "unknown";
 }
 
-Connection::Connection(ServerConfig config) : config_(config) {}
+std::optional<std::uint16_t> Session::static_channel_id(std::string_view name) const
+{
+    const auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
+    const auto found = std::ranges::find_if(static_channels, [&](const auto& channel) {
+        return channel.first.size() == name.size() &&
+               std::ranges::equal(channel.first, name, [&](char a, char b) { return lower(a) == lower(b); });
+    });
+    if (found == static_channels.end()) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+bool Session::supports_gfx() const
+{
+    return client_data.core.has_early_flag(gcc::cs_early_flags::support_dynvc_gfx_protocol) && bits_per_pixel == 32 &&
+           static_channel_id("drdynvc").has_value();
+}
+
+Connection::Connection(ServerConfig config, Negotiation negotiation) : config_(config)
+{
+    session_.negotiation = std::move(negotiation);
+}
 
 // Input -------------------------------------------------------------------------
 
 void Connection::receive(std::span<const std::byte> bytes)
 {
     if (state_ == State::closed) {
-        return;
-    }
-    if (state_ == State::wait_tls) {
-        fail("client data before the TLS handshake completed");
         return;
     }
     input_.insert(input_.end(), bytes.begin(), bytes.end());
@@ -144,15 +159,6 @@ void Connection::receive(std::span<const std::byte> bytes)
     }
 }
 
-void Connection::tls_established()
-{
-    if (state_ != State::wait_tls) {
-        fail("TLS established in the wrong state");
-        return;
-    }
-    state_ = State::wait_connect_initial;
-}
-
 std::vector<std::byte> Connection::take_output()
 {
     auto bytes = std::move(output_).take();
@@ -178,12 +184,6 @@ Result<void> Connection::handle_pdu(proto::FrameKind kind, std::span<const std::
     }
     FARLAND_TRY(Reader tpdu, proto::read_tpkt(r));
     FARLAND_TRY(const proto::TpduCode code, proto::peek_tpdu_code(tpdu));
-    if (state_ == State::wait_connection_request) {
-        if (code != proto::TpduCode::connection_request) {
-            return farland::fail(Errc::invalid_value, "expected an X.224 Connection Request", tpdu.offset());
-        }
-        return on_connection_request(tpdu);
-    }
     if (code == proto::TpduCode::disconnect_request) {
         close("client sent an X.224 Disconnect Request");
         return {};
@@ -200,39 +200,6 @@ Result<void> Connection::handle_pdu(proto::FrameKind kind, std::span<const std::
 
 // Connection sequence -------------------------------------------------------------
 
-Result<void> Connection::on_connection_request(Reader& tpdu)
-{
-    FARLAND_TRY(const auto request, proto::decode_connection_request(tpdu));
-    session_.cookie = request.cookie;
-    if (!request.negotiation) {
-        // A client without RDP_NEG_REQ only speaks Standard RDP Security.
-        close("client does not negotiate a security protocol (Standard RDP Security is not supported)");
-        return {};
-    }
-    session_.requested_protocols = request.negotiation->requested_protocols;
-    const std::uint32_t usable = session_.requested_protocols & config_.supported_protocols;
-
-    proto::ConnectionConfirm confirm;
-    if ((usable & proto::protocol::ssl) != 0) {
-        session_.selected_protocol = proto::protocol::ssl;
-        confirm.result = proto::NegotiationResponse{proto::neg_rsp_flags::extended_client_data_supported,
-                                                    session_.selected_protocol};
-    } else {
-        confirm.result = proto::NegotiationFailureCode::ssl_required_by_server;
-    }
-    proto::encode_connection_confirm(output_, confirm);
-
-    if (std::holds_alternative<proto::NegotiationFailureCode>(confirm.result)) {
-        close("client offers no security protocol farland supports");
-        return {};
-    }
-    log::info(log_component, "client requested protocols 0x{:x}, selected TLS{}{}", session_.requested_protocols,
-              session_.cookie.empty() ? "" : ", cookie user ", session_.cookie);
-    state_ = State::wait_tls;
-    events_.emplace_back(event::StartTls{});
-    return {};
-}
-
 Result<void> Connection::on_connect_initial(Reader& data)
 {
     FARLAND_TRY(const auto initial, mcs::decode_connect_initial(data));
@@ -245,7 +212,7 @@ Result<void> Connection::on_connect_initial(Reader& data)
 
     // [MS-RDPBCGR] 3.3.5.3.3: serverSelectedProtocol must repeat our choice;
     // a mismatch means the X.224 exchange was tampered with.
-    if (core.server_selected_protocol && *core.server_selected_protocol != session_.selected_protocol) {
+    if (core.server_selected_protocol && *core.server_selected_protocol != session_.negotiation.selected_protocol) {
         close("serverSelectedProtocol does not match the negotiated protocol");
         return {};
     }
@@ -275,7 +242,7 @@ Result<void> Connection::on_connect_initial(Reader& data)
     session_.user_channel_id = next_id;
 
     server.core.version = std::clamp(core.version, gcc::rdp_version_5_plus, max_rdp_version);
-    server.core.client_requested_protocols = session_.requested_protocols;
+    server.core.client_requested_protocols = session_.negotiation.requested_protocols;
     server.core.early_capability_flags = core.has_early_flag(gcc::cs_early_flags::support_skip_channeljoin)
                                              ? gcc::sc_early_flags::skip_channeljoin_supported
                                              : 0U;
@@ -583,8 +550,7 @@ void Connection::disconnect(std::uint32_t error_info)
     if (share_exists && session_.supports_error_info && error_info != proto::errinfo::none) {
         send_data_pdu(proto::SetErrorInfo{error_info});
     }
-    if (state_ != State::wait_connection_request && state_ != State::wait_tls &&
-        state_ != State::wait_connect_initial) {
+    if (state_ != State::wait_connect_initial) {
         const std::size_t tpkt = proto::begin_data_tpdu(output_);
         mcs::encode(output_, mcs::DisconnectProviderUltimatum{mcs::DisconnectReason::user_requested});
         proto::end_tpkt(output_, tpkt);
@@ -596,6 +562,19 @@ void Connection::send_io(std::span<const std::byte> payload)
 {
     const std::size_t tpkt = proto::begin_data_tpdu(output_);
     mcs::encode(output_, mcs::SendDataIndication{mcs::server_channel_id, mcs::io_channel_id, payload});
+    proto::end_tpkt(output_, tpkt);
+}
+
+void Connection::send_channel_data(std::uint16_t channel_id, std::span<const std::byte> chunk)
+{
+    if (state_ == State::closed) {
+        return;
+    }
+    FARLAND_ASSERT(state_ == State::wait_confirm_active || state_ == State::finalizing || state_ == State::active);
+    FARLAND_ASSERT(std::ranges::any_of(session_.static_channels,
+                                       [channel_id](const auto& channel) { return channel.second == channel_id; }));
+    const std::size_t tpkt = proto::begin_data_tpdu(output_);
+    mcs::encode(output_, mcs::SendDataIndication{mcs::server_channel_id, channel_id, chunk});
     proto::end_tpkt(output_, tpkt);
 }
 

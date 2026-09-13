@@ -147,13 +147,18 @@ using Plane = std::vector<std::uint8_t>;
 
 [[nodiscard]] std::vector<std::byte> encode_raw(const std::array<Plane, 3>& planes, const Geometry& g)
 {
-    Writer w(raw_stream_size(g));
-    w.u8(header_na);
+    // Sized up front and filled in place: building it through Writer's
+    // reserve() trips a GCC 15 -Wfree-nonheap-object false positive at -O3.
+    std::vector<std::byte> out(raw_stream_size(g), std::byte{0});
+    out.front() = static_cast<std::byte>(header_na);
+    auto rest = std::span(out).subspan(1);
     for (const auto& plane : planes) {
-        w.bytes(std::as_bytes(std::span(plane)));
+        const auto bytes = std::as_bytes(std::span(plane));
+        std::ranges::copy(bytes, rest.begin());
+        rest = rest.subspan(bytes.size());
     }
-    w.u8(0);  // Pad, which FreeRDP and mstsc both accept
-    return std::move(w).take();
+    // The final byte stays zero: the Pad, which FreeRDP and mstsc both accept.
+    return out;
 }
 
 /// A run of `run` (>= 3) copies of the last value, split into segments

@@ -57,16 +57,6 @@ Bytes io(std::span<const std::byte> payload, std::uint16_t channel = mcs::io_cha
     return domain(mcs::SendDataRequest{user_id, channel, payload});
 }
 
-Bytes connection_request(std::uint32_t protocols)
-{
-    proto::ConnectionRequest request;
-    request.cookie = "tester";
-    request.negotiation = proto::ConnectionRequest::Negotiation{0, protocols};
-    Writer w;
-    proto::encode_connection_request(w, request);
-    return std::move(w).take();
-}
-
 gcc::ClientData client_data(std::uint32_t selected_protocol, std::uint16_t early_flags)
 {
     gcc::ClientData data;
@@ -214,14 +204,17 @@ std::vector<farland::server::Event> events(Connection& c)
     return out;
 }
 
+/// What PreAuth hands over for a TLS-only client (PreAuth has its own tests).
+farland::server::Negotiation tls_negotiation()
+{
+    return {"tester", proto::protocol::ssl | proto::protocol::hybrid | proto::protocol::hybrid_ex, proto::protocol::ssl,
+            std::nullopt};
+}
+
 /// Runs the connection sequence up to (not including) the Confirm Active and
 /// returns the Demand Active's share ID.
 std::uint32_t connect_until_demand_active(Connection& c, std::uint16_t early_flags = 0x0001)
 {
-    c.receive(connection_request(proto::protocol::ssl | proto::protocol::hybrid));
-    static_cast<void>(c.take_output());
-    static_cast<void>(events(c));
-    c.tls_established();
     c.receive(connect_initial(client_data(proto::protocol::ssl, early_flags)));
     static_cast<void>(c.take_output());
     Bytes both = domain(mcs::ErectDomainRequest{});
@@ -253,29 +246,11 @@ void finalize(Connection& c, std::uint32_t share_id)
 
 TEST_CASE("The full connection sequence, step by step")
 {
-    Connection c;
-
-    // X.224: TLS selected, EXTENDED_CLIENT_DATA_SUPPORTED set.
-    c.receive(connection_request(proto::protocol::ssl | proto::protocol::hybrid | proto::protocol::hybrid_ex));
-    auto out = split(c.take_output());
-    REQUIRE(out.tpkt.size() == 1);
-    {
-        Reader r(out.tpkt[0]);
-        Reader tpdu = proto::read_tpkt(r).value();
-        const auto confirm = proto::decode_connection_confirm(tpdu).value();
-        const auto& response = std::get<proto::NegotiationResponse>(confirm.result);
-        CHECK(response.selected_protocol == proto::protocol::ssl);
-        CHECK(response.flags == proto::neg_rsp_flags::extended_client_data_supported);
-    }
-    auto evs = events(c);
-    REQUIRE(evs.size() == 1);
-    CHECK(std::holds_alternative<ev::StartTls>(evs[0]));
-    CHECK(c.state() == State::wait_tls);
-    c.tls_established();
+    Connection c({}, tls_negotiation());
 
     // MCS Connect: channels 1004/1005 static, 1006 message, 1007 user.
     c.receive(connect_initial(client_data(proto::protocol::ssl, 0x0001)));
-    out = split(c.take_output());
+    auto out = split(c.take_output());
     REQUIRE(out.tpkt.size() == 1);
     {
         Reader r(out.tpkt[0]);
@@ -326,7 +301,7 @@ TEST_CASE("The full connection sequence, step by step")
 
     // Client Info: license, then Demand Active.
     c.receive(client_info());
-    evs = events(c);
+    auto evs = events(c);
     REQUIRE(evs.size() == 1);
     const auto& info = std::get<ev::ClientInfo>(evs[0]);
     CHECK(info.user_name == "alice");
@@ -462,26 +437,9 @@ TEST_CASE("The full connection sequence, step by step")
     CHECK(c.state() == State::closed);
 }
 
-TEST_CASE("Clients without TLS are refused with RDP_NEG_FAILURE")
-{
-    Connection c;
-    c.receive(connection_request(proto::protocol::rdp));
-    const auto out = split(c.take_output());
-    Reader r(out.tpkt.at(0));
-    Reader tpdu = proto::read_tpkt(r).value();
-    const auto confirm = proto::decode_connection_confirm(tpdu).value();
-    CHECK(std::get<proto::NegotiationFailureCode>(confirm.result) ==
-          proto::NegotiationFailureCode::ssl_required_by_server);
-    CHECK(c.state() == State::closed);
-}
-
 TEST_CASE("A serverSelectedProtocol that differs from the negotiation closes the connection")
 {
-    Connection c;
-    c.receive(connection_request(proto::protocol::ssl));
-    static_cast<void>(c.take_output());
-    static_cast<void>(events(c));
-    c.tls_established();
+    Connection c({}, tls_negotiation());
     c.receive(connect_initial(client_data(proto::protocol::hybrid, 0)));
     CHECK(c.state() == State::closed);
     const auto evs = events(c);
@@ -491,20 +449,13 @@ TEST_CASE("A serverSelectedProtocol that differs from the negotiation closes the
 
 TEST_CASE("Garbage and out-of-order PDUs close the connection with an error")
 {
-    Connection garbage;
+    Connection garbage({}, tls_negotiation());
     const std::array junk{std::byte{0xff}, std::byte{0xff}};
     garbage.receive(junk);
     CHECK(garbage.state() == State::closed);
     CHECK(std::get<ev::Closed>(garbage.poll_event().value()).error);
 
-    Connection early;
-    early.receive(connection_request(proto::protocol::ssl));
-    static_cast<void>(early.take_output());
-    static_cast<void>(events(early));
-    early.receive(connection_request(proto::protocol::ssl));  // plaintext before TLS completed
-    CHECK(early.state() == State::closed);
-
-    Connection skipped;
+    Connection skipped({}, tls_negotiation());
     connect_until_demand_active(skipped);
     const std::array input{proto::InputEvent{proto::KeyboardEvent{0, 0x1e}}};
     Writer fp;
@@ -515,11 +466,7 @@ TEST_CASE("Garbage and out-of-order PDUs close the connection with an error")
 
 TEST_CASE("Skip-channel-join clients go straight from Attach User to Client Info")
 {
-    Connection c;
-    c.receive(connection_request(proto::protocol::ssl));
-    static_cast<void>(c.take_output());
-    static_cast<void>(events(c));
-    c.tls_established();
+    Connection c({}, tls_negotiation());
     c.receive(connect_initial(client_data(proto::protocol::ssl, gcc::cs_early_flags::support_skip_channeljoin)));
     const auto out = split(c.take_output());
     {
@@ -542,7 +489,7 @@ TEST_CASE("Skip-channel-join clients go straight from Attach User to Client Info
 
 TEST_CASE("Without fast-path output, bitmap updates use slow-path Update PDUs")
 {
-    Connection c;
+    Connection c({}, tls_negotiation());
     const auto share_id = connect_until_demand_active(c);
     c.receive(confirm_active(share_id, false));
     finalize(c, share_id);
@@ -564,7 +511,7 @@ TEST_CASE("Without fast-path output, bitmap updates use slow-path Update PDUs")
 
 TEST_CASE("A client Shutdown Request is reported, and the client's ultimatum closes")
 {
-    Connection c;
+    Connection c({}, tls_negotiation());
     const auto share_id = connect_until_demand_active(c);
     c.receive(confirm_active(share_id, true));
     finalize(c, share_id);
@@ -574,4 +521,46 @@ TEST_CASE("A client Shutdown Request is reported, and the client's ultimatum clo
     c.receive(domain(mcs::DisconnectProviderUltimatum{}));
     const auto closed = std::get<ev::Closed>(c.poll_event().value());
     CHECK_FALSE(closed.error);
+}
+
+TEST_CASE("Static channel data goes out on the channel's own MCS ID")
+{
+    Connection c({}, tls_negotiation());
+    const auto share_id = connect_until_demand_active(c);
+    c.receive(confirm_active(share_id, true));
+    finalize(c, share_id);
+    static_cast<void>(c.take_output());
+    REQUIRE(c.active());
+
+    const auto rdpdr = c.session().static_channel_id("RDPDR");  // names compare without regard to case
+    REQUIRE(rdpdr.has_value());
+    CHECK_FALSE(c.session().static_channel_id("drdynvc").has_value());
+    CHECK_FALSE(c.session().supports_gfx());
+
+    const std::array chunk{std::byte{0x04}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+                           std::byte{0x03}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+    c.send_channel_data(*rdpdr, chunk);
+    const auto out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 1);
+    Bytes storage;
+    const auto pdu = domain_of(out.tpkt[0], storage);
+    const auto& send = std::get<mcs::SendDataIndication>(pdu);
+    CHECK(send.initiator == mcs::server_channel_id);
+    CHECK(send.channel_id == *rdpdr);
+    CHECK(Bytes(send.data.begin(), send.data.end()) == Bytes(chunk.begin(), chunk.end()));
+}
+
+TEST_CASE("GFX needs the early flag, the drdynvc channel and 32 bpp")
+{
+    farland::server::Session s;
+    s.static_channels = {{"rdpdr", 1004}, {"drdynvc", 1005}};
+    s.client_data.core.early_capability_flags = gcc::cs_early_flags::support_dynvc_gfx_protocol;
+    s.bits_per_pixel = 32;
+    CHECK(s.supports_gfx());
+    CHECK(s.static_channel_id("DRDYNVC") == 1005);
+    s.bits_per_pixel = 16;
+    CHECK_FALSE(s.supports_gfx());
+    s.bits_per_pixel = 32;
+    s.client_data.core.early_capability_flags = 0;
+    CHECK_FALSE(s.supports_gfx());
 }

@@ -26,14 +26,14 @@ This document covers scope, architecture, reference material and risks. The phas
 | Decision | Choice | Notes |
 |---|---|---|
 | First deliverable | **Server** | The client follows once the server has shipped (phase 2) |
-| Language | **C++23** (GCC ≥ 13, Clang ≥ 17) | `std::span`, `std::expected`, `std::byte`; see §6 on how memory-safety risk is handled |
+| Language | **C++23** (GCC ≥ 13, Clang ≥ 19) | `std::span`, `std::expected`, `std::byte`; see §6 on how memory-safety risk is handled |
 | Protocol core | **Our own**, sans-IO | ZeroVDI, macRDP, FreeRDP and IronRDP serve as behavioural references only |
 | Build | **Meson** (+ wraps) | Consistent with the PipeWire, libei and GNOME/wlroots ecosystems, and pkg-config native. Keep the set of build options small; FreeRDP has about 240 |
 | TLS/crypto | **OpenSSL 3** | TLS server/client, X.509 generation, and the NTLM primitives via EVP. MD4 needs the legacy provider or its own implementation, because OpenSSL 3 disables MD4 by default |
 | Kerberos/SPNEGO | **System GSSAPI** (MIT krb5) | We do not implement Kerberos ourselves, unlike FreeRDP's in-tree package |
 | NTLM | **Our own implementation** | The server has to verify NTLMv2 against a stored NT hash; ports of macRDP's and ZeroVDI's code are available |
 | License | **Apache-2.0** | Compatible with reading and translating FreeRDP code; translated files keep FreeRDP's copyright notices and are marked as modified. An optional x264 backend makes that build's combined binary GPLv3, so x264 stays opt-in and is never the default |
-| Platform baseline | **2024-era distributions:** Debian 13, Ubuntu 24.04, Fedora 40, RHEL 10 and later | GCC ≥ 13 / Clang ≥ 17, PipeWire ≥ 1.0, xdg-desktop-portal ≥ 1.18 (Clipboard portal), libei ≥ 1.0. RHEL 9 and Ubuntu 22.04 are not supported: no compatibility shims |
+| Platform baseline | **2024-era distributions:** Debian 13, Ubuntu 24.04, Fedora 40, RHEL 10 and later | GCC ≥ 13 / Clang ≥ 19 (Clang 18 cannot use libstdc++'s `std::expected`), PipeWire ≥ 1.0, xdg-desktop-portal ≥ 1.18 (Clipboard portal), libei ≥ 1.0. RHEL 9 and Ubuntu 22.04 are not supported: no compatibility shims |
 | Public API | **No stable API until the client phase** | Internal C++ APIs can change freely during server 1.0. A versioned `libfarland` C API ships with the client (C5), for Remmina, GNOME Connections and KRDC plugins. The server is controlled through D-Bus and `farlandctl` only |
 
 All foundational decisions are settled (2026-09-13).

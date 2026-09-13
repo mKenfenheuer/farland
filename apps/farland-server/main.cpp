@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
 // SPDX-License-Identifier: Apache-2.0
 
-// farland-server, M1: an RDP server over TLS with the synthetic test backend.
-// Wayland capture (M4) and NLA (M2) come later.
+// farland-server: an RDP server with NLA and the synthetic test backend.
+// Wayland capture comes with M4.
 
+#include <farland/auth/credential_store.hpp>
+#include <farland/auth/ntlm.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/log.hpp>
 
+#include "nla.hpp"
+#include "privsep_process.hpp"
+#include "sandbox.hpp"
 #include "session.hpp"
 
 #include <algorithm>
@@ -18,6 +23,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <netdb.h>
@@ -32,6 +38,7 @@
 namespace {
 
 namespace log = farland::log;
+namespace app = farland::app;
 using farland::app::SessionOptions;
 constexpr std::string_view log_component = "app";
 
@@ -49,8 +56,15 @@ struct Options {
     std::string port = "3389";
     std::filesystem::path cert;
     std::filesystem::path key;
+    std::filesystem::path users;
     std::string hostname;
+    std::string log_level = "info";
     bool print_fingerprint = false;
+    bool privsep = true;
+    bool allow_tls_only = false;
+    /// Internal: this process is the network process for one client.
+    bool privsep_child = false;
+    std::string peer;
     int max_sessions = 4;
     SessionOptions session;
 };
@@ -83,10 +97,16 @@ void usage()
                  "  --port PORT           TCP port (default 3389)\n"
                  "  --cert FILE --key FILE  TLS certificate and key (PEM); created if both are missing\n"
                  "                        (default: $XDG_CONFIG_HOME/farland/tls/{cert,key}.pem)\n"
+                 "  --users FILE          NLA users, managed with farlandctl passwd\n"
+                 "                        (default: $XDG_CONFIG_HOME/farland/users)\n"
                  "  --hostname NAME       certificate host name (default: this host's name)\n"
                  "  --fps N               frame rate of the test pattern (default 30)\n"
                  "  --codec planar|raw    bitmap codec for 32 bpp sessions (default planar)\n"
+                 "  --gfx-codec CODEC     progressive, planar or avc420 for GFX clients (default progressive)\n"
+                 "  --openh264 FILE       OpenH264 library for avc420 (default: libopenh264.so.8 and older)\n"
                  "  --max-sessions N      concurrent connections (default 4)\n"
+                 "  --allow-tls-only      also accept clients without NLA (anyone reaches the login screen)\n"
+                 "  --no-privsep          handle clients in this process instead of a sandboxed one\n"
                  "  --log-level LEVEL     trace, debug, info, warn, error (default info)\n"
                  "  --fingerprint         print the certificate's SHA-256 fingerprint and exit\n";
 }
@@ -109,6 +129,8 @@ bool parse_options(std::span<char*> args, Options& options)
             options.cert = value();
         } else if (arg == "--key") {
             options.key = value();
+        } else if (arg == "--users") {
+            options.users = value();
         } else if (arg == "--hostname") {
             options.hostname = value();
         } else if (arg == "--fps") {
@@ -120,14 +142,36 @@ bool parse_options(std::span<char*> args, Options& options)
             }
             options.session.codec =
                 codec == "planar" ? farland::server::BitmapCodec::planar : farland::server::BitmapCodec::uncompressed;
+        } else if (arg == "--gfx-codec") {
+            const auto codec = value();
+            if (codec == "progressive") {
+                options.session.gfx_codec = farland::server::TileCodec::progressive;
+            } else if (codec == "planar") {
+                options.session.gfx_codec = farland::server::TileCodec::planar;
+            } else if (codec == "avc420" || codec == "h264") {
+                options.session.gfx_codec = farland::server::TileCodec::avc420;
+            } else {
+                throw std::runtime_error("--gfx-codec must be progressive, planar or avc420");
+            }
+        } else if (arg == "--openh264") {
+            options.session.openh264_library = value();
         } else if (arg == "--max-sessions") {
             options.max_sessions = std::stoi(value());
+        } else if (arg == "--allow-tls-only") {
+            options.allow_tls_only = true;
+            options.session.preauth.require_nla = false;
+        } else if (arg == "--no-privsep") {
+            options.privsep = false;
+        } else if (arg == "--privsep-child") {
+            options.privsep_child = true;
+        } else if (arg == "--peer") {
+            options.peer = value();
         } else if (arg == "--log-level") {
-            const auto level = value();
+            options.log_level = value();
             static constexpr std::array levels{"trace", "debug", "info", "warn", "error"};
-            const auto* found = std::ranges::find(levels, level);
+            const auto* found = std::ranges::find(levels, options.log_level);
             if (found == levels.end()) {
-                throw std::runtime_error("unknown log level " + level);
+                throw std::runtime_error("unknown log level " + options.log_level);
             }
             log::set_level(static_cast<log::Level>(found - levels.begin()));
         } else if (arg == "--fingerprint") {
@@ -146,10 +190,25 @@ bool parse_options(std::span<char*> args, Options& options)
         options.cert = config_dir() / "tls" / "cert.pem";
         options.key = config_dir() / "tls" / "key.pem";
     }
+    if (options.users.empty()) {
+        options.users = config_dir() / "users";
+    }
     if (options.hostname.empty()) {
         options.hostname = local_hostname();
     }
     return true;
+}
+
+/// The arguments that give the network process the monitor's configuration.
+app::ChildLaunch child_launch(const Options& options, const char* argv0)
+{
+    app::ChildLaunch launch{app::current_executable(argv0), {}};
+    launch.arguments = {"--cert",     options.cert.string(), "--key",       options.key.string(),
+                        "--hostname", options.hostname,      "--log-level", options.log_level};
+    if (options.allow_tls_only) {
+        launch.arguments.emplace_back("--allow-tls-only");
+    }
+    return launch;
 }
 
 int listen_on(const Options& options)
@@ -165,6 +224,7 @@ int listen_on(const Options& options)
     const int fd = ::socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     const int yes = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
     const bool ok = fd >= 0 && ::bind(fd, result->ai_addr, result->ai_addrlen) == 0 && ::listen(fd, 16) == 0;
     ::freeaddrinfo(result);
     if (!ok) {
@@ -187,6 +247,50 @@ std::string peer_name(const sockaddr_storage& address)
     return host + ":" + port;
 }
 
+/// Checks NTLM responses against the credential store, read afresh for every
+/// connection so that farlandctl changes apply without a restart.
+class StoreVerifier final : public farland::auth::NtlmVerifier {
+public:
+    explicit StoreVerifier(farland::auth::CredentialStore store)
+        : store_(std::move(store)),
+          verifier_([this](std::string_view user, std::string_view domain) { return store_.lookup(user, domain); })
+    {
+    }
+
+    std::optional<std::array<std::byte, 16>> session_base_key(std::string_view user, std::string_view domain,
+                                                              std::span<const std::byte, 8> challenge,
+                                                              std::span<const std::byte> response) override
+    {
+        return verifier_.session_base_key(user, domain, challenge, response);
+    }
+    bool verify_password(std::string_view user, std::string_view domain, std::string_view password) override
+    {
+        return verifier_.verify_password(user, domain, password);
+    }
+
+private:
+    farland::auth::CredentialStore store_;
+    farland::auth::ntlm::LocalNtlmVerifier verifier_;
+};
+
+/// The network process: one client, sandboxed.
+int run_child(const Options& options)
+{
+    std::signal(SIGPIPE, SIG_IGN);
+    auto identity = farland::auth::TlsIdentity::load_or_create(options.cert, options.key, options.hostname);
+    if (!identity) {
+        log::error(log_component, "cannot load the TLS identity: {}", identity.error().message());
+        return 1;
+    }
+    if (!app::enter_network_sandbox()) {
+        return 1;
+    }
+    const auto& tls = *identity;
+    return app::run_network_child(options.peer, tls, options.session, [&](farland::auth::NtlmVerifier& verifier) {
+        return app::make_nla_factory(tls, verifier, options.hostname);
+    });
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -202,6 +306,13 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    // This build can serve the Graphics Pipeline (planar tiles over RDPGFX).
+    options.session.preauth.advertise_gfx = true;
+
+    if (options.privsep_child) {
+        return run_child(options);
+    }
+
     auto identity = farland::auth::TlsIdentity::load_or_create(options.cert, options.key, options.hostname);
     if (!identity) {
         std::cerr << "farland-server: cannot load or create the TLS identity: " << identity.error().message() << "\n";
@@ -210,6 +321,13 @@ int main(int argc, char** argv)
     if (options.print_fingerprint) {
         std::cout << identity->sha256_fingerprint() << "\n";
         return 0;
+    }
+    const auto launch = child_launch(options, argv[0]);
+    if (const auto users = farland::auth::CredentialStore::load(options.users); !users) {
+        std::cerr << "farland-server: cannot read the NLA user store " << options.users.string() << "\n";
+        return 1;
+    } else if (users->entries().empty()) {
+        log::warn(log_component, "no NLA users in {}; add one with: farlandctl passwd USER", options.users.string());
     }
 
     std::signal(SIGINT, on_signal);
@@ -223,8 +341,8 @@ int main(int argc, char** argv)
         std::cerr << "farland-server: " << e.what() << "\n";
         return 1;
     }
-    log::info(log_component, "listening on {}:{}, certificate SHA-256 {}", options.bind, options.port,
-              identity->sha256_fingerprint());
+    log::info(log_component, "listening on {}:{}, certificate SHA-256 {}{}", options.bind, options.port,
+              identity->sha256_fingerprint(), options.privsep ? "" : " (privilege separation off)");
 
     while (!stop_requested.load()) {
         pollfd pfd{listener, POLLIN, 0};
@@ -237,6 +355,7 @@ int main(int argc, char** argv)
         if (fd < 0) {
             continue;
         }
+        app::prepare_socket(fd);
         const std::string peer = peer_name(address);
         if (active_sessions.load() >= options.max_sessions) {
             log::warn(log_component, "{}: refused, {} sessions already running", peer, options.max_sessions);
@@ -245,8 +364,25 @@ int main(int argc, char** argv)
         }
         log::info(log_component, "{}: connected", peer);
         ++active_sessions;
-        std::thread([fd, peer, &identity, &options] {
-            farland::app::run_session(fd, peer, *identity, options.session, stop_requested);
+        std::thread([fd, peer, &identity, &options, &launch] {
+            if (options.privsep) {
+                auto store = farland::auth::CredentialStore::load(options.users);
+                if (!store) {
+                    log::error(log_component, "{}: refused, the NLA user store cannot be read", peer);
+                    ::close(fd);
+                } else {
+                    StoreVerifier verifier(std::move(*store));
+                    app::run_monitored_session(fd, peer, launch, verifier, options.session, stop_requested);
+                }
+            } else if (auto store = farland::auth::CredentialStore::load(options.users); !store) {
+                log::error(log_component, "{}: refused, the NLA user store cannot be read", peer);
+                ::close(fd);
+            } else {
+                StoreVerifier verifier(std::move(*store));
+                auto session = options.session;
+                session.make_nla = app::make_nla_factory(*identity, verifier, options.hostname);
+                app::run_session(fd, peer, *identity, session, stop_requested);
+            }
             --active_sessions;
         }).detach();
     }

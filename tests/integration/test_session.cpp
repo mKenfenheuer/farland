@@ -3,8 +3,13 @@
 
 // End to end over a real socket: farland-server's session loop (TLS pump,
 // connection state machine, test pattern, frame encoder) against a scripted
-// client that does TLS, activates, decodes the planar frames and clicks.
+// client that does TLS, activates, decodes the planar frames and clicks. The
+// same client runs against the in-process loop and the privilege-separated
+// network process.
 
+#include <farland/auth/credential_store.hpp>
+#include <farland/auth/credssp.hpp>
+#include <farland/auth/ntlm.hpp>
 #include <farland/auth/tls.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/codec/planar.hpp>
@@ -15,6 +20,8 @@
 #include <farland/proto/share.hpp>
 #include <farland/proto/x224.hpp>
 
+#include "nla.hpp"
+#include "privsep_process.hpp"
 #include "session.hpp"
 #include "support/client_pdus.hpp"
 
@@ -22,6 +29,8 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <poll.h>
 #include <set>
@@ -73,6 +82,31 @@ public:
         }
     }
 
+    /// The TLS connection, once start_tls has run.
+    [[nodiscard]] const farland::auth::TlsClient& tls() const { return *tls_; }
+
+    /// The next complete TSRequest (CredSSP, inside TLS).
+    Bytes read_ts_request()
+    {
+        for (;;) {
+            const auto size = farland::auth::credssp::frame_ts_request(plain_);
+            REQUIRE(size.has_value());
+            if (size->has_value() && plain_.size() >= **size) {
+                return take(**size);
+            }
+            read_more();
+        }
+    }
+
+    /// The next `n` plaintext bytes.
+    Bytes read_exact(std::size_t n)
+    {
+        while (plain_.size() < n) {
+            read_more();
+        }
+        return take(n);
+    }
+
     /// The next complete PDU (plaintext).
     Bytes read_pdu()
     {
@@ -90,6 +124,13 @@ public:
     }
 
 private:
+    Bytes take(std::size_t n)
+    {
+        Bytes out(plain_.begin(), plain_.begin() + static_cast<std::ptrdiff_t>(n));
+        plain_.erase(plain_.begin(), plain_.begin() + static_cast<std::ptrdiff_t>(n));
+        return out;
+    }
+
     void send_raw(std::span<const std::byte> bytes)
     {
         while (!bytes.empty()) {
@@ -187,6 +228,191 @@ struct Canvas {
     }
 };
 
+struct Login {
+    std::string user;
+    std::string password;
+};
+
+/// X.224 in plaintext, then TLS on the same stream and, with a login, NLA
+/// with SPNEGO and NTLM. The server's NTSTATUS when it refused the login.
+std::optional<std::uint32_t> negotiate(TestClient& c, std::uint32_t protocol, const Login* login)
+{
+    const auto requested = login != nullptr
+                               ? proto::protocol::ssl | proto::protocol::hybrid | proto::protocol::hybrid_ex
+                               : proto::protocol::ssl;
+    c.send(client::connection_request(requested));
+    {
+        const auto cc = c.read_pdu();
+        Reader r(cc);
+        Reader tpdu = proto::read_tpkt(r).value();
+        const auto confirm = proto::decode_connection_confirm(tpdu).value();
+        REQUIRE(std::get<proto::NegotiationResponse>(confirm.result).selected_protocol == protocol);
+    }
+    c.start_tls();
+    if (login == nullptr) {
+        return std::nullopt;
+    }
+
+    namespace credssp = farland::auth::credssp;
+    namespace ntlm = farland::auth::ntlm;
+    ntlm::InitiatorConfig mechanism;
+    mechanism.user = login->user;
+    mechanism.password = farland::SecretString(std::string(login->password));
+    mechanism.workstation = "E2E";
+    mechanism.channel_bindings = ntlm::channel_bindings_hash(c.tls().peer_certificate_der());
+    credssp::InitiatorConfig config;
+    config.mechanism = std::make_unique<ntlm::Initiator>(std::move(mechanism));
+    const auto key = c.tls().peer_subject_public_key();
+    config.server_public_key.assign(key.begin(), key.end());
+    config.credentials =
+        farland::auth::PasswordCredentials{"", login->user, farland::SecretString(std::string(login->password))};
+    credssp::Initiator initiator(std::move(config));
+    for (;;) {
+        c.send(initiator.take_output());
+        if (initiator.status() != credssp::Initiator::Status::in_progress) {
+            break;
+        }
+        initiator.receive(c.read_ts_request());
+    }
+    if (initiator.status() != credssp::Initiator::Status::succeeded) {
+        return initiator.server_error_code().value_or(0);
+    }
+    if (protocol == proto::protocol::hybrid_ex) {
+        // Early User Authorization Result: AUTHZ_SUCCESS.
+        CHECK(c.read_exact(4) == Bytes(4, std::byte{0}));
+    }
+    return std::nullopt;
+}
+
+/// The scripted client, from X.224 to the server's shutdown: sets `stop`
+/// once it has seen frames and input, then expects the ultimatum.
+void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto::protocol::ssl,
+                const Login* login = nullptr)
+{
+    TestClient c(fd);
+
+    REQUIRE_FALSE(negotiate(c, protocol, login).has_value());
+
+    // MCS connect and domain setup.
+    c.send(client::connect_initial(client::client_data(protocol, 0x0001, width, height)));
+    static_cast<void>(c.read_pdu());  // Connect Response
+    c.send(client::erect_domain());
+    c.send(client::attach_user());
+    std::uint16_t user = 0;
+    {
+        const auto confirm = c.read_pdu();
+        Reader r(confirm);
+        Reader tpdu = proto::read_tpkt(r).value();
+        Reader data = proto::decode_data_tpdu(tpdu).value();
+        user = std::get<mcs::AttachUserConfirm>(mcs::decode_domain_pdu(data).value()).initiator.value();
+    }
+    for (const std::uint16_t channel : {user, mcs::io_channel_id}) {
+        c.send(client::channel_join(user, channel));
+        static_cast<void>(c.read_pdu());
+    }
+
+    // Client Info, license, capabilities, finalization.
+    c.send(client::client_info(user, "e2e"));
+    static_cast<void>(c.read_pdu());  // license
+    std::uint32_t share_id = 0;
+    {
+        const auto payload = indication(c.read_pdu());
+        Reader r(payload);
+        auto control = proto::read_share_control(r).value();
+        share_id = proto::decode_demand_active(control.body).value().share_id;
+    }
+    c.send(client::confirm_active(user, share_id, true, width, height));
+    c.send(client::finalization(user, share_id));
+    for (int i = 0; i < 4; ++i) {
+        static_cast<void>(c.read_pdu());  // Synchronize, Cooperate, Granted, Font Map
+    }
+
+    // The first frames cover the whole desktop: 5 x 4 tiles.
+    Canvas canvas;
+    for (int i = 0; i < 400 && canvas.tiles_seen.size() < 20; ++i) {
+        canvas.apply(c.read_pdu());
+    }
+    REQUIRE(canvas.tiles_seen.size() == 20);
+    CHECK(canvas.rgb(5, 5) == 0xFFFFFF);    // first color bar
+    CHECK(canvas.rgb(315, 5) == 0x000000);  // last color bar
+
+    // Press the left button at (160, 200): the crosshair turns red.
+    const std::array input{
+        proto::InputEvent{proto::MouseEvent{proto::ptr_flags::move, 160, 200}},
+        proto::InputEvent{proto::MouseEvent{proto::ptr_flags::down | proto::ptr_flags::button1, 160, 200}},
+    };
+    c.send(client::fastpath_input(input));
+    for (int i = 0; i < 400 && canvas.rgb(170, 200) != 0xFF2020; ++i) {
+        canvas.apply(c.read_pdu());
+    }
+    CHECK(canvas.rgb(170, 200) == 0xFF2020);
+
+    // Server shutdown: Set Error Info, then the Disconnect Provider Ultimatum.
+    stop = true;
+    bool ultimatum = false;
+    for (int i = 0; i < 400 && !ultimatum; ++i) {
+        const auto pdu = c.read_pdu();
+        if (std::to_integer<unsigned>(pdu.at(0)) != 0x03) {
+            continue;
+        }
+        Reader r(pdu);
+        Reader tpdu = proto::read_tpkt(r).value();
+        Reader data = proto::decode_data_tpdu(tpdu).value();
+        ultimatum = std::holds_alternative<mcs::DisconnectProviderUltimatum>(mcs::decode_domain_pdu(data).value());
+    }
+    CHECK(ultimatum);
+}
+
+/// No NLA users: these tests cover the TLS-only path.
+class NoUsers final : public farland::auth::NtlmVerifier {
+public:
+    std::optional<std::array<std::byte, 16>> session_base_key(std::string_view /*user*/, std::string_view /*domain*/,
+                                                              std::span<const std::byte, 8> /*challenge*/,
+                                                              std::span<const std::byte> /*response*/) override
+    {
+        return std::nullopt;
+    }
+    bool verify_password(std::string_view /*user*/, std::string_view /*domain*/, std::string_view /*password*/) override
+    {
+        return false;
+    }
+};
+
+/// One NLA user, alice, in an in-memory credential store.
+class AliceVerifier final : public farland::auth::NtlmVerifier {
+public:
+    AliceVerifier()
+        : verifier_([this](std::string_view user, std::string_view domain) { return store_.lookup(user, domain); })
+    {
+        store_.set("alice", "", farland::auth::ntlm::nt_hash("Secret1!"));
+    }
+    std::optional<std::array<std::byte, 16>> session_base_key(std::string_view user, std::string_view domain,
+                                                              std::span<const std::byte, 8> challenge,
+                                                              std::span<const std::byte> response) override
+    {
+        return verifier_.session_base_key(user, domain, challenge, response);
+    }
+    bool verify_password(std::string_view user, std::string_view domain, std::string_view password) override
+    {
+        return verifier_.verify_password(user, domain, password);
+    }
+
+private:
+    farland::auth::CredentialStore store_;
+    farland::auth::ntlm::LocalNtlmVerifier verifier_;
+};
+
+/// A certificate and key on disk for the network process, removed afterwards.
+struct TempIdentity {
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ("farland-e2e-" + std::to_string(::getpid()));
+    std::filesystem::path cert = dir / "cert.pem";
+    std::filesystem::path key = dir / "key.pem";
+    TempIdentity() { REQUIRE(farland::auth::TlsIdentity::load_or_create(cert, key, "e2e.farland.test").has_value()); }
+    TempIdentity(const TempIdentity&) = delete;
+    TempIdentity& operator=(const TempIdentity&) = delete;
+    ~TempIdentity() { std::filesystem::remove_all(dir); }
+};
+
 }  // namespace
 
 TEST_CASE("End to end: TLS, activation, planar frames and input over a socket")
@@ -197,90 +423,113 @@ TEST_CASE("End to end: TLS, activation, planar frames and input over a socket")
     std::atomic<bool> stop{false};
     farland::app::SessionOptions options;
     options.frames_per_second = 60;
+    options.preauth.require_nla = false;  // this test covers the TLS-only path
     std::thread server([&] { farland::app::run_session(fds[0], "e2e", identity, options, stop); });
+    run_client(fds[1], stop);
+    server.join();
+}
 
+TEST_CASE("End to end through the privilege-separated network process")
+{
+    // The network process is farland-server itself; meson passes its path.
+    const char* executable = std::getenv("FARLAND_SERVER");
+    if (executable == nullptr) {
+        SKIP("FARLAND_SERVER is not set");
+    }
+    const TempIdentity files;
+
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const farland::app::ChildLaunch launch{executable,
+                                           {"--cert", files.cert.string(), "--key", files.key.string(), "--hostname",
+                                            "e2e.farland.test", "--log-level", "warn", "--allow-tls-only"}};
+    NoUsers verifier;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.frames_per_second = 60;
+    options.preauth.require_nla = false;
+    std::thread monitor(
+        [&] { farland::app::run_monitored_session(fds[0], "e2e-privsep", launch, verifier, options, stop); });
+    run_client(fds[1], stop);
+    monitor.join();
+}
+
+TEST_CASE("End to end with NLA: HYBRID_EX, SPNEGO and NTLM in process")
+{
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
+    AliceVerifier verifier;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.frames_per_second = 60;
+    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    std::thread server([&] { farland::app::run_session(fds[0], "e2e-nla", identity, options, stop); });
+    const Login login{"alice", "Secret1!"};
+    run_client(fds[1], stop, proto::protocol::hybrid_ex, &login);
+    server.join();
+}
+
+TEST_CASE("NLA with a wrong password ends with STATUS_LOGON_FAILURE")
+{
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
+    AliceVerifier verifier;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    std::thread server([&] { farland::app::run_session(fds[0], "e2e-nla-bad", identity, options, stop); });
     {
         TestClient c(fds[1]);
-
-        // X.224 in plaintext, then TLS on the same stream.
-        c.send(client::connection_request(proto::protocol::ssl));
-        {
-            const auto cc = c.read_pdu();
-            Reader r(cc);
-            Reader tpdu = proto::read_tpkt(r).value();
-            const auto confirm = proto::decode_connection_confirm(tpdu).value();
-            REQUIRE(std::get<proto::NegotiationResponse>(confirm.result).selected_protocol == proto::protocol::ssl);
-        }
-        c.start_tls();
-
-        // MCS connect and domain setup.
-        c.send(client::connect_initial(client::client_data(proto::protocol::ssl, 0x0001, width, height)));
-        static_cast<void>(c.read_pdu());  // Connect Response
-        c.send(client::erect_domain());
-        c.send(client::attach_user());
-        std::uint16_t user = 0;
-        {
-            const auto confirm = c.read_pdu();
-            Reader r(confirm);
-            Reader tpdu = proto::read_tpkt(r).value();
-            Reader data = proto::decode_data_tpdu(tpdu).value();
-            user = std::get<mcs::AttachUserConfirm>(mcs::decode_domain_pdu(data).value()).initiator.value();
-        }
-        for (const std::uint16_t channel : {user, mcs::io_channel_id}) {
-            c.send(client::channel_join(user, channel));
-            static_cast<void>(c.read_pdu());
-        }
-
-        // Client Info, license, capabilities, finalization.
-        c.send(client::client_info(user, "e2e"));
-        static_cast<void>(c.read_pdu());  // license
-        std::uint32_t share_id = 0;
-        {
-            const auto payload = indication(c.read_pdu());
-            Reader r(payload);
-            auto control = proto::read_share_control(r).value();
-            share_id = proto::decode_demand_active(control.body).value().share_id;
-        }
-        c.send(client::confirm_active(user, share_id, true, width, height));
-        c.send(client::finalization(user, share_id));
-        for (int i = 0; i < 4; ++i) {
-            static_cast<void>(c.read_pdu());  // Synchronize, Cooperate, Granted, Font Map
-        }
-
-        // The first frames cover the whole desktop: 5 x 4 tiles.
-        Canvas canvas;
-        for (int i = 0; i < 400 && canvas.tiles_seen.size() < 20; ++i) {
-            canvas.apply(c.read_pdu());
-        }
-        REQUIRE(canvas.tiles_seen.size() == 20);
-        CHECK(canvas.rgb(5, 5) == 0xFFFFFF);    // first color bar
-        CHECK(canvas.rgb(315, 5) == 0x000000);  // last color bar
-
-        // Press the left button at (160, 200): the crosshair turns red.
-        const std::array input{
-            proto::InputEvent{proto::MouseEvent{proto::ptr_flags::move, 160, 200}},
-            proto::InputEvent{proto::MouseEvent{proto::ptr_flags::down | proto::ptr_flags::button1, 160, 200}},
-        };
-        c.send(client::fastpath_input(input));
-        for (int i = 0; i < 400 && canvas.rgb(170, 200) != 0xFF2020; ++i) {
-            canvas.apply(c.read_pdu());
-        }
-        CHECK(canvas.rgb(170, 200) == 0xFF2020);
-
-        // Server shutdown: Set Error Info, then the Disconnect Provider Ultimatum.
-        stop = true;
-        bool ultimatum = false;
-        for (int i = 0; i < 400 && !ultimatum; ++i) {
-            const auto pdu = c.read_pdu();
-            if (std::to_integer<unsigned>(pdu.at(0)) != 0x03) {
-                continue;
-            }
-            Reader r(pdu);
-            Reader tpdu = proto::read_tpkt(r).value();
-            Reader data = proto::decode_data_tpdu(tpdu).value();
-            ultimatum = std::holds_alternative<mcs::DisconnectProviderUltimatum>(mcs::decode_domain_pdu(data).value());
-        }
-        CHECK(ultimatum);
+        const Login login{"alice", "wrong"};
+        CHECK(negotiate(c, proto::protocol::hybrid_ex, &login) == farland::auth::credssp::status_logon_failure);
     }
     server.join();
+}
+
+TEST_CASE("TLS-only clients are refused while NLA is required")
+{
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
+    AliceVerifier verifier;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    std::thread server([&] { farland::app::run_session(fds[0], "e2e-tls-refused", identity, options, stop); });
+    {
+        TestClient c(fds[1]);
+        c.send(client::connection_request(proto::protocol::ssl));
+        const auto cc = c.read_pdu();
+        Reader r(cc);
+        Reader tpdu = proto::read_tpkt(r).value();
+        const auto confirm = proto::decode_connection_confirm(tpdu).value();
+        CHECK(std::get<proto::NegotiationFailureCode>(confirm.result) ==
+              proto::NegotiationFailureCode::hybrid_required_by_server);
+    }
+    server.join();
+}
+
+TEST_CASE("End to end with NLA through the privilege-separated network process")
+{
+    const char* executable = std::getenv("FARLAND_SERVER");
+    if (executable == nullptr) {
+        SKIP("FARLAND_SERVER is not set");
+    }
+    const TempIdentity files;
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const farland::app::ChildLaunch launch{executable,
+                                           {"--cert", files.cert.string(), "--key", files.key.string(), "--hostname",
+                                            "e2e.farland.test", "--log-level", "warn"}};
+    AliceVerifier verifier;  // only the monitor holds the store
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.frames_per_second = 60;
+    std::thread monitor(
+        [&] { farland::app::run_monitored_session(fds[0], "e2e-privsep-nla", launch, verifier, options, stop); });
+    const Login login{"alice", "Secret1!"};
+    run_client(fds[1], stop, proto::protocol::hybrid_ex, &login);
+    monitor.join();
 }

@@ -5,6 +5,7 @@
 
 #include <farland/base/assert.hpp>
 
+#include <algorithm>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -29,7 +30,14 @@ public:
     void u16be(std::uint16_t value) { write_be(value); }
     void u32be(std::uint32_t value) { write_be(value); }
 
-    void bytes(std::span<const std::byte> data) { buf_.insert(buf_.end(), data.begin(), data.end()); }
+    void bytes(std::span<const std::byte> data)
+    {
+        // resize + copy rather than insert: GCC 13 and 14 report a bogus
+        // -Wstringop-overflow for the inlined vector::insert at -O3.
+        const std::size_t old = buf_.size();
+        buf_.resize(old + data.size());
+        std::ranges::copy(data, buf_.begin() + static_cast<std::ptrdiff_t>(old));
+    }
     void zeros(std::size_t count) { buf_.resize(buf_.size() + count); }
 
     template <std::unsigned_integral T>

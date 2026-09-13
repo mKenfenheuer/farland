@@ -8,22 +8,25 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
+**Status (2026-09-13):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is next.
+
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
 ---
 
 ## Phase 1: server
 
-### M0: Foundations (~2 weeks)
+### M0: Foundations (~2 weeks): done
 - Set up the repo with Meson, clang-format/clang-tidy and a pre-commit hook. CI on GCC and Clang: debug, ASan+UBSan, TSan and hardened-release builds.
-- CI containers: Ubuntu 24.04 (the oldest baseline: GCC 13, Clang 18, Meson 1.3), Debian 13, current Fedora and Arch, each with GCC and Clang. Fedora 40 is past end of life and its repositories are archived, so current Fedora stands in for it. A build that needs anything newer than the baseline fails CI.
+- CI containers: Ubuntu 24.04 (the oldest baseline: GCC 13, Clang 19 from `clang-19`, Meson 1.3), Debian 13, current Fedora and Arch, each with GCC and Clang. Fedora 40 is past end of life and its repositories are archived, so current Fedora stands in for it. A build that needs anything newer than the baseline fails CI.
 - SPDX license headers (Apache-2.0) on every file, checked in CI with the REUSE tool. Files translated from FreeRDP keep FreeRDP's copyright notice and carry a "modified" note (see NOTICE).
 - `farland-base`: bounded `Reader`/`Writer`, `expected` error model, BER/PER/DER codecs, logging, and a hex-dump test helper.
 - Fuzz harness scaffolding (libFuzzer plus a corpus directory layout), and a transcript-replay test harness.
 - Spec index: map the MS-* documents to sections, and follow the convention of citing `[MS-RDPBCGR] 2.2.1.3.2` style references in code.
 - **Exit:** CI green on all build variants; the first fuzz target (BER/PER) runs nightly.
+- **Status: done.** The CI workflow has all the build variants and a nightly fuzz job, but it has not run on GitHub yet because nothing has been pushed. The same builds pass locally: Apple clang and Homebrew LLVM on macOS (including ASan+UBSan and TSan), and GCC 15 on Ubuntu 26.04.
 
-### M1: Connection core, TLS only (~5 weeks)
+### M1: Connection core, TLS only (~5 weeks): done
 - **X.224:** full `RDP_NEG_REQ`/`RSP`/`FAILURE` handling, skipping the cookie and routing token, and correct `RSP` flags (`EXTENDED_CLIENT_DATA_SUPPORTED`, `DYNVC_GFX_PROTOCOL_SUPPORTED`).
 - **TLS server** (OpenSSL 3): self-signed certificate generated with the serverAuth EKU, or a user-supplied certificate; the fingerprint is shown in `farlandctl`.
 - **MCS/GCC with real parsers:**
@@ -42,8 +45,16 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - mstsc (Windows 11), Windows App (macOS) and FreeRDP 2 and 3 connect over TLS-only, show the test pattern, and input shows up in the log.
   - The §4.1 regression tests pass.
   - Fuzz targets exist for X.224, GCC, capability sets and fast-path input.
+- **Status: done, with these differences:**
+  - `farland-server --fingerprint` prints the certificate fingerprint; `farlandctl` does not.
+  - The server does not send heartbeat PDUs yet.
+- **Tested:**
+  - FreeRDP 3 (xfreerdp3 3.31) connects over TLS, shows the test pattern and delivers input.
+  - The §4.1 regression tests pass.
+  - The X.224, MCS/GCC, capability (share), input, planar and connection fuzz targets exist.
+- **Not tested yet:** mstsc, Windows App and FreeRDP 2.
 
-### M2: NLA (~4 weeks)
+### M2: NLA (~4 weeks): done except Kerberos
 - **CredSSP acceptor**, TSRequest v2–6:
   - pubKeyAuth using the nonce hash (v5+) or pubKey+1 (v2–4), bound to the PKCS#1 key.
   - Sends `errorCode` TSRequests on failure, with correct NTSTATUS values.
@@ -60,8 +71,22 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - The whole client matrix connects with NLA.
   - A wrong password shows the client's native "logon failure" message.
   - Fuzz targets for TSRequest and NTLM run nightly.
+- **Status: done except Kerberos.** The Kerberos acceptor moves to M7, where the other authentication modes are. SPNEGO is done: it negotiates NTLM, including the mechListMIC exchange.
+- **Differences from the plan:**
+  - Privilege separation relays the decrypted stream over a socket pair. It does not hand over the socket and TLS session, because a TLS session cannot move between processes without kernel TLS.
+  - The network process switches to `nobody` when started as root. On Linux it runs under Landlock and a seccomp allowlist.
+  - It sends NTLM responses to the main process for checking and never sees a hash. The main process accepts only an identity it verified itself.
+  - The NTLM target name is recorded but not enforced.
+  - Only password credentials can be delegated. Smart-card and Remote Guard credentials are decoded and then refused.
+- **Tested:**
+  - FreeRDP 3 connects with NLA over HYBRID and over HYBRID_EX, with and without a domain.
+  - A wrong password gives `ERRCONNECT_LOGON_FAILURE`.
+  - A TLS-only client gets `HYBRID_REQUIRED_BY_SERVER`.
+  - End-to-end tests cover the in-process and privilege-separated paths.
+  - The fuzz targets are `credssp` (TSRequest and SPNEGO), `ntlm` and `privsep`.
+- **Not tested yet:** mstsc, Windows App and FreeRDP 2.
 
-### M3: Graphics pipeline, first GFX codecs (~7 weeks)
+### M3: Graphics pipeline, first GFX codecs (~7 weeks): done
 - **drdynvc server**, caps v1–v3: 1/2/4-byte channel IDs, `DATA_FIRST`/`DATA`, Close, and reading compressed client data.
 - **RDPGFX server:**
   - Caps 8.0 through 11.x with correct lengths.
@@ -76,11 +101,26 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - **Planar** (lossless).
   - **RFX Progressive**, ported from macRDP, respecting the 16 KB mstsc cap.
   - **AVC420** on OpenH264 and x264 software backends, with real region rectangles and QP metadata.
-- Legacy fallback for clients without GFX: SurfaceBits with planar.
+- Legacy fallback for clients without GFX: fast-path bitmap updates with planar (planar is not a SurfaceBits codec).
 - **Exit:**
   - A 1080p test-pattern animation reaches all clients through GFX.
   - FreeRDP's decoders verify our codec output: bit-exact for planar, PSNR ≥ 40 dB for Progressive at its final quality stage.
   - The drdynvc and rdpgfx client→server fuzzers run.
+- **Status: done, with these gaps:**
+  - The session does not use SurfaceToSurface or the surface cache yet, although the RDPGFX layer implements both. It answers CacheImportOffer with an empty reply.
+  - Pacing uses the frames-in-flight window and SUSPEND_FRAME_ACKNOWLEDGEMENT; queueDepth and QoE acknowledgements are not used yet. Dropped frames are not re-encoded as such: their damage stays pending, so the next frame covers it.
+  - AVC420 always encodes the whole surface as one H.264 picture; region rectangles tell the client which parts to copy. OpenH264 is loaded at runtime, and x264 is an opt-in build because it makes the binaries GPL.
+- **Tested:**
+  - FreeRDP 3 (xfreerdp3 3.31) runs the test pattern at 1920×1080 over RDPGFX 10.7 with Progressive and with planar: 30 fps with frames acknowledged in 7–8 ms. drdynvc runs at version 3.
+  - A scripted client in the unit tests checks the whole path (drdynvc, caps, ZGFX, surface setup, frames): planar pixel for pixel, Progressive to at least 30 dB, and the AVC420 region layout.
+  - Independent decoders:
+    - FreeRDP's `zgfx.c` and ZeroVDI's decoder reproduce the ZGFX output exactly.
+    - ZeroVDI's decoder reproduces the Progressive output bit for bit.
+    - ffmpeg decodes both H.264 backends at 44–47 dB.
+  - The fuzz targets are `svc`, `drdynvc`, `zgfx`, `rdpgfx`, `progressive` and `avc420`.
+- **Not tested yet:**
+  - mstsc and Windows App.
+  - AVC420 against a real client. Ubuntu's FreeRDP is built without H.264; against it, the server falls back to Progressive as intended.
 
 ### M4: Wayland capture and input, portal backend (~6 weeks)
 - **PipeWire consumer:**
@@ -131,7 +171,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **Headless sessions** per user:
   - Launchers for `mutter --headless`, `kwin_wayland --virtual`, sway/labwc headless, and cage (kiosk).
   - The keymap is taken from CS_CORE `keyboardLayout`.
-- **Authentication modes:** per-server credential, Kerberos, and delegated login with PAM (PLAN §3.5).
+- **Authentication modes:** per-server credential, Kerberos (the SPNEGO/GSSAPI acceptor with a keytab, moved here from M2), and delegated login with PAM (PLAN §3.5).
 - **Session broker:** multiple concurrent sessions, reconnect to an existing session through the **auto-reconnect cookie**, idle and disconnect policies.
 - **Hand-over** from the system daemon to a user session via Server Redirection + **RDSTLS**.
 - **Operations:**

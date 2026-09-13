@@ -22,6 +22,8 @@ unit_test_deps = [test_support_dep, catch2_dep]
 subdir('base')
 subdir('proto')
 subdir('codec')
+subdir('video')
+subdir('channels')
 subdir('auth')
 subdir('server')
 subdir('integration')
@@ -33,4 +35,11 @@ unit_tests = executable(
   cpp_args: '-DFARLAND_TEST_DATA_DIR="@0@"'.format(meson.current_source_dir() / 'data'),
 )
 
-test('unit', unit_tests, suite: 'unit')
+# The privilege-separation test starts farland-server as the network process.
+test(
+  'unit',
+  unit_tests,
+  suite: 'unit',
+  env: {'FARLAND_SERVER': farland_server_exe.full_path()},
+  depends: farland_server_exe,
+)

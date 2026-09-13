@@ -19,13 +19,14 @@ project(
 
 cxx = meson.get_compiler('cpp')
 
-# Platform baseline, docs/PLAN.md §2: GCC >= 13, Clang >= 17. Apple clang (local
+# Platform baseline, docs/PLAN.md §2: GCC >= 13, Clang >= 19 (Clang 18 cannot use
+# libstdc++'s std::expected; Ubuntu 24.04 ships clang-19). Apple clang (local
 # development on macOS only) uses its own version numbers and is not gated.
 if cxx.get_id() == 'gcc' and cxx.version().version_compare('< 13')
   error('farland needs GCC >= 13, found @0@'.format(cxx.version()))
 endif
-if cxx.get_id() == 'clang' and host_machine.system() != 'darwin' and cxx.version().version_compare('< 17')
-  error('farland needs Clang >= 17, found @0@'.format(cxx.version()))
+if cxx.get_id() == 'clang' and host_machine.system() != 'darwin' and cxx.version().version_compare('< 19')
+  error('farland needs Clang >= 19, found @0@ (on Ubuntu 24.04: apt install clang-19, CXX=clang++-19)'.format(cxx.version()))
 endif
 
 add_project_arguments(
@@ -45,6 +46,9 @@ add_project_arguments(
     '-Wduplicated-cond',
     '-Wlogical-op',
     '-Wextra-semi',
+    # FARLAND_TRY names its temporaries with __COUNTER__, which every supported
+    # compiler has; Clang 21 and later call it a C2y extension under -Wpedantic.
+    '-Wno-c2y-extensions',
   ),
   language: 'cpp',
 )
@@ -103,6 +107,9 @@ catch2_dep = dependency(
   version: '>= 3.4',
   required: get_option('tests').disable_if(get_option('fuzzing')),
   allow_fallback: true,
+  # The wrap's own test suite is not ours to build (it breaks with Clang 19 and
+  # libstdc++ 14).
+  default_options: ['tests=false'],
   include_type: 'system',
 )
 if catch2_dep.found()

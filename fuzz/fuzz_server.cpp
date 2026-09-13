@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
 // SPDX-License-Identifier: Apache-2.0
 
-// The server state machine. The first input byte picks how far a scripted,
-// valid client gets before the fuzz data takes over: from the very first byte
-// (pre-TLS), after the MCS connect, or with an active connection. The server
-// must never crash, whatever arrives, and its own output must stay well
-// formed.
+// The server state machines. The first input byte picks the stage the fuzz
+// data meets: pre-authentication from the very first byte, the Connection
+// after the MCS connect, or an active Connection. The server must never
+// crash, whatever arrives, and its own output must stay well formed.
 
 #include <farland/base/assert.hpp>
 #include <farland/proto/client_info.hpp>
@@ -16,6 +15,7 @@
 #include <farland/proto/share.hpp>
 #include <farland/proto/x224.hpp>
 #include <farland/server/connection.hpp>
+#include <farland/server/preauth.hpp>
 
 #include "fuzz.hpp"
 
@@ -52,30 +52,26 @@ Bytes io(std::span<const std::byte> payload)
     return domain(mcs::SendDataRequest{user_id, mcs::io_channel_id, payload});
 }
 
+/// Everything the server sends must frame cleanly.
+void check_framing(std::span<const std::byte> out)
+{
+    while (!out.empty()) {
+        const auto frame = proto::peek_frame(out);
+        FARLAND_ASSERT(frame.has_value() && frame->has_value() && (*frame)->length <= out.size());
+        out = out.subspan((*frame)->length);
+    }
+}
+
 void feed(server::Connection& c, std::span<const std::byte> bytes)
 {
     c.receive(bytes);
-    const auto out = c.take_output();
-    // Everything the server sends must frame cleanly.
-    std::span<const std::byte> rest(out);
-    while (!rest.empty()) {
-        const auto frame = proto::peek_frame(rest);
-        FARLAND_ASSERT(frame.has_value() && frame->has_value() && (*frame)->length <= rest.size());
-        rest = rest.subspan((*frame)->length);
-    }
+    check_framing(c.take_output());
     while (c.poll_event()) {
     }
 }
 
 void connect_mcs(server::Connection& c)
 {
-    proto::ConnectionRequest request;
-    request.negotiation = proto::ConnectionRequest::Negotiation{0, proto::protocol::ssl};
-    Writer cr;
-    proto::encode_connection_request(cr, request);
-    feed(c, cr.view());
-    c.tls_established();
-
     gcc::ClientData data;
     data.core.desktop_width = 640;
     data.core.desktop_height = 480;
@@ -132,6 +128,24 @@ void activate(server::Connection& c)
     FARLAND_ASSERT(c.active());
 }
 
+/// Pre-authentication from the first byte, under a TLS-only policy (the NLA
+/// acceptor has its own fuzz target).
+void fuzz_preauth(std::span<const std::byte> fuzz)
+{
+    server::PreAuth p(server::PreAuthConfig{proto::protocol::ssl, false, false});
+    const std::size_t half = fuzz.size() / 2;
+    p.receive(fuzz.first(half));
+    check_framing(p.take_output());
+    if (p.state() == server::PreAuth::State::wait_tls) {
+        p.tls_established();
+    }
+    p.receive(fuzz.subspan(half));
+    static_cast<void>(p.take_output());
+    while (p.poll_event()) {
+    }
+    static_cast<void>(p.take_remaining_input());
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size)
@@ -142,11 +156,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const auto input = std::as_bytes(std::span(data, size));
     const auto stage = std::to_integer<unsigned>(input[0]) % 3U;
     const auto fuzz = input.subspan(1);
-
-    server::Connection c;
-    if (stage >= 1) {
-        connect_mcs(c);
+    if (stage == 0) {
+        fuzz_preauth(fuzz);
+        return 0;
     }
+
+    server::Connection c(server::ServerConfig{},
+                         server::Negotiation{"", proto::protocol::ssl, proto::protocol::ssl, std::nullopt});
+    connect_mcs(c);
     if (stage >= 2) {
         activate(c);
     }

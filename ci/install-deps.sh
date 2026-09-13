@@ -13,6 +13,13 @@ debian | ubuntu)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang libssl-dev
+    # Ubuntu 24.04's default clang is 18, which cannot use libstdc++'s
+    # std::expected; its clang-19 package can.
+    if [ "$ID" = ubuntu ] && [ "${VERSION_ID%%.*}" -lt 25 ]; then
+        apt-get install -y --no-install-recommends clang-19
+        ln -sf /usr/bin/clang-19 /usr/local/bin/clang
+        ln -sf /usr/bin/clang++-19 /usr/local/bin/clang++
+    fi
     ;;
 fedora)
     dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang openssl-devel
