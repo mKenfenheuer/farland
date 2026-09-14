@@ -134,6 +134,7 @@ Bytes confirm_active(std::uint16_t user, std::uint32_t share_id, bool fastpath_o
     sets.input = caps::Input{};
     sets.input->input_flags = caps::input_flags::scancodes | caps::input_flags::fastpath_input2;
     sets.multifragment_update = caps::MultifragmentUpdate{0x100000};
+    sets.pointer = caps::Pointer{};  // 32 bpp pointers and a 25-entry cache, as mstsc and FreeRDP send
     Writer w;
     proto::encode_confirm_active(w, user, confirm);
     return io(user, w.view());

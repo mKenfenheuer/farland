@@ -4,12 +4,15 @@
 #include "session.hpp"
 
 #include <farland/base/log.hpp>
+#include <farland/platform/input_translator.hpp>
 #include <farland/server/connection.hpp>
+#include <farland/server/cursor_encoder.hpp>
 #include <farland/server/dynamic_channels.hpp>
 #include <farland/server/frame_scheduler.hpp>
 #include <farland/server/graphics_pipeline.hpp>
 #include <farland/server/test_pattern.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <optional>
@@ -24,11 +27,11 @@ using Clock = std::chrono::steady_clock;
 constexpr std::string_view log_component = "app.session";
 
 /// One client over a transport: the Connection once pre-authentication is
-/// done, with the synthetic test backend behind.
+/// done, with the shared desktop (or the synthetic test pattern) behind.
 class SessionRunner {
 public:
     SessionRunner(Transport& transport, std::string peer, const SessionOptions& options)
-        : transport_(transport), peer_(std::move(peer)), options_(options),
+        : transport_(transport), peer_(std::move(peer)), options_(options), desktop_(options.desktop),
           frame_interval_(std::chrono::microseconds(1'000'000 / std::max(options.frames_per_second, 1U)))
     {
     }
@@ -50,9 +53,10 @@ public:
                           options_.activation_timeout);
                 break;
             }
-            pollfd pfd{transport_.fd(), POLLIN, 0};
-            ::poll(&pfd, 1, poll_timeout_ms());
-            if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            std::vector<pollfd> fds{pollfd{transport_.fd(), POLLIN, 0}};
+            add_desktop_fds(fds);
+            ::poll(fds.data(), static_cast<nfds_t>(fds.size()), poll_timeout_ms());
+            if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
                 data.clear();
                 if (!transport_.read(data)) {
                     break;
@@ -63,9 +67,15 @@ public:
                     pump();
                 }
             }
+            if (running_ && desktop_ != nullptr) {
+                service_desktop(std::span(fds).subspan(1));
+            }
             if (running_) {
                 send_frame_if_due();
             }
+        }
+        if (translator_) {
+            translator_->release_all();  // never leave keys held on the shared desktop
         }
         transport_.close();
     }
@@ -83,11 +93,114 @@ private:
     }
 
     /// Creates the Connection as soon as the transport has pre-authenticated.
+    /// A shared desktop dictates the desktop size.
     void start_connection_if_ready()
     {
-        if (!connection_ && transport_.ready()) {
-            connection_.emplace(server::ServerConfig{}, transport_.negotiation());
+        if (connection_ || !transport_.ready()) {
+            return;
         }
+        server::ServerConfig config;
+        if (desktop_ != nullptr) {
+            const auto [width, height] = desktop_->frames().size();
+            if (width > 0 && height > 0) {
+                config.desktop_size = std::pair{static_cast<std::uint16_t>(std::min<std::uint32_t>(width, 0xFFFF)),
+                                                static_cast<std::uint16_t>(std::min<std::uint32_t>(height, 0xFFFF))};
+            }
+        }
+        connection_.emplace(config, transport_.negotiation());
+    }
+
+    void add_desktop_fds(std::vector<pollfd>& fds) const
+    {
+        if (desktop_ == nullptr) {
+            return;
+        }
+        const int cursor_fd = desktop_->cursor() != nullptr ? desktop_->cursor()->wake_fd() : -1;
+        for (const int fd : {desktop_->frames().wake_fd(), cursor_fd}) {
+            if (fd >= 0) {
+                fds.push_back(pollfd{fd, POLLIN, 0});
+            }
+        }
+        for (const int fd : desktop_->dispatch_fds()) {
+            if (fd >= 0) {
+                fds.push_back(pollfd{fd, POLLIN, 0});
+            }
+        }
+    }
+
+    /// Takes what the desktop has: its events, the newest frame, cursor changes.
+    void service_desktop(std::span<const pollfd> fds)
+    {
+        const bool readable = std::ranges::any_of(
+            fds, [](const pollfd& pfd) { return (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0; });
+        if (!readable && desktop_->frames().wake_fd() >= 0) {
+            return;
+        }
+        desktop_->dispatch();
+        if (desktop_->closed()) {
+            log::info(log_component, "{}: the shared desktop went away", peer_);
+            if (connection_) {
+                connection_->disconnect(proto::errinfo::none);
+                pump();
+            }
+            running_ = false;
+            return;
+        }
+        if (auto frame = desktop_->frames().take_frame()) {
+            desktop_image_ = frame->image;
+            desktop_dirty_ = true;
+            if (scheduler_) {
+                scheduler_->damage();
+            }
+        }
+        if (auto* source = desktop_->cursor()) {
+            if (auto update = source->take_cursor()) {
+                on_cursor(std::move(*update));
+            }
+        }
+    }
+
+    /// Sends a cursor change, or keeps it until the connection is active.
+    void on_cursor(platform::CursorUpdate update)
+    {
+        if (cursor_ && active()) {
+            for (const auto& pointer : cursor_->encode(update)) {
+                connection_->send_pointer(pointer);
+            }
+            pump();
+            return;
+        }
+        if (!pending_cursor_) {
+            pending_cursor_ = std::move(update);
+            return;
+        }
+        if (update.shape) {
+            pending_cursor_->shape = std::move(update.shape);
+        }
+        if (update.position) {
+            pending_cursor_->position = update.position;
+        }
+        pending_cursor_->visible = update.visible;
+    }
+
+    [[nodiscard]] bool has_picture() const { return desktop_ != nullptr || pattern_.has_value(); }
+
+    /// The picture for the next frame: the desktop's newest frame when it
+    /// changed, or the test pattern's next frame.
+    [[nodiscard]] std::optional<codec::ImageView> next_image()
+    {
+        if (desktop_ == nullptr) {
+            return pattern_->render(frame_++);
+        }
+        if (!desktop_image_ || !desktop_dirty_) {
+            return std::nullopt;
+        }
+        const auto& session = connection_->session();
+        if (desktop_image_->width != session.desktop_width || desktop_image_->height != session.desktop_height) {
+            return std::nullopt;  // the desktop was resized; following it needs the disp channel (M6)
+        }
+        desktop_dirty_ = false;
+        return desktop_image_;
     }
 
     void send(std::span<const std::byte> bytes)
@@ -254,7 +367,7 @@ private:
 
     void send_gfx_frame_if_due()
     {
-        if (suppressed_ || !pattern_) {
+        if (suppressed_ || !has_picture()) {
             return;
         }
         const auto now = Clock::now();
@@ -265,12 +378,17 @@ private:
         if (next_frame_ < now) {
             next_frame_ = now + frame_interval_;
         }
-        scheduler_->damage();  // the test pattern moves in every frame
-        if (!scheduler_->due(now)) {
-            return;  // the client is behind; the next frame covers everything
+        if (desktop_ == nullptr) {
+            scheduler_->damage();  // the test pattern moves in every frame
         }
-        const auto image = pattern_->render(frame_++);
-        if (const auto frame_id = gfx_->send_frame(image)) {
+        if (!scheduler_->due(now)) {
+            return;  // the client is behind, or nothing changed; the next frame covers everything
+        }
+        const auto image = next_image();
+        if (!image) {
+            return;
+        }
+        if (const auto frame_id = gfx_->send_frame(*image)) {
             scheduler_->frame_sent(*frame_id, now);
             ++gfx_frames_;
         }
@@ -288,7 +406,9 @@ private:
     {
         const auto& session = connection_->session();
         const auto codec = session.bits_per_pixel == 32 ? options_.codec : server::BitmapCodec::uncompressed;
-        if (!pattern_) {
+        if (desktop_ != nullptr) {
+            start_desktop_session(session);
+        } else if (!pattern_) {
             pattern_.emplace(session.desktop_width, session.desktop_height);
         } else {
             pattern_->resize(session.desktop_width, session.desktop_height);
@@ -308,8 +428,39 @@ private:
         start_dynamic_channels();
     }
 
+    /// On (re)activation with a shared desktop: the cursor (re)starts and
+    /// input maps client coordinates onto the desktop.
+    void start_desktop_session(const server::Session& session)
+    {
+        desktop_dirty_ = desktop_image_.has_value();
+        if (desktop_->cursor() != nullptr) {
+            const auto config = server::CursorEncoder::Config::negotiated(session, connection_->max_update_size());
+            if (!cursor_) {
+                cursor_.emplace(config);
+            }
+            for (const auto& pointer : cursor_->reset(config)) {
+                connection_->send_pointer(pointer);
+            }
+            if (pending_cursor_) {
+                for (const auto& pointer : cursor_->encode(*pending_cursor_)) {
+                    connection_->send_pointer(pointer);
+                }
+                pending_cursor_.reset();
+            }
+        }
+        if (!translator_) {
+            translator_.emplace(desktop_->input());
+        }
+        const auto [width, height] = desktop_->frames().size();
+        translator_->set_geometry(session.desktop_width, session.desktop_height, width, height);
+    }
+
     void on_event(server::event::Input& e)
     {
+        if (translator_) {
+            translator_->translate(e.events);
+            return;
+        }
         for (const auto& input : e.events) {
             if (pattern_) {
                 pattern_->apply(input);
@@ -375,18 +526,19 @@ private:
             send_gfx_frame_if_due();
             return;
         }
-        if (!active() || suppressed_ || !encoder_ || !pattern_) {
+        if (!active() || suppressed_ || !encoder_ || !has_picture()) {
             return;
         }
         const auto now = Clock::now();
         if (now < next_frame_) {
             return;
         }
-        const auto image = pattern_->render(frame_++);
-        for (const auto& update : encoder_->encode(image, connection_->max_update_size())) {
-            connection_->send_bitmap_update(update);
+        if (const auto image = next_image()) {
+            for (const auto& update : encoder_->encode(*image, connection_->max_update_size())) {
+                connection_->send_bitmap_update(update);
+            }
+            pump();
         }
-        pump();
         next_frame_ += frame_interval_;
         if (next_frame_ < now) {
             next_frame_ = now + frame_interval_;  // fell behind: drop frames rather than burst
@@ -396,6 +548,7 @@ private:
     Transport& transport_;
     std::string peer_;
     SessionOptions options_;
+    Desktop* desktop_;
     Clock::duration frame_interval_;
     std::optional<server::Connection> connection_;
     std::optional<server::DynamicChannels> dvc_;
@@ -407,6 +560,11 @@ private:
     bool running_ = true;
     bool suppressed_ = false;
     std::optional<server::TestPattern> pattern_;
+    std::optional<codec::ImageView> desktop_image_;  ///< valid until the next take_frame()
+    bool desktop_dirty_ = false;
+    std::optional<server::CursorEncoder> cursor_;
+    std::optional<platform::CursorUpdate> pending_cursor_;
+    std::optional<platform::InputTranslator> translator_;
     std::optional<server::FrameEncoder> encoder_;
     std::uint64_t frame_ = 0;
     Clock::time_point next_frame_;

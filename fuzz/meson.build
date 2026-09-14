@@ -13,6 +13,7 @@ fuzz_targets = {
   'mcs_gcc': farland_proto_dep,
   'input': farland_proto_dep,
   'planar': farland_codec_dep,
+  'pointer': farland_proto_dep,
   'privsep': farland_server_dep,
   'progressive': farland_codec_dep,
   'rdpgfx': farland_channels_dep,

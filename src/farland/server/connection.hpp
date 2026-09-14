@@ -10,6 +10,7 @@
 #include <farland/proto/framing.hpp>
 #include <farland/proto/gcc.hpp>
 #include <farland/proto/input.hpp>
+#include <farland/proto/pointer.hpp>
 #include <farland/proto/share.hpp>
 #include <farland/server/preauth.hpp>
 
@@ -37,6 +38,9 @@ struct ServerConfig {
     std::uint16_t max_desktop_size = 8192;
     /// Deepest color depth to negotiate (32, 24 or 16).
     std::uint16_t max_bits_per_pixel = 32;
+    /// The desktop size to announce instead of the client's request (a shared
+    /// desktop has the size it has). Clamped like client sizes.
+    std::optional<std::pair<std::uint16_t, std::uint16_t>> desktop_size;
 };
 
 enum class State : std::uint8_t {
@@ -78,6 +82,18 @@ struct Session {
     /// client did not send a MultifragmentUpdate capability.
     std::uint32_t max_request_size = 0;
     bool supports_error_info = false;
+
+    /// Pointer support both sides agreed on: the client's cache sizes, capped
+    /// at what the server advertised, and the large pointer flags both set
+    /// ([MS-RDPBCGR] 2.2.7.1.5, 2.2.7.2.7). CursorEncoder::Config::negotiated
+    /// turns this into an encoder configuration.
+    struct PointerSupport {
+        std::uint16_t color_pointer_cache_size = 0;
+        /// 0: no New or Large Pointer Updates (the client left pointerCacheSize out or set it to 0).
+        std::uint16_t pointer_cache_size = 0;
+        std::uint16_t large_pointer_flags = 0;  ///< proto::caps::large_pointer_flags
+    };
+    PointerSupport pointer;
 
     /// The MCS channel ID of the static channel `name` (compared without
     /// regard to case), if the client asked for it.
@@ -149,6 +165,10 @@ public:
     [[nodiscard]] std::size_t max_update_size() const noexcept;
     /// Sends one TS_UPDATE_BITMAP_DATA (fast-path when negotiated). Active only.
     void send_bitmap_update(std::span<const std::byte> update_data);
+    /// Sends one pointer update ([MS-RDPBCGR] 2.2.9.1.1.4, 2.2.9.1.2.1.4 -
+    /// 2.2.9.1.2.1.11): fast-path when negotiated, otherwise a slow-path
+    /// Pointer Update PDU. Large pointers need fast-path output. Active only.
+    void send_pointer(const proto::PointerUpdate& update);
     /// Sends one static virtual channel chunk (CHANNEL_PDU_HEADER and data,
     /// [MS-RDPBCGR] 2.2.6.1) on a channel the client asked for. Allowed from
     /// the capability exchange on; ignored once the connection is closed.

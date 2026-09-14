@@ -20,6 +20,13 @@ On macOS, use Apple clang for the sanitizer builds (ASan, UBSan and TSan all wor
 
 Tests that need an H.264 encoder are skipped unless one is available. To run them, set `FARLAND_OPENH264_LIBRARY` to a libopenh264 (Cisco's prebuilt binaries from ciscobinary.openh264.org work) or configure with `-Dx264=enabled`. `FARLAND_FFMPEG` and `FARLAND_FFPROBE` point the H.264 quality tests at ffmpeg.
 
+The portal backend (Linux only) needs `libsystemd-dev`, `libei-dev` and `libpipewire-0.3-dev`, with `libgbm-dev` and `libegl-dev` optional for tiled dmabufs. Its tests skip what they cannot run:
+- the portal session tests need `dbus-daemon`, `python3-dbus` and `python3-gi`, and run `tests/platform/portal/mock_portal.py` on a private bus;
+- the libei tests need `libeis-dev`;
+- the capture tests need the `pipewire` daemon, which they start privately.
+
+`build/tests/platform/portal/farland-portal-probe` tries a real portal session on a desktop.
+
 Install the git hooks once with `pre-commit install`. They run clang-format, the REUSE license check and whitespace fixes.
 
 ## Rules for code that touches network input

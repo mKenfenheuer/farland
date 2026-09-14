@@ -8,6 +8,7 @@
 #include <farland/server/graphics_pipeline.hpp>
 #include <farland/server/preauth.hpp>
 
+#include "desktop.hpp"
 #include "transport.hpp"
 
 #include <atomic>
@@ -30,6 +31,9 @@ struct SessionOptions {
     server::PreAuthConfig preauth;
     /// Creates the CredSSP acceptor for NLA connections; without it only TLS is offered.
     server::PreAuth::NlaFactory make_nla;
+    /// The shared desktop; null: the synthetic test pattern. Must outlive the
+    /// session, and only one session may use it at a time.
+    Desktop* desktop = nullptr;
 };
 
 /// Runs one client connection on a connected socket until it ends or `stop`

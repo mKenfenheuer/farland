@@ -6,6 +6,7 @@
 farland_server_lib = static_library(
   'farland-server',
   'connection.cpp',
+  'cursor_encoder.cpp',
   'dynamic_channels.cpp',
   'frame_encoder.cpp',
   'frame_scheduler.cpp',

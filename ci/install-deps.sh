@@ -12,7 +12,9 @@ case "$ID" in
 debian | ubuntu)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang libssl-dev
+    apt-get install -y --no-install-recommends ca-certificates git meson ninja-build pkg-config g++ clang libssl-dev \
+        libsystemd-dev libei-dev libeis-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libegl-dev \
+        dbus python3-dbus python3-gi pipewire
     # Ubuntu 24.04's default clang is 18, which cannot use libstdc++'s
     # std::expected; its clang-19 package can.
     if [ "$ID" = ubuntu ] && [ "${VERSION_ID%%.*}" -lt 25 ]; then
@@ -22,10 +24,13 @@ debian | ubuntu)
     fi
     ;;
 fedora)
-    dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang openssl-devel
+    dnf install -y git meson ninja-build pkgconf-pkg-config gcc-c++ clang openssl-devel \
+        systemd-devel libei-devel pipewire-devel mesa-libgbm-devel libglvnd-devel \
+        dbus-daemon python3-dbus python3-gobject pipewire
     ;;
 arch)
-    pacman -Syu --noconfirm --needed git meson ninja pkgconf gcc clang openssl
+    pacman -Syu --noconfirm --needed git meson ninja pkgconf gcc clang openssl \
+        systemd libei pipewire mesa libglvnd dbus python-dbus python-gobject
     ;;
 *)
     echo "unsupported distribution: $ID" >&2

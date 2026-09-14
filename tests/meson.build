@@ -25,6 +25,8 @@ subdir('codec')
 subdir('video')
 subdir('channels')
 subdir('auth')
+subdir('platform')
+subdir('platform/portal')
 subdir('server')
 subdir('integration')
 

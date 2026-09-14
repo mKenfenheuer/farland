@@ -22,6 +22,18 @@
 #include <sys/syscall.h>
 #endif
 
+// Sanitizer runtimes probe whether memory is readable by writing it into a
+// pipe (UBSan's vptr check, for one); in those builds the filter allows it.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer) ||          \
+    __has_feature(undefined_behavior_sanitizer)
+#define FARLAND_SANITIZED 1
+#endif
+#endif
+#if !defined(FARLAND_SANITIZED) && (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+#define FARLAND_SANITIZED 1
+#endif
+
 namespace farland::app {
 
 namespace {
@@ -150,6 +162,12 @@ std::vector<long> allowed_syscalls()
 #endif
 #ifdef SYS_rseq
     allowed.push_back(SYS_rseq);
+#endif
+#ifdef FARLAND_SANITIZED
+    allowed.push_back(SYS_pipe2);
+#ifdef SYS_pipe
+    allowed.push_back(SYS_pipe);
+#endif
 #endif
     return allowed;
 }

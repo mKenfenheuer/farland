@@ -20,6 +20,7 @@
 #include <farland/proto/share.hpp>
 #include <farland/proto/x224.hpp>
 
+#include "desktop.hpp"
 #include "nla.hpp"
 #include "privsep_process.hpp"
 #include "session.hpp"
@@ -29,6 +30,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -185,6 +187,7 @@ struct Canvas {
     std::vector<std::byte> pixels = std::vector<std::byte>(static_cast<std::size_t>(width) * height * 4);
     std::set<std::pair<std::uint16_t, std::uint16_t>> tiles_seen;
     proto::fastpath::Reassembler reassembler{std::size_t{1} << 20U};
+    std::size_t other_updates = 0;
 
     /// Applies a fast-path PDU; ignores everything else.
     void apply(const Bytes& pdu)
@@ -193,13 +196,21 @@ struct Canvas {
             return;
         }
         Reader r(pdu);
-        for (const auto& fragment : proto::fastpath::decode_output_pdu(r).value()) {
+        // Named: GCC before 15 lacks C++23's lifetime extension in range-for.
+        const auto fragments = proto::fastpath::decode_output_pdu(r).value();
+        for (const auto& fragment : fragments) {
             auto update = reassembler.add(fragment).value();
-            if (!update || update->code != proto::fastpath::update_code::bitmap) {
+            if (!update) {
+                continue;
+            }
+            if (update->code != proto::fastpath::update_code::bitmap) {
+                ++other_updates;  // pointer updates, for one
                 continue;
             }
             Reader u(update->data);
-            for (const auto& rect : proto::decode_bitmap_update(u).value()) {
+            // Named: GCC before 15 lacks C++23's lifetime extension in range-for.
+            const auto rects = proto::decode_bitmap_update(u).value();
+            for (const auto& rect : rects) {
                 std::vector<std::byte> decoded(static_cast<std::size_t>(rect.width) * rect.height * 4);
                 REQUIRE(farland::codec::planar::decode(rect.data, rect.width, rect.height,
                                                        farland::codec::planar::Orientation::bottom_up, decoded)
@@ -284,17 +295,14 @@ std::optional<std::uint32_t> negotiate(TestClient& c, std::uint32_t protocol, co
     return std::nullopt;
 }
 
-/// The scripted client, from X.224 to the server's shutdown: sets `stop`
-/// once it has seen frames and input, then expects the ultimatum.
-void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto::protocol::ssl,
-                const Login* login = nullptr)
+/// MCS setup, Client Info, licensing, capabilities and finalization, asking
+/// for a `client_width` x `client_height` desktop. Returns the desktop size
+/// the server announced.
+std::pair<std::uint16_t, std::uint16_t> activate(TestClient& c, std::uint32_t protocol, std::uint16_t client_width,
+                                                 std::uint16_t client_height)
 {
-    TestClient c(fd);
-
-    REQUIRE_FALSE(negotiate(c, protocol, login).has_value());
-
     // MCS connect and domain setup.
-    c.send(client::connect_initial(client::client_data(protocol, 0x0001, width, height)));
+    c.send(client::connect_initial(client::client_data(protocol, 0x0001, client_width, client_height)));
     static_cast<void>(c.read_pdu());  // Connect Response
     c.send(client::erect_domain());
     c.send(client::attach_user());
@@ -315,17 +323,35 @@ void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto:
     c.send(client::client_info(user, "e2e"));
     static_cast<void>(c.read_pdu());  // license
     std::uint32_t share_id = 0;
+    std::pair<std::uint16_t, std::uint16_t> size{client_width, client_height};
     {
         const auto payload = indication(c.read_pdu());
         Reader r(payload);
         auto control = proto::read_share_control(r).value();
-        share_id = proto::decode_demand_active(control.body).value().share_id;
+        const auto demand = proto::decode_demand_active(control.body).value();
+        share_id = demand.share_id;
+        REQUIRE(demand.capabilities.bitmap.has_value());
+        size = {demand.capabilities.bitmap->desktop_width, demand.capabilities.bitmap->desktop_height};
     }
-    c.send(client::confirm_active(user, share_id, true, width, height));
+    // Clients take the size the server announces in the Demand Active.
+    c.send(client::confirm_active(user, share_id, true, size.first, size.second));
     c.send(client::finalization(user, share_id));
     for (int i = 0; i < 4; ++i) {
         static_cast<void>(c.read_pdu());  // Synchronize, Cooperate, Granted, Font Map
     }
+    return size;
+}
+
+/// The scripted client, from X.224 to the server's shutdown: sets `stop`
+/// once it has seen frames and input, then expects the ultimatum.
+void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto::protocol::ssl,
+                const Login* login = nullptr)
+{
+    TestClient c(fd);
+
+    REQUIRE_FALSE(negotiate(c, protocol, login).has_value());
+
+    activate(c, protocol, width, height);
 
     // The first frames cover the whole desktop: 5 x 4 tiles.
     Canvas canvas;
@@ -400,6 +426,94 @@ public:
 private:
     farland::auth::CredentialStore store_;
     farland::auth::ntlm::LocalNtlmVerifier verifier_;
+};
+
+/// A shared desktop for tests: one solid frame, one cursor shape, and a sink
+/// that records the input it gets.
+class FakeDesktop final : public farland::app::Desktop {
+public:
+    static constexpr std::uint32_t color = 0x3366CC;
+
+    class Frames final : public farland::platform::FrameSource {
+    public:
+        Frames() : pixels_(static_cast<std::size_t>(width) * height * 4)
+        {
+            for (std::size_t i = 0; i < pixels_.size(); i += 4) {
+                pixels_[i] = std::byte{color & 0xFFU};
+                pixels_[i + 1] = std::byte{(color >> 8U) & 0xFFU};
+                pixels_[i + 2] = std::byte{(color >> 16U) & 0xFFU};
+                pixels_[i + 3] = std::byte{0xFF};
+            }
+        }
+        [[nodiscard]] int wake_fd() const noexcept override { return -1; }
+        [[nodiscard]] std::optional<farland::platform::Frame> take_frame() override
+        {
+            if (!fresh_) {
+                return std::nullopt;
+            }
+            fresh_ = false;
+            return farland::platform::Frame{{pixels_, width, height, std::size_t{width} * 4}, {}, 1};
+        }
+        [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> size() const override { return {width, height}; }
+
+    private:
+        std::vector<std::byte> pixels_;
+        bool fresh_ = true;
+    };
+
+    class Cursor final : public farland::platform::CursorSource {
+    public:
+        [[nodiscard]] int wake_fd() const noexcept override { return -1; }
+        [[nodiscard]] std::optional<farland::platform::CursorUpdate> take_cursor() override
+        {
+            if (!fresh_) {
+                return std::nullopt;
+            }
+            fresh_ = false;
+            farland::platform::CursorImage shape{16, 16, 1, 1, std::vector<std::byte>(16 * 16 * 4, std::byte{0xFF})};
+            return farland::platform::CursorUpdate{std::move(shape), std::nullopt, true};
+        }
+
+    private:
+        bool fresh_ = true;
+    };
+
+    /// Written on the session thread; read by the test after joining it.
+    class Sink final : public farland::platform::InputSink {
+    public:
+        void key(std::uint32_t evdev_code, bool pressed) override
+        {
+            keys.emplace_back(evdev_code, pressed);
+            ++events;
+        }
+        void pointer_motion_absolute(double x, double y) override
+        {
+            motion = {x, y};
+            ++events;
+        }
+        void pointer_motion_relative(double /*dx*/, double /*dy*/) override {}
+        void button(std::uint32_t /*evdev_button*/, bool /*pressed*/) override {}
+        void scroll_discrete(std::int32_t /*x_v120*/, std::int32_t /*y_v120*/) override {}
+        void text(char32_t /*codepoint*/) override {}
+        void flush() override {}
+
+        std::vector<std::pair<std::uint32_t, bool>> keys;
+        std::optional<std::pair<double, double>> motion;
+        std::atomic<int> events{0};
+    };
+
+    [[nodiscard]] farland::platform::FrameSource& frames() override { return frames_; }
+    [[nodiscard]] farland::platform::CursorSource* cursor() override { return &cursor_; }
+    [[nodiscard]] farland::platform::InputSink& input() override { return sink; }
+    [[nodiscard]] std::vector<int> dispatch_fds() const override { return {}; }
+    void dispatch() override {}
+    [[nodiscard]] bool closed() const override { return false; }
+
+    Sink sink;
+
+private:
+    Frames frames_;
+    Cursor cursor_;
 };
 
 /// A certificate and key on disk for the network process, removed afterwards.
@@ -532,4 +646,48 @@ TEST_CASE("End to end with NLA through the privilege-separated network process")
     const Login login{"alice", "Secret1!"};
     run_client(fds[1], stop, proto::protocol::hybrid_ex, &login);
     monitor.join();
+}
+
+TEST_CASE("End to end with a shared desktop: its size, frames and cursor, input into it")
+{
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
+    FakeDesktop desktop;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.frames_per_second = 60;
+    options.preauth.require_nla = false;
+    options.desktop = &desktop;
+    std::thread server([&] { farland::app::run_session(fds[0], "e2e-desktop", identity, options, stop); });
+    {
+        TestClient c(fds[1]);
+        REQUIRE_FALSE(negotiate(c, proto::protocol::ssl, nullptr).has_value());
+        // The client asks for 640x480, but a shared desktop has the size it has.
+        CHECK(activate(c, proto::protocol::ssl, 640, 480) == std::pair<std::uint16_t, std::uint16_t>{width, height});
+
+        Canvas canvas;
+        for (int i = 0; i < 400 && (canvas.tiles_seen.size() < 20 || canvas.other_updates == 0); ++i) {
+            canvas.apply(c.read_pdu());
+        }
+        CHECK(canvas.tiles_seen.size() == 20);
+        CHECK(canvas.rgb(5, 5) == FakeDesktop::color);
+        CHECK(canvas.rgb(315, 235) == FakeDesktop::color);
+        CHECK(canvas.other_updates > 0);  // the cursor, as pointer updates
+
+        const std::array input{
+            proto::InputEvent{proto::MouseEvent{proto::ptr_flags::move, 100, 50}},
+            proto::InputEvent{proto::KeyboardEvent{0, 0x1E}},                          // A down
+            proto::InputEvent{proto::KeyboardEvent{proto::kbd_flags::release, 0x1E}},  // A up
+        };
+        c.send(client::fastpath_input(input));
+        for (int i = 0; i < 300 && desktop.sink.events.load() < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        stop = true;
+    }
+    server.join();
+    const std::vector<std::pair<std::uint32_t, bool>> expected_keys{{30, true}, {30, false}};  // KEY_A
+    CHECK(desktop.sink.keys == expected_keys);
+    CHECK(desktop.sink.motion == std::pair{100.0, 50.0});
 }

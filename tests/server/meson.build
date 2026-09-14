@@ -3,6 +3,7 @@
 
 unit_test_sources += files(
   'test_connection.cpp',
+  'test_cursor_encoder.cpp',
   'test_dynamic_channels.cpp',
   'test_frame_encoder.cpp',
   'test_frame_scheduler.cpp',

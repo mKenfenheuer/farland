@@ -53,6 +53,17 @@ add_project_arguments(
   language: 'cpp',
 )
 
+# GCC 13 and 14 report bogus buffer overflows, frees and uninitialized reads
+# inside inlined std::vector code at -O2/-O3 (GCC bugs 105705, 106199, 107852),
+# and GCC 15 still the bogus frees; GCC 16 and Clang do not. Only there are
+# these warnings off.
+if cxx.get_id() == 'gcc' and cxx.version().version_compare('< 15')
+  add_project_arguments('-Wno-stringop-overflow', '-Wno-maybe-uninitialized', language: 'cpp')
+endif
+if cxx.get_id() == 'gcc' and cxx.version().version_compare('< 16')
+  add_project_arguments('-Wno-free-nonheap-object', language: 'cpp')
+endif
+
 # Hardening, docs/PLAN.md §6. Sanitizer and fuzzing builds turn this off.
 # Meson itself enables standard library assertions only while b_ndebug is off
 # (libc++ in "fast" mode); farland keeps them in release builds too, and uses

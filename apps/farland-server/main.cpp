@@ -10,6 +10,9 @@
 #include <farland/base/log.hpp>
 
 #include "nla.hpp"
+#ifdef FARLAND_HAVE_PORTAL
+#include "portal_desktop.hpp"
+#endif
 #include "privsep_process.hpp"
 #include "sandbox.hpp"
 #include "session.hpp"
@@ -61,6 +64,9 @@ struct Options {
     std::string log_level = "info";
     bool print_fingerprint = false;
     bool privsep = true;
+    /// Share the running desktop through xdg-desktop-portal.
+    bool share = false;
+    bool virtual_monitor = false;
     bool allow_tls_only = false;
     /// Internal: this process is the network process for one client.
     bool privsep_child = false;
@@ -105,6 +111,9 @@ void usage()
                  "  --gfx-codec CODEC     progressive, planar or avc420 for GFX clients (default progressive)\n"
                  "  --openh264 FILE       OpenH264 library for avc420 (default: libopenh264.so.8 and older)\n"
                  "  --max-sessions N      concurrent connections (default 4)\n"
+                 "  --share               share the running Wayland desktop (xdg-desktop-portal, PipeWire, libei)\n"
+                 "                        instead of the test pattern; one session at a time\n"
+                 "  --virtual-monitor     with --share: share a new virtual monitor where the portal offers it\n"
                  "  --allow-tls-only      also accept clients without NLA (anyone reaches the login screen)\n"
                  "  --no-privsep          handle clients in this process instead of a sandboxed one\n"
                  "  --log-level LEVEL     trace, debug, info, warn, error (default info)\n"
@@ -160,6 +169,11 @@ bool parse_options(std::span<char*> args, Options& options)
         } else if (arg == "--allow-tls-only") {
             options.allow_tls_only = true;
             options.session.preauth.require_nla = false;
+        } else if (arg == "--share") {
+            options.share = true;
+        } else if (arg == "--virtual-monitor") {
+            options.share = true;
+            options.virtual_monitor = true;
         } else if (arg == "--no-privsep") {
             options.privsep = false;
         } else if (arg == "--privsep-child") {
@@ -323,6 +337,30 @@ int main(int argc, char** argv)
         return 0;
     }
     const auto launch = child_launch(options, argv[0]);
+#ifdef FARLAND_HAVE_PORTAL
+    // Declared before the listener and the session threads, destroyed after them.
+    std::unique_ptr<app::Desktop> desktop;
+    if (options.share) {
+        auto shared = app::start_portal_desktop(app::PortalDesktopOptions{
+            .virtual_monitor = options.virtual_monitor,
+            .restore_token_file = std::nullopt,
+            .timeout = std::chrono::seconds(300),
+        });
+        if (!shared) {
+            std::cerr << "farland-server: cannot share the desktop: " << shared.error().message() << "\n";
+            return 1;
+        }
+        desktop = std::move(*shared);
+        options.session.desktop = desktop.get();
+        options.max_sessions = 1;  // one session drives the desktop at a time
+    }
+#else
+    if (options.share) {
+        std::cerr << "farland-server: --share needs the portal backend (Linux with sd-bus, PipeWire and libei), "
+                     "which this build does not have\n";
+        return 2;
+    }
+#endif
     if (const auto users = farland::auth::CredentialStore::load(options.users); !users) {
         std::cerr << "farland-server: cannot read the NLA user store " << options.users.string() << "\n";
         return 1;

@@ -213,7 +213,9 @@ TEST_CASE("4.1.12 Server Demand Active PDU")
     CHECK(caps.general.has_value());
     CHECK(caps.bitmap.has_value());
     CHECK(caps.order.has_value());
-    CHECK(caps.pointer.has_value());
+    REQUIRE(caps.pointer.has_value());
+    CHECK(caps.pointer->color_pointer_cache_size == 25);  // farland's server offers the same
+    CHECK(caps.pointer->pointer_cache_size == 25);
     CHECK(caps.input.has_value());
     CHECK(caps.virtual_channel.has_value());
     CHECK(caps.font.has_value());  // length 4, empty body
@@ -238,7 +240,9 @@ TEST_CASE("4.1.13 Client Confirm Active PDU")
     REQUIRE(caps.general.has_value());
     REQUIRE(caps.bitmap.has_value());
     CHECK(caps.order.has_value());
-    CHECK(caps.pointer.has_value());
+    REQUIRE(caps.pointer.has_value());
+    CHECK(caps.pointer->color_pointer_cache_size == 20);
+    CHECK(caps.pointer->pointer_cache_size == 21);
     CHECK(caps.share.has_value());
     CHECK(caps.input.has_value());
     CHECK(caps.font.has_value());

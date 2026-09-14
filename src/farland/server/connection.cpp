@@ -26,6 +26,8 @@ constexpr std::size_t max_buffered_input = std::size_t{1} << 20U;
 constexpr std::uint32_t max_rdp_version = 0x00080011;  // RDP 10.12, as FreeRDP's server
 constexpr std::uint32_t channel_chunk_length = 1600;
 constexpr std::size_t slow_path_update_limit = 0x3FFF - 64;  // MCS PER length minus headers
+/// Pointer cache slots the server advertises; FreeRDP's server offers 25 too.
+constexpr std::uint16_t pointer_cache_slots = 25;
 
 /// The color depth to run the session at, from the client's CS_CORE.
 std::uint16_t choose_bits_per_pixel(const gcc::ClientCoreData& core, std::uint16_t max_bpp)
@@ -61,7 +63,12 @@ caps::CapabilitySets server_capabilities(const Session& session)
     sets.order = caps::Order{};
     sets.order->order_flags = 0x0002 | 0x0008 | 0x0020;
 
-    sets.pointer = caps::Pointer{};
+    // Pointers go out as Pointer Updates, never in the desktop image
+    // (docs/PLAN.md §3.3): color and 32 bpp pointer caches, and shapes up to
+    // 384 x 384 ([MS-RDPBCGR] 2.2.7.1.5, 2.2.7.2.7).
+    sets.pointer = caps::Pointer{1, pointer_cache_slots, pointer_cache_slots};
+    sets.large_pointer =
+        caps::LargePointer{caps::large_pointer_flags::size_96x96 | caps::large_pointer_flags::size_384x384};
     sets.input = caps::Input{};
     sets.input->input_flags = caps::input_flags::scancodes | caps::input_flags::mousex | caps::input_flags::unicode |
                               caps::input_flags::fastpath_input | caps::input_flags::fastpath_input2 |
@@ -121,7 +128,7 @@ bool Session::supports_gfx() const
            static_channel_id("drdynvc").has_value();
 }
 
-Connection::Connection(ServerConfig config, Negotiation negotiation) : config_(config)
+Connection::Connection(ServerConfig config, Negotiation negotiation) : config_(std::move(config))
 {
     session_.negotiation = std::move(negotiation);
 }
@@ -217,8 +224,9 @@ Result<void> Connection::on_connect_initial(Reader& data)
         return {};
     }
 
-    session_.desktop_width = std::clamp(core.desktop_width, config_.min_desktop_size, config_.max_desktop_size);
-    session_.desktop_height = std::clamp(core.desktop_height, config_.min_desktop_size, config_.max_desktop_size);
+    const auto [width, height] = config_.desktop_size.value_or(std::pair{core.desktop_width, core.desktop_height});
+    session_.desktop_width = std::clamp(width, config_.min_desktop_size, config_.max_desktop_size);
+    session_.desktop_height = std::clamp(height, config_.min_desktop_size, config_.max_desktop_size);
     session_.bits_per_pixel = choose_bits_per_pixel(core, config_.max_bits_per_pixel);
     session_.supports_error_info = core.has_early_flag(gcc::cs_early_flags::support_errinfo_pdu);
 
@@ -421,6 +429,18 @@ Result<void> Connection::on_confirm_active(Reader& body)
     session_.no_bitmap_compression_header =
         (caps.general->extra_flags & caps::general_extra_flags::no_bitmap_compression_hdr) != 0;
     session_.max_request_size = caps.multifragment_update ? caps.multifragment_update->max_request_size : 0;
+    session_.pointer = {};
+    if (caps.pointer) {
+        session_.pointer.color_pointer_cache_size =
+            std::min(caps.pointer->color_pointer_cache_size, pointer_cache_slots);
+        session_.pointer.pointer_cache_size =
+            std::min(caps.pointer->pointer_cache_size.value_or(std::uint16_t{0}), pointer_cache_slots);
+    }
+    if (caps.large_pointer) {
+        session_.pointer.large_pointer_flags =
+            caps.large_pointer->support_flags &
+            (caps::large_pointer_flags::size_96x96 | caps::large_pointer_flags::size_384x384);
+    }
     session_.client_capabilities = std::move(caps);
 
     // Finalization, server half: Synchronize and Control Cooperate go out at
@@ -522,6 +542,24 @@ void Connection::send_bitmap_update(std::span<const std::byte> update_data)
     }
     Writer pdu;
     proto::write_data_pdu(pdu, session_.share_id, mcs::server_channel_id, proto::pdu_type2::update, update_data);
+    send_io(pdu.view());
+}
+
+void Connection::send_pointer(const proto::PointerUpdate& update)
+{
+    if (state_ != State::active) {
+        return;
+    }
+    if (session_.fastpath_output) {
+        Writer data(proto::pointer::fastpath_size(update));
+        const std::uint8_t code = proto::pointer::encode_fastpath(data, update);
+        proto::fastpath::encode_update(output_, code, data.view());
+        return;
+    }
+    Writer payload;
+    proto::pointer::encode_slow_path(payload, update);
+    Writer pdu;
+    proto::write_data_pdu(pdu, session_.share_id, mcs::server_channel_id, proto::pdu_type2::pointer, payload.view());
     send_io(pdu.view());
 }
 

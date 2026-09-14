@@ -9,3 +9,5 @@ option('hardening', type: 'boolean', value: true,
   description: 'Hardened build: library assertions, stack protector, zero-initialised locals, FORTIFY_SOURCE=3, full RELRO')
 option('x264', type: 'feature', value: 'disabled',
   description: 'x264 H.264 encoder backend. libx264 is GPLv2+: binaries built with it must be distributed under the GPL (docs/PLAN.md §2). Never on by default')
+option('portal', type: 'feature', value: 'auto',
+  description: 'Portal platform backend (Linux only): xdg-desktop-portal over sd-bus (libsystemd or basu), PipeWire and libei')

@@ -34,7 +34,9 @@ std::vector<fastpath::Reassembler::Update> reassemble(std::span<const std::byte>
         const std::size_t length =
             ((std::to_integer<std::size_t>(rest[1]) & 0x7FU) << 8U) | std::to_integer<std::size_t>(rest[2]);
         Reader pdu = r.sub(length).value();
-        for (const auto& fragment : fastpath::decode_output_pdu(pdu).value()) {
+        // Named: GCC before 15 lacks C++23's lifetime extension in range-for.
+        const auto fragments = fastpath::decode_output_pdu(pdu).value();
+        for (const auto& fragment : fragments) {
             if (auto update = reassembler.add(fragment).value()) {
                 updates.push_back(std::move(*update));
             }
@@ -81,7 +83,9 @@ TEST_CASE("Large updates are fragmented and reassemble")
         const std::size_t length =
             ((std::to_integer<std::size_t>(rest[1]) & 0x7FU) << 8U) | std::to_integer<std::size_t>(rest[2]);
         Reader pdu = r.sub(length).value();
-        for (const auto& fragment : fastpath::decode_output_pdu(pdu).value()) {
+        // Named: GCC before 15 lacks C++23's lifetime extension in range-for.
+        const auto fragments = fastpath::decode_output_pdu(pdu).value();
+        for (const auto& fragment : fragments) {
             const auto result = small.add(fragment);
             if (!result) {
                 CHECK(result.error().code == Errc::limit_exceeded);

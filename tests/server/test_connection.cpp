@@ -108,7 +108,8 @@ Bytes client_info()
 }
 
 Bytes confirm_active(std::uint32_t share_id, bool fastpath_output, std::uint16_t width = 1024,
-                     std::uint16_t height = 768)
+                     std::uint16_t height = 768, std::optional<caps::Pointer> pointer = std::nullopt,
+                     std::optional<caps::LargePointer> large_pointer = std::nullopt)
 {
     proto::ConfirmActive confirm;
     confirm.share_id = share_id;
@@ -122,6 +123,8 @@ Bytes confirm_active(std::uint32_t share_id, bool fastpath_output, std::uint16_t
     sets.input = caps::Input{};
     sets.input->input_flags = caps::input_flags::scancodes | caps::input_flags::fastpath_input2;
     sets.multifragment_update = caps::MultifragmentUpdate{0x100000};
+    sets.pointer = pointer;
+    sets.large_pointer = large_pointer;
     Writer w;
     proto::encode_confirm_active(w, user_id, confirm);
     return io(w.view());
@@ -213,7 +216,8 @@ farland::server::Negotiation tls_negotiation()
 
 /// Runs the connection sequence up to (not including) the Confirm Active and
 /// returns the Demand Active's share ID.
-std::uint32_t connect_until_demand_active(Connection& c, std::uint16_t early_flags = 0x0001)
+std::uint32_t connect_until_demand_active(Connection& c, std::uint16_t early_flags = 0x0001,
+                                          proto::DemandActive* demand = nullptr)
 {
     c.receive(connect_initial(client_data(proto::protocol::ssl, early_flags)));
     static_cast<void>(c.take_output());
@@ -231,7 +235,37 @@ std::uint32_t connect_until_demand_active(Connection& c, std::uint16_t early_fla
     const auto payload = indication(out.tpkt.at(1));
     Reader r(payload);
     auto control = proto::read_share_control(r).value();
-    return proto::decode_demand_active(control.body).value().share_id;
+    auto decoded = proto::decode_demand_active(control.body).value();
+    if (demand != nullptr) {
+        decoded.capabilities.other.clear();  // raw bodies point into `payload`
+        *demand = decoded;
+    }
+    return decoded.share_id;
+}
+
+/// An active connection whose client sent these pointer capabilities.
+std::uint32_t activate_with_pointer(Connection& c, bool fastpath_output, std::optional<caps::Pointer> pointer,
+                                    std::optional<caps::LargePointer> large_pointer)
+{
+    const auto share_id = connect_until_demand_active(c);
+    c.receive(confirm_active(share_id, fastpath_output, 1024, 768, pointer, large_pointer));
+    c.receive(data_pdu(share_id, proto::Synchronize{1, mcs::server_channel_id}));
+    c.receive(data_pdu(share_id, proto::Control{proto::control_action::cooperate, 0, 0}));
+    c.receive(data_pdu(share_id, proto::Control{proto::control_action::request_control, 0, 0}));
+    c.receive(data_pdu(share_id, proto::FontList{}));
+    static_cast<void>(c.take_output());
+    REQUIRE(c.active());
+    return share_id;
+}
+
+/// A small 32 bpp New Pointer.
+proto::PointerUpdate small_pointer()
+{
+    const std::vector<std::byte> pixels{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{0xFF},
+                                        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}};
+    auto shape = proto::pointer::shape_from_bgra(pixels, 2, 1, 32);
+    shape.cache_index = 3;
+    return proto::pointer::NewPointer{shape};
 }
 
 void finalize(Connection& c, std::uint32_t share_id)
@@ -563,4 +597,111 @@ TEST_CASE("GFX needs the early flag, the drdynvc channel and 32 bpp")
     s.bits_per_pixel = 32;
     s.client_data.core.early_capability_flags = 0;
     CHECK_FALSE(s.supports_gfx());
+}
+
+TEST_CASE("The server advertises pointer caches and large pointers; the client's pointer caps are negotiated")
+{
+    Connection c({}, tls_negotiation());
+    proto::DemandActive demand;
+    static_cast<void>(connect_until_demand_active(c, 0x0001, &demand));
+    REQUIRE(demand.capabilities.pointer.has_value());
+    CHECK(demand.capabilities.pointer->color_pointer_flag == 1);
+    CHECK(demand.capabilities.pointer->color_pointer_cache_size == 25);
+    CHECK(demand.capabilities.pointer->pointer_cache_size == 25);
+    REQUIRE(demand.capabilities.large_pointer.has_value());
+    CHECK(demand.capabilities.large_pointer->support_flags ==
+          (caps::large_pointer_flags::size_96x96 | caps::large_pointer_flags::size_384x384));
+
+    // mstsc's values ([MS-RDPBCGR] 4.1.13): 20 color, 21 pointer slots.
+    Connection mstsc({}, tls_negotiation());
+    activate_with_pointer(mstsc, true, caps::Pointer{1, 20, 21}, caps::LargePointer{0x0001});
+    CHECK(mstsc.session().pointer.color_pointer_cache_size == 20);
+    CHECK(mstsc.session().pointer.pointer_cache_size == 21);
+    CHECK(mstsc.session().pointer.large_pointer_flags == caps::large_pointer_flags::size_96x96);
+
+    // More slots than the server offers, unknown flags, no pointerCacheSize.
+    Connection greedy({}, tls_negotiation());
+    activate_with_pointer(greedy, true, caps::Pointer{1, 200, std::nullopt}, caps::LargePointer{0x0007});
+    CHECK(greedy.session().pointer.color_pointer_cache_size == 25);
+    CHECK(greedy.session().pointer.pointer_cache_size == 0);
+    CHECK(greedy.session().pointer.large_pointer_flags == 0x0003);
+
+    Connection none({}, tls_negotiation());
+    activate_with_pointer(none, true, std::nullopt, std::nullopt);
+    CHECK(none.session().pointer.color_pointer_cache_size == 0);
+    CHECK(none.session().pointer.pointer_cache_size == 0);
+    CHECK(none.session().pointer.large_pointer_flags == 0);
+}
+
+TEST_CASE("Pointer updates go out as fast-path updates when negotiated")
+{
+    Connection c({}, tls_negotiation());
+    activate_with_pointer(c, true, caps::Pointer{1, 25, 25}, caps::LargePointer{0x0003});
+
+    for (const proto::PointerUpdate& update :
+         {proto::PointerUpdate{proto::pointer::Hidden{}}, proto::PointerUpdate{proto::pointer::Position{3, 4}},
+          proto::PointerUpdate{proto::pointer::CachedPointer{2}}, small_pointer()}) {
+        c.send_pointer(update);
+        const auto out = split(c.take_output());
+        REQUIRE(out.tpkt.empty());
+        REQUIRE(out.fastpath.size() == 1);
+        Reader r(out.fastpath[0]);
+        const auto fragments = proto::fastpath::decode_output_pdu(r).value();
+        REQUIRE(fragments.size() == 1);
+        CHECK(fragments[0].code == proto::pointer::fastpath_code(update));
+        Reader data(fragments[0].data);
+        CHECK(proto::pointer::decode_fastpath(fragments[0].code, data).value() == update);
+    }
+
+    // A 384x384 pointer spans several fragments and reassembles.
+    const std::vector<std::byte> pixels(std::size_t{384} * 384 * 4, std::byte{0x7F});
+    auto shape = proto::pointer::shape_from_bgra(pixels, 384, 384, 32);
+    const proto::PointerUpdate large = proto::pointer::LargePointer{shape};
+    c.send_pointer(large);
+    const auto out = split(c.take_output());
+    CHECK(out.fastpath.size() > 1);
+    proto::fastpath::Reassembler reassembler(c.max_update_size());
+    std::optional<proto::fastpath::Reassembler::Update> whole;
+    for (const auto& pdu : out.fastpath) {
+        Reader r(pdu);
+        const auto fragments = proto::fastpath::decode_output_pdu(r).value();
+        for (const auto& fragment : fragments) {
+            if (auto update = reassembler.add(fragment).value()) {
+                whole = std::move(update);
+            }
+        }
+    }
+    REQUIRE(whole.has_value());
+    CHECK(whole->code == proto::fastpath::update_code::large_pointer);
+    Reader data(whole->data);
+    CHECK(proto::pointer::decode_fastpath(whole->code, data).value() == large);
+}
+
+TEST_CASE("Without fast-path output, pointer updates are slow-path Pointer Update PDUs")
+{
+    Connection c({}, tls_negotiation());
+    const auto share_id = activate_with_pointer(c, false, caps::Pointer{1, 25, 25}, std::nullopt);
+    for (const proto::PointerUpdate& update : {proto::PointerUpdate{proto::pointer::Default{}},
+                                               proto::PointerUpdate{proto::pointer::Position{3, 4}}, small_pointer()}) {
+        c.send_pointer(update);
+        const auto out = split(c.take_output());
+        REQUIRE(out.fastpath.empty());
+        REQUIRE(out.tpkt.size() == 1);
+        const auto payload = indication(out.tpkt[0]);
+        Reader r(payload);
+        auto control = proto::read_share_control(r).value();
+        CHECK(control.type == proto::pdu_type::data);
+        auto data = proto::read_share_data(control.body).value();
+        CHECK(data.share_id == share_id);
+        CHECK(data.type2 == proto::pdu_type2::pointer);
+        CHECK(proto::pointer::decode_slow_path(data.payload).value() == update);
+    }
+}
+
+TEST_CASE("Pointer updates before activation are dropped")
+{
+    Connection c({}, tls_negotiation());
+    static_cast<void>(connect_until_demand_active(c));
+    c.send_pointer(proto::pointer::Hidden{});
+    CHECK(c.take_output().empty());
 }

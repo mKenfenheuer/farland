@@ -158,8 +158,12 @@ struct MultifragmentUpdate {
 
 /// TS_LARGE_POINTER_CAPABILITYSET, [MS-RDPBCGR] 2.2.7.2.7.
 struct LargePointer {
-    std::uint16_t support_flags = 0;  ///< 0x1: 96x96, 0x2: 384x384
+    std::uint16_t support_flags = 0;  ///< large_pointer_flags
 };
+namespace large_pointer_flags {
+inline constexpr std::uint16_t size_96x96 = 0x0001;    ///< LARGE_POINTER_FLAG_96x96
+inline constexpr std::uint16_t size_384x384 = 0x0002;  ///< LARGE_POINTER_FLAG_384x384, Fast-Path Large Pointer Updates
+}  // namespace large_pointer_flags
 
 /// TS_SURFCMDS_CAPABILITYSET, [MS-RDPBCGR] 2.2.7.2.9.
 struct SurfaceCommands {

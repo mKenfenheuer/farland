@@ -50,17 +50,19 @@ void PreAuth::receive(std::span<const std::byte> bytes)
             fail(frame.error().message());
             return;
         }
-        if (!frame->has_value()) {
+        const auto& complete = *frame;  // nullopt while the header is incomplete
+        if (!complete) {
             return;
         }
-        if ((*frame)->kind != proto::FrameKind::tpkt || (*frame)->length > max_connection_request) {
+        const auto header = *complete;
+        if (header.kind != proto::FrameKind::tpkt || header.length > max_connection_request) {
             fail("expected an X.224 Connection Request");
             return;
         }
-        if (input_.size() < (*frame)->length) {
+        if (input_.size() < header.length) {
             return;
         }
-        if (input_.size() > (*frame)->length) {
+        if (input_.size() > header.length) {
             // The client must wait for the Connection Confirm before TLS starts.
             fail("client data after the X.224 Connection Request");
             return;

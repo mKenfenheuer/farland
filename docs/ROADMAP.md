@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-13):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is next.
+**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME with mstsc, Windows App and ZeroVDI; Plasma and the latency target are still to be tested.
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -140,6 +140,28 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **Exit:**
   - Full control of GNOME 48+ and Plasma 6.x desktops from mstsc and FreeRDP.
   - Glass-to-glass latency on a LAN is at most 50 ms at 1080p60 with AVC420.
+- **Status: implemented; works on GNOME with mstsc, Windows App, ZeroVDI and FreeRDP. Plasma, dmabuf and latency are not tested yet.**
+  - Done:
+    - The backend interface (`FrameSource`, `CursorSource`, `InputSink`).
+    - The portal client: RemoteDesktop and ScreenCast over sd-bus, restore tokens, and the Notify* fallback.
+    - PipeWire capture: eight pixel layouts, shared memory, and LINEAR or GBM-imported dmabufs, with damage and cursor metadata.
+    - libei input, with absolute pointers per region and no stuck keys.
+    - The scancode→evdev table, checked against FreeRDP's.
+    - The cursor pipeline: Pointer and LargePointer capabilities, 32 bpp pointers and a pointer cache.
+    - `farland-server --share`.
+  - Tested:
+    - In Docker, against a mock portal, a private PipeWire daemon and an in-process EIS server.
+    - An end-to-end test of the session with a fake desktop.
+    - On a real desktop (2026-09-14): GNOME 50 on Ubuntu 26.04 (xdg-desktop-portal 1.21, PipeWire 1.6, libei 1.5), in a VM without a GPU, so over shared memory:
+      - mstsc, Windows App and ZeroVDI control the shared monitor with keyboard, mouse and cursor shapes; FreeRDP 3 shows it over RDPGFX 10.7 with Progressive.
+      - The restore token skips the dialog on later starts.
+      - `--virtual-monitor` gets a new 1920x1080 monitor from mutter and shares it.
+  - Differences from the plan:
+    - `--share` shares one monitor and serves one session at a time. A resized desktop is not followed yet; that comes with the disp channel (M6).
+    - The session reads each frame into CPU memory; zero-copy dmabuf to VA-API is M5.
+    - Unicode input is not typed through libei, which has no text input.
+    - A virtual monitor is always 1920x1080; it does not take the client's size yet.
+  - Not tested yet: Plasma, the dmabuf paths, AVC420 against a real client, input on the virtual monitor, and the latency exit criterion.
 
 ### M5: Codecs 2, quality and efficiency (~7 weeks)
 - **VA-API encoder:** dmabuf → VASurface zero-copy (Intel/AMD), with the colour conversion on the GPU. **NVENC** optional.

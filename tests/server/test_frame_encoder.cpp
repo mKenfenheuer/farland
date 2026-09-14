@@ -43,7 +43,9 @@ std::size_t paint(const std::vector<std::vector<std::byte>>& updates, Frame& can
     std::size_t rects = 0;
     for (const auto& update : updates) {
         Reader r(update);
-        for (const auto& rect : proto::decode_bitmap_update(r).value()) {
+        // Named: GCC before 15 lacks C++23's lifetime extension in range-for.
+        const auto update_rects = proto::decode_bitmap_update(r).value();
+        for (const auto& rect : update_rects) {
             ++rects;
             std::vector<std::byte> decoded(static_cast<std::size_t>(rect.width) * rect.height * 4);
             if (codec == BitmapCodec::planar) {

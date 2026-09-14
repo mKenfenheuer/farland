@@ -487,9 +487,7 @@ struct ZgfxCompressor::State {
         if (window.size() + data.size() > max_window) {
             const std::size_t keep = std::min(window.size(), p.history);
             const std::size_t shift = window.size() - keep;
-            const auto w = std::span(window);
-            std::ranges::copy(w.subspan(shift, keep), w.begin());
-            window.resize(keep);
+            window.erase(window.begin(), window.begin() + static_cast<std::ptrdiff_t>(shift));
             window_start += shift;
         }
         if (window.capacity() < window.size() + data.size()) {
