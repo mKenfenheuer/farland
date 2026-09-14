@@ -158,10 +158,10 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
       - `--virtual-monitor` gets a new 1920x1080 monitor from mutter and shares it.
     - Plasma 6.6 on Kubuntu 26.04 (xdg-desktop-portal-kde), in a VM with a virtio GPU: FreeRDP 3 shows the desktop and controls it with keyboard and mouse through libei. KWin sends LINEAR dmabufs, which farland maps and reads; this is the first run of the dmabuf path.
   - Differences from the plan:
-    - `--share` shares one monitor and serves one session at a time. A resized desktop is not followed yet; that comes with the disp channel (M6).
+    - `--share` serves one session at a time. It shared one monitor and did not follow a resized desktop; since M6 it shares every monitor picked in the portal dialog and follows the client's layout (see M6).
     - The session read each frame into CPU memory; since M5, AVC420 on VA-API takes the captured dmabufs directly.
     - Unicode input is not typed through libei, which has no text input.
-    - A virtual monitor is always 1920x1080; it does not take the client's size yet.
+    - A virtual monitor was always 1920x1080; since M6 it takes the client's size on GNOME (KWin's portal keeps 1920x1080).
   - Not tested yet: mstsc on Plasma, tiled (GPU-imported) dmabufs, AVC420 against a real client, input on the virtual monitor, and the latency exit criterion.
 
 ### M5: Codecs 2, quality and efficiency (~7 weeks)
@@ -177,7 +177,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - Benchmarks for bitrate, CPU and latency are published per codec, together with a content corpus.
   - Text is sharp at low bandwidth (2 Mbit/s).
   - VA-API runs at 4K30 with less than 10% of one core.
-- **Status: in progress.**
+- **Status: implemented except the items under Open.**
   - Done:
     - Network auto-detect ([MS-RDPBCGR] 2.2.14): connect-time RTT and bandwidth measurement, continuous RTT probes and bandwidth measured on real frames, the MCS message channel and heartbeats. Only for clients that advertise it; `--autodetect full|continuous|off`.
     - The quality ladder (`QualityController`, ZeroVDI's four tiers): queueing delay, slow frame acknowledgements, the client's queue depth and the measured bandwidth set frame rate, Progressive quantisation and H.264 bitrate, with hysteresis.
@@ -236,22 +236,97 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - Text, HTML and images through the portal **Clipboard** interface, or a Wayland data device in headless sessions.
   - File copy (FileContents), exposed through a FUSE or temp-dir staging area.
 - **rdpsnd (MS-RDPEA):** PipeWire monitor capture; PCM, then Opus/AAC formats where the client supports them. Wave-confirm flow control.
+  - **Status: implemented, tried with FreeRDP only.**
+    - Sans-IO codec and server (`channels::rdpsnd`, `RdpsndServer`): formats, quality mode, training, Wave2 for version 8 clients and WaveInfo/Wave for older ones, wave confirm, close, volume. UDP (Crypt Key, Wave Encrypt, UDP Wave) is not implemented.
+    - Transport: AUDIO_PLAYBACK_DVC first, as Windows servers and gnome-remote-desktop do, and the "rdpsnd" static channel when the client refuses it or has no drdynvc. AUDIO_PLAYBACK_LOSSY_DVC needs UDP (phase 3).
+    - Formats: Opus 48 kHz stereo (libopus loaded at runtime, BSD) for clients asking for dynamic or medium quality, PCM 48/44.1/22.05 kHz stereo otherwise. FreeRDP decodes Opus when built with it; Windows clients do not take Opus. AAC (0xA106), which Windows clients decode, would need an AAC encoder: fdk-aac's licence is not Apache-compatible and FFmpeg's is LGPL, so it is left for an optional runtime-loaded backend.
+    - Capture: the default sink's monitor (`stream.capture.sink`) in the user's PipeWire, only while a client plays; PipeWire resamples.
+    - Flow control: 20 ms packets; audio unconfirmed beyond the lowest backlog of the last seconds plus 100 ms is dropped, not queued (400 ms before the first confirmation, 1 s at most). 1 s of digital silence stops the stream with a Close PDU. In dynamic quality the Opus bitrate follows the auto-detected bandwidth.
 - **audin (MS-RDPEAI):** a PipeWire virtual source.
+  - **Status: implemented, tried with FreeRDP only.** AUDIO_INPUT with 16-bit PCM (48/44.1 kHz mono preferred), opened when the client sets INFO_AUDIOCAPTURE. The samples go to a virtual source (`farland-microphone`, a stream node of media.class Audio/Source: with Audio/Source/Virtual, WirePlumber stalls Pulse streams opened after it) with a 40 ms jitter buffer, which exists while the client records.
 - **rdpei (MS-RDPEI):** touch and pen, delivered as EIS touch events.
 - Optional: **rdpecam** as a PipeWire virtual camera; **ainput**.
 - **Exit:** clipboard works in both directions for text, images and files; audio stays in sync (under 100 ms) and the microphone works from Windows App and FreeRDP.
+- **Status: all four channels implemented and tried with FreeRDP; the exit needs mstsc and Windows App, the portal clipboard on a live desktop, and a real touch device.**
+- **Status of disp: implemented.**
+  - Done:
+    - The [MS-RDPEDISP] codec (`channels/disp`): the capabilities and monitor layout PDUs with every field (orientation, desktop and device scale, physical size), decoded strictly (the header length, MonitorLayoutSize 40, 1 to MaxNumMonitors monitors that fill the PDU), with a fuzz target that also runs the server's validation.
+    - `server::DisplayControl` on "Microsoft::Windows::RDS::DisplayControl": sends the capabilities (8 monitors, 8 x 3840 x 2160 pixels in all), validates layouts (widths even, 200 to 8192, no overlaps, one primary, a bounding box of at most 16384) and ignores invalid ones, and debounces a dragged window edge: a layout applies 300 ms after the last one, or 1 s after the first of a burst.
+    - `server::DisplayLayout`: the client's monitors from CS_MONITOR/CS_MONITOR_EX at connect time or from Display Control, normalised to a desktop starting at 0,0, and where each screen shows: its own size, or scaled down and centred (letterboxed) on its monitor.
+    - The Graphics Pipeline lays out one surface per screen with its own encoders (per-monitor surfaces map cleanly to separately captured streams, and keep each H.264 picture within what hardware encoders take), mapped where the screen shows: pictures larger than their monitor go through MapSurfaceToScaledOutput where the client allows it, or are scaled on the CPU (a box filter) otherwise. Borders and monitors without a picture are black surfaces of their own, since ResetGraphics leaves the rest of the output undefined. A new layout sends ResetGraphics with the monitor list and new surfaces; one RDPGFX frame carries every screen.
+    - Clients without GFX get one composed picture and are reactivated (Deactivate All, Demand Active) at the new desktop size.
+    - The test pattern shows on every monitor, and takes pointer input on the one under the pointer.
+    - The portal desktop shares every monitor picked in the dialog (`multiple`), each captured separately, ordered left to right, each on one client monitor; absolute pointer motion goes to the right stream through libei's regions (`EiInput::set_outputs` with the letterboxed places) or the Notify* layout. The cursor comes from the screen that shows it, mapped onto its place.
+    - `--virtual-monitor` sizes the virtual monitor to the client's monitor and resizes it with the client's window: the capture renegotiates its PipeWire format with the requested size first (as gnome-remote-desktop does), which Mutter follows; a producer of another fixed size (KWin's 1920x1080 virtual output) still matches the size range offered after it.
+    - A shared desktop with fixed monitors shows them side by side at their size to single-monitor clients until they send a layout (as before M6 for one monitor).
+  - Differences from the plan:
+    - A portal session has one virtual monitor (xdg-desktop-portal-gnome and -kde both), so with `--virtual-monitor` only the client's primary monitor gets a picture. Several virtual monitors need Mutter's own `RecordVirtual` (allowed several times per session and not restricted to trusted callers in Mutter 50), which comes with the Mutter backend (M7).
+    - KWin's virtual output stays 1920x1080: xdg-desktop-portal-kde creates it at that size and KWin does not follow the consumer's format.
+    - The Monitor Layout PDU ([MS-RDPBCGR] 2.2.12.1) is not sent to clients without GFX; they keep the layout they asked for.
+  - Tested:
+    - Unit tests for the codec (a FreeRDP-style two-monitor layout, strict decoding), the layout rules and letterboxing, the debounce, the scaler and compositor, and the multi-surface pipeline (surfaces, scaled maps, black borders, one frame for all screens, a new layout); the fuzz corpus. GCC 15 with `-Werror` on Ubuntu 26.04 and Kubuntu 26.04, Apple clang with ASan and UBSan.
+    - Live on Ubuntu 26.04 with FreeRDP 3.31 (`/dynamic-resolution`, in Xvfb, its window resized with xdotool) and the test pattern: every settled layout gives a ResetGraphics and a new surface (1024x768, 1280x720, then a burst of five sizes applied as two layouts), and the pattern renders at each size. Without GFX (`/bpp:16`) the connection is reactivated at the new size.
+    - Live on Plasma 6.6 (xdg-desktop-portal-kde) with `--share` and FreeRDP 3: the 1280x800 monitor fills a 1280x800 window, is centred with black borders in a 1600x900 one, and scaled to 800x500 with borders above and below in an 800x800 one.
+  - Not tested yet: mstsc and Windows App (resizing and "use all my monitors"); a client with several monitors (Xvfb gave FreeRDP no valid multi-monitor layout); sharing several monitors (the test machines have one each); `--virtual-monitor` resizing on GNOME (no desktop session was logged in on the GNOME host) and on Plasma (its portal dialog needs a person); the zero-copy AVC420 path with several screens.
+- **Status of rdpei: implemented; not yet tried with a real touch client.**
+  - Done:
+    - The codec ([MS-RDPEI] 2.2): the five variable-length integers, SC_READY and CS_READY (versions 1.0 to 3.0, multipen flags), touch and pen events with every optional field, suspend, resume and dismiss-hovering. Decoding is strict: `pduLength`, counts and field presence must add up exactly, with at most 128 frames, 256 touch or 4 pen contacts per frame and 64 KiB per PDU. Fuzz target `rdpei`.
+    - `RdpeiServer`: SC_READY 3.0, and the contact state machine of 3.1.1.1 for every touch contact and pen, with at most the client's `maxTouchContacts` (capped at 32). A contact that breaks it is canceled and the rest of its transaction ignored (3.2.5.3). Contacts are released on suspend, on a new CS_READY, when the channel closes and at the end of the session. Frame timestamps are not replayed.
+    - An `InputSink` touch API (down, motion, up and cancel per slot, framed by `flush()`), implemented by `EiInput` with libei touches mapped through the same regions and outputs as the absolute pointer. Without a touchscreen device, the first finger drives the pointer.
+    - Pen: libei (1.5) has no tablet devices, so the pen moves the pointer and holds the left button while it touches (the right one with the barrel button); pressure, tilt and rotation are dropped.
+    - The test pattern shows touch and pen contacts.
+  - Tested:
+    - Unit tests with the spec's integer examples, and an in-process end-to-end test: a scripted client opens the channel through drdynvc, and its touches reach an `InputSink` through `TouchInput` and the translator.
+    - `EiInput` against an in-process libeis server with a touchscreen.
+    - Live on Plasma 6.6 (2026-09-14): `farland-touch-probe` touched the shared monitor through the portal's EIS connection, and a full-screen Qt client got the tap, a swipe, a two-finger spread and a cancel at the right positions. KWin's EIS supports touch and cancel; Mutter 50's reads touches but not cancels (a cancel becomes an up there), from the symbols it imports; GNOME was not tried live.
+  - Not tested yet: a real touch or pen client (Windows App on a tablet, mstsc on a Surface), and pen input anywhere.
+- **Status of cliprdr: implemented; the portal clipboard is not yet tried on a live desktop.**
+  - Done:
+    - The protocol ([MS-RDPECLIP]): all PDUs with strict decoding and limits, long and short format names, delayed rendering both ways, one outstanding request per direction with time-outs, file contents by size and range with stream IDs, Lock/Unlock with clip data IDs, huge files; a fuzz target with a seed corpus.
+    - Formats: CF_UNICODETEXT and CF_TEXT ↔ text/plain (UTF-8, CRLF/LF), "HTML Format" ↔ text/html, CF_DIB/CF_DIBV5/"PNG" ↔ image/png and image/bmp (an own PNG codec on zlib, optional), FileGroupDescriptorW ↔ text/uri-list and x-special/gnome-copied-files.
+    - Files: the client's are staged when the desktop pastes them, in a 0700 directory under `$XDG_RUNTIME_DIR/farland/` with names checked against escapes and a size cap (1 GiB per paste); the desktop's are served from the paths it names, re-checked (device, inode, no symlinks) on every read. No FUSE: a large paste waits until every file is fetched.
+    - Desktop: org.freedesktop.portal.Clipboard (RequestClipboard before Start, SetSelection, SelectionRead/Write, the owner and transfer signals), tested against a mock portal.
+    - The test pattern has a loopback clipboard: what the client copies is fetched at once and offered back.
+  - Tested:
+    - FreeRDP 3.31 (xfreerdp3) against the loopback, with text, HTML, an image (CF_DIB to PNG and BMP and back, pixel-exact) and files (a file and a folder with 3 MB, staged on the server and read back through FreeRDP's FUSE mount), on Ubuntu 26.04. The portal path is tested against the mock portal; against GNOME 50 it reaches Start with RequestClipboard, but the permission dialog was not answered, so the real desktop clipboard and mstsc/Windows App are still untested.
+  - Not tested yet: the portal clipboard on a live desktop (the portal's permission dialog was not accepted in the test), mstsc and Windows App.
 
 ### M7: Sessions, headless, deployment (~7 weeks)
-- **System daemon (`farlandd`)**, plus a D-Bus control API, polkit, `farlandctl`, and a TOML config.
+Multi-session with headless desktops behind one port (decided 2026-09-14).
+- **System daemon (`farlandd`)**, root, one system unit:
+  - Owns the port, reads `/etc/farland/farland.toml` (`[server]`, `[auth]`, `[session]`, `[policy]`) and the credential store, runs PAM, and keeps the session registry.
+  - Spawns the network processes as farland-server does: X.224, TLS and NLA stay sandboxed behind privsep.
+  - A D-Bus control API (`org.farland.Farland1`) with polkit, used by `farlandctl sessions|terminate|passwd`.
+- **Hand-over by descriptor passing:**
+  - The network process keeps TLS and relays the plaintext RDP stream. farlandd passes that socket over SCM_RIGHTS to the user's **`farland-agent`**, which runs the rest of the connection (broker protocol: `src/farland/server/broker.hpp`).
+  - One TCP connection that works with every client; no TLS key or credential leaves root and the sandbox.
+  - Server Redirection with **RDSTLS** stays an option for spreading sessions over several hosts later.
+- **`farland-agent`**, one per session, a user unit inside the user's logind session: owns the desktop backend, runs the session loop for each connection, and keeps the desktop between connections. It gets no sandbox of its own before M8.
 - **Headless sessions** per user:
-  - Launchers for `mutter --headless`, `kwin_wayland --virtual`, sway/labwc headless, and cage (kiosk).
-  - The keymap is taken from CS_CORE `keyboardLayout`.
-- **Authentication modes:** per-server credential, Kerberos (the SPNEGO/GSSAPI acceptor with a keytab, moved here from M2), and delegated login with PAM (PLAN §3.5).
-- **Session broker:** multiple concurrent sessions, reconnect to an existing session through the **auto-reconnect cookie**, idle and disconnect policies.
-- **Hand-over** from the system daemon to a user session via Server Redirection + **RDSTLS**.
+  - **GNOME through GDM:** `RemoteDisplayFactory.CreateRemoteDisplay` with a preauthenticated user creates a headless systemd session. The Mutter backend drives it without a portal dialog: RemoteDesktop, ScreenCast `RecordVirtual` and EIS input.
+  - **Plasma, sway, labwc and cage through farland's own PAM and logind session** (`pam_systemd` marks it remote): `kwin_wayland --virtual`, wlroots compositors on the headless backend, and cage with one kiosk application.
+  - The desktop starts at the client's size and monitors, and disp resizes it later. The keymap comes from CS_CORE `keyboardLayout`.
+- **Authentication:**
+  - Default: **self-enrolment.** `farlandctl passwd` asks farlandd over D-Bus. Polkit (`auth_self`) and a PAM password check confirm the user, and farlandd stores the NT hash with the local account (`user:domain:NT hash[:local account]`).
+  - Delegated login with PAM (PLAN §3.5) is dropped: NTLM needs the NT hash before a password could ever reach PAM.
+  - Kerberos: the SPNEGO/GSSAPI acceptor with a keytab (moved here from M2), with the principal mapped to a local user.
+- **Session broker:**
+  - The NLA identity picks the user's one session (`max_sessions_per_user = 1`). A second connection takes over and ends the first with ERRINFO_DISCONNECTED_BY_OTHERCONNECTION.
+  - The agent sends a fresh **auto-reconnect cookie** (Save Session Info) on every connection and checks a returning one; NLA stays authoritative.
+  - A user already logged in on a local seat: `on_local_session = refuse | attach` (default refuse).
+  - Policies: `disconnected_timeout`, `idle_timeout`, `max_sessions`. Logging out ends the compositor, then the agent, then the GDM display or PAM session.
 - **Operations:**
-  - systemd units, journald structured logging, Prometheus metrics (fps, bitrate, RTT, queue depth).
+  - systemd units, the PAM file, D-Bus and polkit policies, and the KWin desktop file.
+  - journald structured logging, Prometheus metrics (fps, bitrate, RTT, queue depth).
   - Packaging as deb, rpm and an AUR recipe; a container image for the test backend.
+- **Phases:**
+  - S0: the broker protocol with descriptor passing, Save Session Info and the ARC verifier, the TOML config, and the local-account column.
+  - S1: farlandd and the agent through farland's own PAM, with the test pattern. Two users; reconnecting resumes. Tested in a CI container with `pam_permit` and on the test hosts.
+  - S2: GNOME through GDM with the Mutter backend and disp resize.
+  - S3: Plasma, starting with a spike on headless KWin under systemd boot.
+  - S4: wlroots and cage, with headless sway in CI.
+  - S5: policies, the D-Bus API and polkit, `farlandctl` commands, metrics, units and packaging; then Kerberos.
+  - S6 (optional): Server Redirection and RDSTLS for several hosts.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)

@@ -82,6 +82,14 @@ bool CredentialStore::valid_name(std::string_view name, bool allow_empty)
            });
 }
 
+bool CredentialStore::valid_local_account(std::string_view name)
+{
+    return !name.empty() && name.size() <= max_name_size && name.front() != '-' &&
+           std::ranges::none_of(name, [](char c) {
+               return c == ':' || c == '/' || c == ' ' || static_cast<unsigned char>(c) < 0x20 || c == 0x7F;
+           });
+}
+
 Result<CredentialStore> CredentialStore::parse(std::string_view text)
 {
     CredentialStore store;
@@ -109,11 +117,21 @@ Result<CredentialStore> CredentialStore::parse(std::string_view text)
         if (!valid_name(user, false) || !valid_name(domain, true)) {
             return fail(Errc::invalid_value, "invalid user or domain name", line_no);
         }
-        auto digits = from_hex(line.substr(second + 1));
+        // The hash, then optionally the local account.
+        const auto rest = line.substr(second + 1);
+        const auto third = rest.find(':');
+        std::string_view account;
+        if (third != std::string_view::npos) {
+            account = rest.substr(third + 1);
+            if (!valid_local_account(account)) {
+                return fail(Errc::invalid_value, "invalid local account name", line_no);
+            }
+        }
+        auto digits = from_hex(rest.substr(0, third));
         if (!digits || digits->size() != NtHash{}.size()) {
             return fail(Errc::invalid_value, "NT hash is not 32 hexadecimal digits", line_no);
         }
-        Entry entry{std::string(user), std::string(domain), {}};
+        Entry entry{std::string(user), std::string(domain), {}, std::string(account)};
         std::ranges::copy(*digits, entry.hash.begin());
         secure_zero(*digits);
         const bool duplicate = std::ranges::any_of(store.entries_, [&entry](const Entry& e) {
@@ -129,11 +147,15 @@ Result<CredentialStore> CredentialStore::parse(std::string_view text)
 
 std::string CredentialStore::serialize() const
 {
-    std::string out = "# farland NLA users: user:domain:NT hash (an empty domain matches any)\n";
+    std::string out = "# farland NLA users: user:domain:NT hash[:local account] (an empty domain matches any)\n";
     for (const auto& entry : entries_) {
         std::string digits = to_hex(entry.hash);
         std::erase(digits, ' ');
-        out += std::format("{}:{}:{}\n", entry.user, entry.domain, digits);
+        if (entry.local_account.empty()) {
+            out += std::format("{}:{}:{}\n", entry.user, entry.domain, digits);
+        } else {
+            out += std::format("{}:{}:{}:{}\n", entry.user, entry.domain, digits, entry.local_account);
+        }
         secure_zero(std::as_writable_bytes(std::span(digits)));
     }
     return out;
@@ -198,7 +220,7 @@ Result<void> CredentialStore::save(const std::filesystem::path& path) const
     return {};
 }
 
-std::optional<NtHash> CredentialStore::lookup(std::string_view user, std::string_view domain) const
+const CredentialStore::Entry* CredentialStore::find(std::string_view user, std::string_view domain) const
 {
     const Entry* wildcard = nullptr;
     for (const auto& entry : entries_) {
@@ -206,16 +228,22 @@ std::optional<NtHash> CredentialStore::lookup(std::string_view user, std::string
             continue;
         }
         if (!entry.domain.empty() && iequals(entry.domain, domain)) {
-            return entry.hash;
+            return &entry;
         }
         if (entry.domain.empty()) {
             wildcard = &entry;
         }
     }
-    if (wildcard != nullptr) {
-        return wildcard->hash;
+    return wildcard;
+}
+
+std::optional<NtHash> CredentialStore::lookup(std::string_view user, std::string_view domain) const
+{
+    const Entry* entry = find(user, domain);
+    if (entry == nullptr) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    return entry->hash;
 }
 
 void CredentialStore::set(std::string_view user, std::string_view domain, const NtHash& hash)
@@ -227,7 +255,19 @@ void CredentialStore::set(std::string_view user, std::string_view domain, const 
             return;
         }
     }
-    entries_.push_back(Entry{std::string(user), std::string(domain), hash});
+    entries_.push_back(Entry{std::string(user), std::string(domain), hash, {}});
+}
+
+bool CredentialStore::set_local_account(std::string_view user, std::string_view domain, std::string_view account)
+{
+    FARLAND_ASSERT(account.empty() || valid_local_account(account));
+    for (auto& entry : entries_) {
+        if (iequals(entry.user, user) && iequals(entry.domain, domain)) {
+            entry.local_account = account;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool CredentialStore::remove(std::string_view user, std::string_view domain)

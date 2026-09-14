@@ -87,9 +87,55 @@ TEST_CASE("Malformed credential files are rejected with the line number")
     check("\nalice::0011\n", 2);                                                             // short hash
     check(":LAB:00112233445566778899aabbccddeeff\n", 1);                                     // empty user
     check("a::00112233445566778899aabbccddeeff\nA::00112233445566778899aabbccddeeff\n", 2);  // duplicate
+    check("alice::00112233445566778899aabbccddeeff:\n", 1);                                  // empty account
+    check("alice::00112233445566778899aabbccddeeff:-root\n", 1);                             // option-like account
+    check("alice::00112233445566778899aabbccddeeff:a:b\n", 1);                               // a fifth column
+    check("alice::0011:alice\n", 1);                                                         // short hash, with account
     CHECK_FALSE(CredentialStore::valid_name("a:b", false));
     CHECK_FALSE(CredentialStore::valid_name("line\nbreak", false));
     CHECK(CredentialStore::valid_name("", true));
+    CHECK(CredentialStore::valid_local_account("alice.smith@example.org"));
+    CHECK_FALSE(CredentialStore::valid_local_account(""));
+    CHECK_FALSE(CredentialStore::valid_local_account("../root"));
+    CHECK_FALSE(CredentialStore::valid_local_account("a b"));
+}
+
+TEST_CASE("An optional fourth column names the local account")
+{
+    const auto store = CredentialStore::parse("alice::00112233445566778899aabbccddeeff\n"
+                                              "Bob:LAB:ffeeddccbbaa99887766554433221100:bob.smith  # enrolled\n")
+                           .value();
+    REQUIRE(store.entries().size() == 2);
+    CHECK(store.entries()[0].local_account.empty());
+    CHECK(store.entries()[0].account() == "alice");
+    CHECK(store.entries()[1].account() == "bob.smith");
+
+    // Entries without an account keep the three-column form.
+    const auto text = store.serialize();
+    CHECK(text.find("\nalice::00112233445566778899aabbccddeeff\n") != std::string::npos);
+    CHECK(text.find("\nBob:LAB:ffeeddccbbaa99887766554433221100:bob.smith\n") != std::string::npos);
+    const auto again = CredentialStore::parse(text).value();
+    CHECK(again.entries()[1].local_account == "bob.smith");
+
+    const auto* bob = store.find("BOB", "lab");
+    REQUIRE(bob != nullptr);
+    CHECK(bob->account() == "bob.smith");
+    CHECK(store.find("bob", "OTHER") == nullptr);
+    CHECK(store.find("alice", "ANY") == &store.entries()[0]);
+}
+
+TEST_CASE("Changing a password keeps the local account")
+{
+    CredentialStore store;
+    store.set("alice", "", hash_of(1));
+    CHECK(store.set_local_account("ALICE", "", "alice2"));
+    store.set("alice", "", hash_of(2));
+    REQUIRE(store.find("alice", "") != nullptr);
+    CHECK(store.find("alice", "")->local_account == "alice2");
+    CHECK(store.lookup("alice", "") == hash_of(2));
+    CHECK_FALSE(store.set_local_account("carol", "", "carol"));
+    CHECK(store.set_local_account("alice", "", ""));
+    CHECK(store.find("alice", "")->account() == "alice");
 }
 
 TEST_CASE("The store saves atomically with private permissions and reloads")

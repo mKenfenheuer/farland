@@ -11,6 +11,7 @@ if farland_platform_portal_dep.found()
     'test_ei_input.cpp',
     'test_pipewire_capture.cpp',
     'test_pixel_formats.cpp',
+    'test_portal_clipboard.cpp',
     'test_portal_input.cpp',
     'test_portal_session.cpp',
     'test_restore_token.cpp',
@@ -26,6 +27,12 @@ if farland_platform_portal_dep.found()
   executable(
     'farland-portal-probe',
     'portal_probe.cpp',
+    dependencies: farland_platform_portal_dep,
+  )
+  # Touches the shared monitor through EIS; also manual.
+  executable(
+    'farland-touch-probe',
+    'touch_probe.cpp',
     dependencies: farland_platform_portal_dep,
   )
 endif

@@ -119,11 +119,13 @@ QualityController::Verdict QualityController::classify(const Observation& o, std
     };
     if (queue_delay && *queue_delay > config_.queue_delay_limit) {
         worse(*queue_delay > config_.queue_delay_limit * 4 ? Verdict::severe : Verdict::congested,
-              std::format("RTT {:.0f} ms is {:.0f} ms above the base RTT", ms(net.rtt.value_or(decltype(net.rtt)::value_type{})), ms(*queue_delay)));
+              std::format("RTT {:.0f} ms is {:.0f} ms above the base RTT",
+                          ms(net.rtt.value_or(decltype(net.rtt)::value_type{})), ms(*queue_delay)));
     }
     if (ack_delay && *ack_delay > config_.ack_delay_limit) {
         worse(*ack_delay > config_.ack_delay_limit * 4 ? Verdict::severe : Verdict::congested,
-              std::format("frames acknowledged after {:.0f} ms", ms(o.ack_round_trip.value_or(decltype(o.ack_round_trip)::value_type{}))));
+              std::format("frames acknowledged after {:.0f} ms",
+                          ms(o.ack_round_trip.value_or(decltype(o.ack_round_trip)::value_type{}))));
     }
     if (o.queue_depth >= config_.queue_depth_limit) {
         worse(Verdict::congested, std::format("{} frames queued in the client", o.queue_depth));

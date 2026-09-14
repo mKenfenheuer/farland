@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
 // SPDX-License-Identifier: Apache-2.0
 
-// farland-server: an RDP server with NLA and the synthetic test backend.
-// Wayland capture comes with M4.
+// farland-server: an RDP server with NLA that shares the running Wayland
+// desktop (--share) or shows the synthetic test backend.
 
 #include <farland/auth/credential_store.hpp>
 #include <farland/auth/ntlm.hpp>
@@ -122,12 +122,18 @@ void usage()
                  "  --no-clearcodec       Progressive surfaces: no ClearCodec for text and UI tiles\n"
                  "  --no-refine           Progressive surfaces: every tile at full quality at once, no\n"
                  "                        refinement passes\n"
+                 "  --no-audio            do not play the desktop's audio on the client (rdpsnd)\n"
+                 "  --no-microphone       do not offer the client's microphone as a local audio source (audin)\n"
                  "  --autodetect MODE     network auto-detect for clients that support it: full (default;\n"
                  "                        also measures before licensing), continuous (only once connected) or off\n"
                  "  --max-sessions N      concurrent connections (default 4)\n"
                  "  --share               share the running Wayland desktop (xdg-desktop-portal, PipeWire, libei)\n"
-                 "                        instead of the test pattern; one session at a time\n"
-                 "  --virtual-monitor     with --share: share a new virtual monitor where the portal offers it\n"
+                 "                        instead of the test pattern: every monitor picked in the portal dialog,\n"
+                 "                        each on one of the client's monitors; one session at a time\n"
+                 "  --virtual-monitor     with --share: share a new virtual monitor where the portal offers it,\n"
+                 "                        sized to the client's monitor and resized with its window (GNOME)\n"
+                 "  --no-clipboard        do not share the clipboard (text, HTML, images, files); without --share\n"
+                 "                        the clipboard is a loopback that offers back what the client copies\n"
                  "  --allow-tls-only      also accept clients without NLA (anyone reaches the login screen)\n"
                  "  --no-privsep          handle clients in this process instead of a sandboxed one\n"
                  "  --log-level LEVEL     trace, debug, info, warn, error (default info)\n"
@@ -197,6 +203,10 @@ bool parse_options(std::span<char*> args, Options& options)
             options.session.clearcodec = false;
         } else if (arg == "--no-refine") {
             options.session.refine = false;
+        } else if (arg == "--no-audio") {
+            options.session.audio = false;
+        } else if (arg == "--no-microphone") {
+            options.session.microphone = false;
         } else if (arg == "--autodetect") {
             const auto mode = value();
             if (mode == "full") {
@@ -218,6 +228,8 @@ bool parse_options(std::span<char*> args, Options& options)
         } else if (arg == "--virtual-monitor") {
             options.share = true;
             options.virtual_monitor = true;
+        } else if (arg == "--no-clipboard") {
+            options.session.clipboard = false;
         } else if (arg == "--no-privsep") {
             options.privsep = false;
         } else if (arg == "--privsep-child") {
@@ -402,6 +414,7 @@ int main(int argc, char** argv)
             .restore_token_file = std::nullopt,
             .timeout = std::chrono::seconds(300),
             .render_node = render_node,
+            .clipboard = options.session.clipboard,
         });
         if (!shared) {
             std::cerr << "farland-server: cannot share the desktop: " << shared.error().message() << "\n";

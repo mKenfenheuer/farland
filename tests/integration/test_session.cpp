@@ -471,7 +471,8 @@ public:
     /// Written on the session thread; read by the test after joining it.
     class Frames final : public farland::platform::FrameSource {
     public:
-        explicit Frames(bool dmabuf_only) : pixels_(static_cast<std::size_t>(width) * height * 4), dmabuf_only_(dmabuf_only)
+        explicit Frames(bool dmabuf_only)
+            : pixels_(static_cast<std::size_t>(width) * height * 4), dmabuf_only_(dmabuf_only)
         {
             for (std::size_t i = 0; i < pixels_.size(); i += 4) {
                 pixels_[i] = std::byte{color & 0xFFU};

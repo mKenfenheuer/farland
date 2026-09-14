@@ -40,6 +40,8 @@ constexpr std::string_view log_component = "platform.pipewire";
 /// RDP large pointers go up to 384 x 384 (MS-RDPBCGR 2.2.7.2.11), so larger
 /// cursor bitmaps are of no use.
 constexpr std::uint32_t max_cursor_size = 384;
+/// Room for the EnumFormat params: every format twice with a requested size.
+constexpr std::size_t format_pod_capacity = std::size_t{64} * 1024;
 /// Damage rectangles the producer may send per buffer.
 constexpr std::int32_t damage_regions_default = 16;
 constexpr std::int32_t damage_regions_max = 64;
@@ -282,6 +284,8 @@ struct PipeWireCapture::Impl {
     // Loop thread state.
     std::unique_ptr<DmabufReader> dmabuf;
     std::vector<FormatOffer> offers;
+    /// request_size(); offered first, as a fixed size.
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> requested_size;
     std::optional<spa_video_info_raw> format;
     PixelLayout layout = PixelLayout::bgrx;
     std::unordered_map<pw_buffer*, std::unique_ptr<BufferSlot>> slots;
@@ -355,16 +359,23 @@ struct PipeWireCapture::Impl {
         }
     }
 
-    void add_size_and_rate(pw::PodBuilder& b) const
+    /// A fixed size, or any size (1920x1080 preferred: what a virtual
+    /// monitor gets unless a size was requested).
+    void add_size_and_rate(pw::PodBuilder& b,
+                           const std::optional<std::pair<std::uint32_t, std::uint32_t>>& fixed_size) const
     {
         const std::uint32_t max_fps = std::max<std::uint32_t>(options.max_framerate, 1);
         spa_pod_frame choice{};
         b.prop(SPA_FORMAT_VIDEO_size);
-        b.push_choice(&choice, SPA_CHOICE_Range);
-        b.rectangle(1920, 1080);
-        b.rectangle(1, 1);
-        b.rectangle(16384, 16384);
-        static_cast<void>(b.pop(&choice));
+        if (fixed_size) {
+            b.rectangle(fixed_size->first, fixed_size->second);
+        } else {
+            b.push_choice(&choice, SPA_CHOICE_Range);
+            b.rectangle(1920, 1080);
+            b.rectangle(1, 1);
+            b.rectangle(16384, 16384);
+            static_cast<void>(b.pop(&choice));
+        }
         // Screen casts run at a variable rate (0/1), up to maxFramerate.
         b.prop(SPA_FORMAT_VIDEO_framerate);
         b.push_choice(&choice, SPA_CHOICE_Range);
@@ -380,11 +391,24 @@ struct PipeWireCapture::Impl {
         static_cast<void>(b.pop(&choice));
     }
 
-    /// EnumFormat params: one per layout with its dmabuf modifiers (preferred),
-    /// then one for shared memory with every layout.
+    /// EnumFormat params: with a requested size, every format at that size
+    /// first (PipeWire takes the consumer's formats in order), then every
+    /// format at any size.
     [[nodiscard]] std::vector<const spa_pod*> build_formats(pw::PodBuilder& b) const
     {
         std::vector<const spa_pod*> params;
+        if (requested_size) {
+            add_formats(b, params, requested_size);
+        }
+        add_formats(b, params, std::nullopt);
+        return params;
+    }
+
+    /// One param per layout with its dmabuf modifiers (preferred), then one
+    /// for shared memory with every layout.
+    void add_formats(pw::PodBuilder& b, std::vector<const spa_pod*>& params,
+                     const std::optional<std::pair<std::uint32_t, std::uint32_t>>& fixed_size) const
+    {
         for (const FormatOffer& offer : offers) {
             if (offer.modifiers.empty()) {
                 continue;
@@ -407,7 +431,7 @@ struct PipeWireCapture::Impl {
                 b.long_(static_cast<std::int64_t>(modifier));
             }
             static_cast<void>(b.pop(&choice));
-            add_size_and_rate(b);
+            add_size_and_rate(b, fixed_size);
             params.push_back(b.pop(&object));
         }
         spa_pod_frame object{};
@@ -424,9 +448,8 @@ struct PipeWireCapture::Impl {
             b.id(to_spa_format(offer_layout));
         }
         static_cast<void>(b.pop(&choice));
-        add_size_and_rate(b);
+        add_size_and_rate(b, fixed_size);
         params.push_back(b.pop(&object));
-        return params;
     }
 
     // --- State ---------------------------------------------------------------
@@ -570,7 +593,7 @@ struct PipeWireCapture::Impl {
         if (self.stream == nullptr) {
             return;
         }
-        pw::PodBuilder b;
+        pw::PodBuilder b(format_pod_capacity);
         auto params = self.build_formats(b);
         if (b.overflowed()) {
             self.close("format parameters do not fit");
@@ -863,9 +886,10 @@ struct PipeWireCapture::Impl {
             }
             const std::uint32_t plane = held.dmabuf.plane_count++;
             held.fds.at(plane) = UniqueFd(fd);
-            const std::uint32_t pitch = data.chunk->stride > 0 ? static_cast<std::uint32_t>(data.chunk->stride)
-                                        : plane == 0            ? width * 4U
-                                                                : 0U;
+            std::uint32_t pitch = plane == 0 ? width * 4U : 0U;
+            if (data.chunk->stride > 0) {
+                pitch = static_cast<std::uint32_t>(data.chunk->stride);
+            }
             held.dmabuf.planes.at(plane) = DmabufPlane{fd, data.chunk->offset, pitch};
         }
         if (held.dmabuf.plane_count == 0) {
@@ -1397,7 +1421,7 @@ Result<std::unique_ptr<PipeWireCapture>> PipeWireCapture::create(int pipewire_fd
         pw::loop_add_event(pw_thread_loop_get_loop(impl->loop), &Impl::on_renegotiate, impl.get());
     impl->release_event = pw::loop_add_event(pw_thread_loop_get_loop(impl->loop), &Impl::on_release, impl.get());
 
-    pw::PodBuilder b;
+    pw::PodBuilder b(format_pod_capacity);
     auto params = impl->build_formats(b);
     if (b.overflowed()) {
         return fail(Errc::limit_exceeded, "format parameters do not fit");
@@ -1445,6 +1469,20 @@ std::uint32_t PipeWireCapture::node_id() const
 {
     const pw::LoopLock lock(impl_->loop);
     return impl_->stream != nullptr ? pw_stream_get_node_id(impl_->stream) : SPA_ID_INVALID;
+}
+
+void PipeWireCapture::request_size(std::uint32_t width, std::uint32_t height)
+{
+    const pw::LoopLock lock(impl_->loop);
+    const std::pair size{width, height};
+    if (impl_->requested_size == size) {
+        return;
+    }
+    impl_->requested_size = size;
+    log::info(log_component, "asking the producer for {}x{}", width, height);
+    if (impl_->renegotiate_event != nullptr) {
+        pw::loop_signal_event(pw_thread_loop_get_loop(impl_->loop), impl_->renegotiate_event);
+    }
 }
 
 std::uint64_t PipeWireCapture::buffers_received() const noexcept

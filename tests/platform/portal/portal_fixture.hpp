@@ -6,9 +6,12 @@
 #include <farland/platform/portal/portal_session.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <sys/types.h>
+#include <utility>
 #include <vector>
 
 namespace farland::test {
@@ -35,6 +38,14 @@ public:
     /// Makes the mock emit Session.Closed for every session; false if the mock
     /// could not be reached. Safe on any thread.
     [[nodiscard]] bool close_sessions() const;
+
+    /// The desktop side of the clipboard, safe on any thread: someone copies
+    /// `contents` (one per type); someone pastes `mime_type` (the transfer's
+    /// serial, nullopt if the mock cannot be reached); what the session wrote
+    /// for a paste (success and data) once it is finished.
+    [[nodiscard]] bool copy(const std::vector<std::string>& mime_types, const std::vector<std::string>& contents) const;
+    [[nodiscard]] std::optional<std::uint32_t> paste(const std::string& mime_type) const;
+    [[nodiscard]] std::optional<std::pair<bool, std::string>> written(std::uint32_t serial) const;
 
     /// Portal options that talk to this bus.
     [[nodiscard]] platform::portal::PortalOptions options() const;

@@ -601,7 +601,7 @@ Result<std::unique_ptr<Gl>> Gl::load(int cuda_device)
     if (gl->query_devices(max_devices, devices.data(), &count) == 0) {
         return fail(Errc::unsupported, "eglQueryDevicesEXT failed");
     }
-    for (const abi::EGLDeviceEXT device : std::span(devices).first(static_cast<std::size_t>(std::max(count, 0)))) {
+    for (auto* const device : std::span(devices).first(static_cast<std::size_t>(std::max(count, 0)))) {
         abi::EGLAttrib ordinal = -1;
         if (gl->query_device_attrib(device, abi::egl_cuda_device_nv, &ordinal) != 0 && ordinal == cuda_device) {
             gl->display = gl->get_platform_display(abi::egl_platform_device_ext, device, nullptr);
@@ -812,7 +812,7 @@ struct NvencEncoder::Impl {
     [[nodiscard]] Result<void> configure(const EncoderConfig& next);
     [[nodiscard]] Result<void> open_session();
     void close_session() noexcept;
-    void fill_rate(abi::NV_ENC_RC_PARAMS& rc, const RateControl& rate) const;
+    static void fill_rate(abi::NV_ENC_RC_PARAMS& rc, const RateControl& rate);
     [[nodiscard]] Result<void> set_rate_control(const RateControl& rate);
 
     [[nodiscard]] Result<void> ensure_gpu_buffers();
@@ -820,7 +820,7 @@ struct NvencEncoder::Impl {
     [[nodiscard]] Result<const Import*> import(const DmabufFrame& frame);
     void forget_imports() noexcept;
     [[nodiscard]] Result<void> copy_dmabuf(const DmabufFrame& frame);
-    [[nodiscard]] Result<void> convert_staging(std::uint32_t width, std::uint32_t height, const Channels& order);
+    [[nodiscard]] Result<void> convert_staging(std::uint32_t width, std::uint32_t height, const Channels& order) const;
     [[nodiscard]] Result<codec::Yuv420Frame> read_nv12() const;
 
     [[nodiscard]] Result<EncodedFrame> encode_input(void* input, std::uint32_t format, std::uint32_t pitch,
@@ -935,7 +935,7 @@ Result<void> NvencEncoder::Impl::check(abi::NVENCSTATUS status, std::string_view
     return fail(code, what);
 }
 
-void NvencEncoder::Impl::fill_rate(abi::NV_ENC_RC_PARAMS& rc, const RateControl& rate) const
+void NvencEncoder::Impl::fill_rate(abi::NV_ENC_RC_PARAMS& rc, const RateControl& rate)
 {
     constexpr std::uint64_t kilo = 1000;
     const auto bits = [](std::uint64_t value) {
@@ -1212,7 +1212,8 @@ Result<void> NvencEncoder::Impl::ensure_gpu_buffers()
         registration.width = config.width;
         registration.height = config.height;
         registration.pitch = static_cast<std::uint32_t>(nv12.pitch);
-        registration.resourceToRegister = reinterpret_cast<void*>(nv12.pointer);  // NOLINT(performance-no-int-to-ptr)
+        registration.resourceToRegister = reinterpret_cast<void*>(
+            nv12.pointer);  // NOLINT(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
         registration.bufferFormat = abi::buffer_format_nv12;
         registration.bufferUsage = abi::buffer_usage_input_image;
         FARLAND_TRY_VOID(check(api.nvEncRegisterResource(session, &registration), "NVENC cannot register the picture"));
@@ -1231,8 +1232,8 @@ Result<void> NvencEncoder::Impl::ensure_gpu_buffers()
             registration.width = config.width;
             registration.height = config.height;
             registration.pitch = static_cast<std::uint32_t>(staging.pitch);
-            registration.resourceToRegister =
-                reinterpret_cast<void*>(staging.pointer);  // NOLINT(performance-no-int-to-ptr)
+            registration.resourceToRegister = reinterpret_cast<void*>(
+                staging.pointer);  // NOLINT(performance-no-int-to-ptr,cppcoreguidelines-pro-type-reinterpret-cast)
             registration.bufferFormat = abi::buffer_format_argb;
             registration.bufferUsage = abi::buffer_usage_input_image;
             FARLAND_TRY_VOID(
@@ -1400,7 +1401,7 @@ Result<void> NvencEncoder::Impl::copy_dmabuf(const DmabufFrame& frame)
     return copied;
 }
 
-Result<void> NvencEncoder::Impl::convert_staging(std::uint32_t width, std::uint32_t height, const Channels& order)
+Result<void> NvencEncoder::Impl::convert_staging(std::uint32_t width, std::uint32_t height, const Channels& order) const
 {
     if (kernel == nullptr) {
         return fail(Errc::unsupported, "the GPU colour conversion is not available");
@@ -1605,7 +1606,11 @@ Result<EncodedFrame> NvencEncoder::Impl::encode_dmabuf(const DmabufFrame& frame,
         FARLAND_TRY_VOID(cu->check(cu->ctx_synchronize(), "the dmabuf copy failed"));
         return encode_registered(staging_registered, static_cast<std::uint32_t>(staging.pitch), options);
     }
-    FARLAND_TRY_VOID(convert_staging(frame.width, frame.height, *channels(frame.fourcc)));
+    const auto order = channels(frame.fourcc);
+    if (!order.has_value()) {
+        return fail(Errc::unsupported, "NVENC takes XRGB, ARGB, XBGR and ABGR dmabufs");
+    }
+    FARLAND_TRY_VOID(convert_staging(frame.width, frame.height, *order));
     return encode_registered(nv12_registered, static_cast<std::uint32_t>(nv12.pitch), options);
 }
 
@@ -1665,7 +1670,11 @@ Result<codec::Yuv420Frame> NvencEncoder::convert(const DmabufFrame& frame)
     }
     FARLAND_TRY_VOID(impl.ensure_gpu_buffers());
     FARLAND_TRY_VOID(impl.copy_dmabuf(frame));
-    FARLAND_TRY_VOID(impl.convert_staging(frame.width, frame.height, *channels(frame.fourcc)));
+    const auto order = channels(frame.fourcc);
+    if (!order.has_value()) {
+        return fail(Errc::unsupported, "NVENC takes XRGB, ARGB, XBGR and ABGR dmabufs");
+    }
+    FARLAND_TRY_VOID(impl.convert_staging(frame.width, frame.height, *order));
     return impl.read_nv12();
 }
 

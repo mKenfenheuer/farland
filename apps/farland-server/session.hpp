@@ -39,6 +39,10 @@ struct SessionOptions {
     /// coarse first passes refined while the picture stands still.
     bool clearcodec = true;
     bool refine = true;
+    /// Audio: the desktop's output plays on the client (rdpsnd), and the
+    /// client's microphone becomes a local audio source (audin).
+    bool audio = true;
+    bool microphone = true;
     /// Seconds a client may take from TCP accept to an active connection.
     unsigned activation_timeout = 30;
     /// Network characteristics detection for clients that support it. It
@@ -52,6 +56,8 @@ struct SessionOptions {
     /// The shared desktop; null: the synthetic test pattern. Must outlive the
     /// session, and only one session may use it at a time.
     Desktop* desktop = nullptr;
+    /// Share the desktop's clipboard (cliprdr), where the desktop has one.
+    bool clipboard = true;
 };
 
 /// Runs one client connection on a connected socket until it ends or `stop`

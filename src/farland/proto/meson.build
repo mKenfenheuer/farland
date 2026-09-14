@@ -15,6 +15,7 @@ farland_proto_lib = static_library(
   'license.cpp',
   'mcs.cpp',
   'pointer.cpp',
+  'save_session_info.cpp',
   'security.cpp',
   'share.cpp',
   'x224.cpp',

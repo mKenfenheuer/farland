@@ -13,10 +13,12 @@
 #include <farland/codec/planar.hpp>
 #include <farland/codec/progressive.hpp>
 #include <farland/codec/zgfx.hpp>
+#include <farland/server/display_layout.hpp>
 #include <farland/server/graphics_pipeline.hpp>
 #include <farland/server/test_pattern.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -728,8 +730,8 @@ TEST_CASE("GFX: AVC420 from dmabufs lists the capture's damage as regions")
     const std::array corner{PixelRect{60, 60, 10, 10}, PixelRect{149, 99, 50, 50}};
     sent = pipeline.send_dmabuf_frame(frame, corner);
     REQUIRE((sent.has_value() && sent->has_value()));
-    CHECK(same_rects(p.regions(), {{0, 0, 64, 64}, {64, 0, 128, 64}, {0, 64, 64, 100}, {64, 64, 128, 100},
-                                   {128, 64, 150, 100}}));
+    CHECK(same_rects(p.regions(),
+                     {{0, 0, 64, 64}, {64, 0, 128, 64}, {0, 64, 64, 100}, {64, 64, 128, 100}, {128, 64, 150, 100}}));
 
     // No damage: nothing to send.
     sent = pipeline.send_dmabuf_frame(frame, {});
@@ -909,4 +911,109 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
         }
     }
     CHECK(text_exact);
+}
+
+TEST_CASE("GFX: a surface per screen, black surfaces around letterboxed pictures, and a new layout")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    // Monitors 400x200 (primary) and 200x200 to its right. Screen 0 is
+    // 300x200: centred with borders. Screen 1 is 400x400: scaled to 200x200.
+    const auto monitors =
+        farland::server::DisplayLayout::from_disp(
+            {{{.flags = 1, .width = 400, .height = 200}, {.left = 400, .width = 200, .height = 200}}}, {})
+            .value();
+    const std::array sizes{std::pair<std::uint32_t, std::uint32_t>{300, 200},
+                           std::pair<std::uint32_t, std::uint32_t>{400, 400}};
+    const auto layout = monitors.place(sizes);
+    gfx::GfxServerConfig config;
+    config.avc420 = config.avc444 = config.avc444v2 = false;
+    const bool client_scales = GENERATE(true, false);
+    CAPTURE(client_scales);
+    GraphicsPipeline pipeline(channels, layout, config, TileCodec::planar, {},
+                              farland::server::PipelineOptions{.scaled_output = client_scales});
+    const auto id = std::get<dyn::CreateRequest>(client.take().at(0)).channel_id;
+    send(channels, dyn::CreateResponse{id, 0});
+    dispatch(channels, pipeline);
+    send(channels,
+         dyn::Data{id,
+                   gfx::encode(gfx::Pdu{gfx::CapsAdvertise{{gfx::make_capability_set(gfx::cap_version::v10_7, 0)}}})});
+    dispatch(channels, pipeline);
+    REQUIRE(pipeline.ready());
+    REQUIRE(pipeline.screen_count() == 2);
+    CHECK(pipeline.surface_size(0) == std::pair<std::uint32_t, std::uint32_t>{300, 200});
+    CHECK(pipeline.surface_size(1) == (client_scales ? std::pair<std::uint32_t, std::uint32_t>{400, 400}
+                                                     : std::pair<std::uint32_t, std::uint32_t>{200, 200}));
+
+    auto pdus = client.take_gfx(id);
+    REQUIRE(pdus.size() == 14);
+    const auto& reset = std::get<gfx::ResetGraphics>(pdus[1]);
+    CHECK((reset.width == 600 && reset.height == 200));
+    CHECK(reset.monitors == monitors.gfx_monitors());
+    const auto s0 = std::get<gfx::CreateSurface>(pdus[2]);
+    CHECK((s0.width == 300 && s0.height == 200));
+    CHECK(std::get<gfx::MapSurfaceToOutput>(pdus[3]) == gfx::MapSurfaceToOutput{s0.surface_id, 50, 0});
+    const auto s1 = std::get<gfx::CreateSurface>(pdus[4]);
+    if (client_scales) {
+        CHECK((s1.width == 400 && s1.height == 400));
+        CHECK(std::get<gfx::MapSurfaceToScaledOutput>(pdus[5]) ==
+              gfx::MapSurfaceToScaledOutput{s1.surface_id, 400, 0, 200, 200});
+    } else {
+        CHECK((s1.width == 200 && s1.height == 200));
+        CHECK(std::get<gfx::MapSurfaceToOutput>(pdus[5]) == gfx::MapSurfaceToOutput{s1.surface_id, 400, 0});
+    }
+    // The borders left and right of screen 0, filled black in a frame.
+    const auto left = std::get<gfx::CreateSurface>(pdus[6]);
+    CHECK((left.width == 50 && left.height == 200));
+    CHECK(std::get<gfx::MapSurfaceToOutput>(pdus[7]) == gfx::MapSurfaceToOutput{left.surface_id, 0, 0});
+    const auto right = std::get<gfx::CreateSurface>(pdus[8]);
+    CHECK(std::get<gfx::MapSurfaceToOutput>(pdus[9]) == gfx::MapSurfaceToOutput{right.surface_id, 350, 0});
+    CHECK(std::holds_alternative<gfx::StartFrame>(pdus[10]));
+    const auto& fill = std::get<gfx::SolidFill>(pdus[11]);
+    CHECK(fill.surface_id == left.surface_id);
+    CHECK(fill.fill_pixel == gfx::Color32{0, 0, 0, 0xFF});
+    CHECK(std::get<gfx::SolidFill>(pdus[12]).surface_id == right.surface_id);
+    CHECK(std::holds_alternative<gfx::EndFrame>(pdus[13]));
+
+    // One frame carries both screens.
+    farland::server::TestPattern first(300, 200);
+    const auto [w1, h1] = pipeline.surface_size(1);
+    farland::server::TestPattern second(w1, h1);
+    pipeline.begin_frame();
+    pipeline.add_frame(0, first.render(0));
+    pipeline.add_frame(1, second.render(0));
+    const auto frame_id = pipeline.end_frame();
+    REQUIRE(frame_id.has_value());
+    pdus = client.take_gfx(id);
+    CHECK(std::get<gfx::StartFrame>(pdus.front()).frame_id == *frame_id);
+    CHECK(std::get<gfx::EndFrame>(pdus.back()).frame_id == *frame_id);
+    std::size_t on_first = 0;
+    std::size_t on_second = 0;
+    for (std::size_t i = 1; i + 1 < pdus.size(); ++i) {
+        const auto& wire = std::get<gfx::WireToSurface1>(pdus[i]);
+        on_first += wire.surface_id == s0.surface_id ? 1 : 0;
+        on_second += wire.surface_id == s1.surface_id ? 1 : 0;
+    }
+    CHECK(on_first == 5 * 4);  // 300x200 in 64-pixel tiles
+    CHECK(on_second == ((w1 + 63) / 64) * ((h1 + 63) / 64));
+    // Nothing changed: no frame at all.
+    pipeline.begin_frame();
+    pipeline.add_frame(0, first.render(0));
+    CHECK_FALSE(pipeline.end_frame().has_value());
+
+    // A new layout: the old surfaces go, and the new one covers everything.
+    const std::array one{std::pair<std::uint32_t, std::uint32_t>{640, 480}};
+    pipeline.set_layout(farland::server::DisplayLayout::single(640, 480).place(one));
+    pdus = client.take_gfx(id);
+    REQUIRE(pdus.size() == 4 + 3);
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK(std::holds_alternative<gfx::DeleteSurface>(pdus[i]));
+    }
+    CHECK(std::get<gfx::ResetGraphics>(pdus[4]).width == 640);
+    CHECK(std::get<gfx::CreateSurface>(pdus[5]).width == 640);
+    CHECK(std::get<gfx::MapSurfaceToOutput>(pdus[6]).output_origin_x == 0);
+    REQUIRE(pipeline.screen_count() == 1);
+    farland::server::TestPattern big(640, 480);
+    CHECK(pipeline.send_frame(big.render(0)).has_value());
 }

@@ -13,6 +13,7 @@
 #include <limits>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 
@@ -167,6 +168,24 @@ struct EiInput::Target {
         return (dx * dx) + (dy * dy);
     }
 
+    /// The target containing the point, or else the nearest one; null when
+    /// there are none.
+    [[nodiscard]] static const Target* nearest(const std::vector<Target>& targets, double px, double py) noexcept
+    {
+        const Target* best = nullptr;
+        double best_distance = std::numeric_limits<double>::infinity();
+        for (const auto& target : targets) {
+            if (target.contains(px, py)) {
+                return &target;
+            }
+            if (const double d = target.distance_squared(px, py); best == nullptr || d < best_distance) {
+                best = &target;
+                best_distance = d;
+            }
+        }
+        return best;
+    }
+
     /// Desktop pixels to the region's logical coordinates, clamped into it.
     [[nodiscard]] std::pair<double, double> map(double px, double py) const noexcept
     {
@@ -243,11 +262,20 @@ EiInput::~EiInput()
                 send_held(*device, held.key, held.code, false);
                 device->dirty = true;
             }
+            for (const auto& touch : touches_) {
+                if (touch.device == device.get()) {
+                    ei_touch_up(touch.handle);
+                    device->dirty = true;
+                }
+            }
             if (device->dirty) {
                 ei_device_frame(device->handle, now);
             }
             ei_device_stop_emulating(device->handle);
         }
+    }
+    for (const auto& touch : touches_) {
+        ei_touch_unref(touch.handle);
     }
     for (const auto& device : devices_) {
         ei_device_unref(device->handle);
@@ -304,6 +332,10 @@ void EiInput::handle_event(struct ei_event* event)
     case EI_EVENT_DISCONNECT:
         // libei removes every device and seat before this event.
         state_ = State::disconnected;
+        for (const auto& touch : touches_) {
+            ei_touch_unref(touch.handle);
+        }
+        touches_.clear();
         for (const auto& device : devices_) {
             ei_device_unref(device->handle);
         }
@@ -352,6 +384,7 @@ void EiInput::handle_event(struct ei_event* event)
         break;
     case EI_EVENT_DEVICE_PAUSED:
         if (auto* device = find(event)) {
+            drop_touches(*device);
             device_paused(*device);
         }
         break;
@@ -455,13 +488,14 @@ void EiInput::device_removed(struct ei_event* event)
     if (last_pointer_ == &device) {
         last_pointer_ = nullptr;
     }
+    drop_touches(device);
     ei_device_unref(device.handle);
     devices_.erase(it);
 }
 
 EiInput::Device* EiInput::find(struct ei_event* event) const noexcept
 {
-    struct ei_device* handle = ei_event_get_device(event);
+    auto* const handle = ei_event_get_device(event);
     for (const auto& device : devices_) {
         if (device->handle == handle) {
             return device.get();
@@ -484,12 +518,12 @@ EiInput::Device* EiInput::pick(Capability capability) const noexcept
     return nullptr;
 }
 
-std::vector<EiInput::Target> EiInput::absolute_targets() const
+std::vector<EiInput::Target> EiInput::absolute_targets(Capability capability, const Device* only) const
 {
     std::vector<Target> matched;
     std::vector<Target> fallback;
     for (const auto& device : devices_) {
-        if (!device->resumed || !device->has(Capability::pointer_absolute)) {
+        if (!device->resumed || !device->has(capability) || (only != nullptr && device.get() != only)) {
             continue;
         }
         for (const auto& region : device->regions) {
@@ -509,6 +543,18 @@ std::vector<EiInput::Target> EiInput::absolute_targets() const
             fallback.push_back(Target{device.get(), &region, region.x, region.y, region.width * region.scale,
                                       region.height * region.scale});
         }
+    }
+    if (matched.empty() && fallback.size() == 1 && outputs_.size() == 1 && outputs_.front().desktop.width > 0 &&
+        outputs_.front().desktop.height > 0) {
+        // One output and one region belong together, with or without
+        // mapping ids (portals before ScreenCast version 5 have none).
+        const Rect& desktop = outputs_.front().desktop;
+        Target single = fallback.front();
+        single.x = static_cast<double>(desktop.x);
+        single.y = static_cast<double>(desktop.y);
+        single.width = static_cast<double>(desktop.width);
+        single.height = static_cast<double>(desktop.height);
+        return {single};
     }
     return matched.empty() ? fallback : matched;
 }
@@ -577,21 +623,9 @@ void EiInput::pointer_motion_absolute(double x, double y)
         return;
     }
     const auto targets = absolute_targets();
-    if (targets.empty()) {
+    const Target* best = Target::nearest(targets, x, y);
+    if (best == nullptr) {
         return;
-    }
-    // The region containing the point, or else the nearest one.
-    const Target* best = &targets.front();
-    double best_distance = std::numeric_limits<double>::infinity();
-    for (const auto& target : targets) {
-        if (target.contains(x, y)) {
-            best = &target;
-            break;
-        }
-        if (const double d = target.distance_squared(x, y); d < best_distance) {
-            best = &target;
-            best_distance = d;
-        }
     }
     const auto [lx, ly] = best->map(x, y);
     ei_device_pointer_motion_absolute(best->device->handle, lx, ly);
@@ -626,6 +660,107 @@ void EiInput::scroll_discrete(std::int32_t x_v120, std::int32_t y_v120)
     }
     ei_device_scroll_discrete(device->handle, x_v120, y_v120);
     device->dirty = true;
+}
+
+void EiInput::touch_down(std::uint32_t slot, double x, double y)
+{
+    if (closed() || !std::isfinite(x) || !std::isfinite(y)) {
+        return;
+    }
+    if (std::ranges::any_of(touches_, [&](const Touch& t) { return t.slot == slot; })) {
+        touch_motion(slot, x, y);
+        return;
+    }
+    Device* device = nullptr;
+    double lx = x;
+    double ly = y;
+    const auto targets = absolute_targets(Capability::touch);
+    if (const Target* best = Target::nearest(targets, x, y)) {
+        device = best->device;
+        std::tie(lx, ly) = best->map(x, y);
+    } else {
+        // A touch device without regions takes desktop pixels as they are.
+        device = pick(Capability::touch);
+    }
+    if (device == nullptr) {
+        log::trace(component, "no touch device for slot {}: dropped", slot);
+        return;
+    }
+    struct ei_touch* handle = ei_device_touch_new(device->handle);
+    if (handle == nullptr) {
+        return;
+    }
+    ei_touch_down(handle, lx, ly);
+    touches_.push_back(Touch{.slot = slot, .device = device, .handle = handle});
+    device->dirty = true;
+}
+
+void EiInput::touch_motion(std::uint32_t slot, double x, double y)
+{
+    if (closed() || !std::isfinite(x) || !std::isfinite(y)) {
+        return;
+    }
+    const auto it = std::ranges::find(touches_, slot, &Touch::slot);
+    if (it == touches_.end() || !it->device->resumed) {
+        return;
+    }
+    double lx = x;
+    double ly = y;
+    const auto targets = absolute_targets(Capability::touch, it->device);
+    if (const Target* best = Target::nearest(targets, x, y)) {
+        std::tie(lx, ly) = best->map(x, y);
+    }
+    ei_touch_motion(it->handle, lx, ly);
+    it->device->dirty = true;
+}
+
+void EiInput::touch_up(std::uint32_t slot)
+{
+    end_touch(slot, false);
+}
+
+void EiInput::touch_cancel(std::uint32_t slot)
+{
+    end_touch(slot, true);
+}
+
+void EiInput::end_touch(std::uint32_t slot, bool cancel)
+{
+    const auto it = std::ranges::find(touches_, slot, &Touch::slot);
+    if (it == touches_.end()) {
+        return;
+    }
+    if (!closed() && it->device->resumed) {
+#ifdef FARLAND_HAVE_EI_TOUCH_CANCEL
+        if (cancel) {
+            ei_touch_cancel(it->handle);
+        } else {
+            ei_touch_up(it->handle);
+        }
+#else
+        static_cast<void>(cancel);
+        ei_touch_up(it->handle);
+#endif
+        it->device->dirty = true;
+    }
+    ei_touch_unref(it->handle);
+    touches_.erase(it);
+}
+
+void EiInput::drop_touches(const Device& device)
+{
+    const auto dropped = std::ranges::remove_if(touches_, [&](const Touch& t) {
+        if (t.device != &device) {
+            return false;
+        }
+        ei_touch_unref(t.handle);
+        return true;
+    });
+    if (!dropped.empty()) {
+        log::debug(component, "device '{}' went away with {} touches down (the compositor ends them)", device.name,
+                   dropped.size());
+    }
+    touches_.erase(dropped.begin(), dropped.end());
 }
 
 void EiInput::text(char32_t codepoint)

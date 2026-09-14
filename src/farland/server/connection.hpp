@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -55,6 +56,10 @@ struct ServerConfig {
     /// The desktop size to announce instead of the client's request (a shared
     /// desktop has the size it has). Clamped like client sizes.
     std::optional<std::pair<std::uint16_t, std::uint16_t>> desktop_size;
+    /// Chooses the desktop size from the client's data blocks (a session
+    /// that lays out the client's monitors takes their bounding box). Takes
+    /// precedence over `desktop_size`; clamped the same way.
+    std::function<std::pair<std::uint16_t, std::uint16_t>(const proto::gcc::ClientData&)> choose_desktop_size;
     AutoDetectMode autodetect = AutoDetectMode::full;
     AutoDetect::Config autodetect_config;
     /// A Heartbeat PDU ([MS-RDPBCGR] 2.2.16.1) goes out after this long

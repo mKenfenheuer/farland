@@ -37,6 +37,9 @@ Markdown copies of MS-RDPBCGR, -RDPEGFX, -RDPRFX, -RDPEDYC, -RDPECLIP and -RDPEV
 | MS-RDPRFX | RemoteFX, including the progressive codec | M3 |
 | MS-RDPEDISP | Display control (resize, multi-monitor) | M6 |
 | MS-RDPECLIP | Clipboard | M6 |
+| MS-WMF 2.2.2 (DeviceIndependentBitmap, BitmapInfoHeader, BitmapV5Header) | Clipboard images (CF_DIB, CF_DIBV5) | M6 |
+| PNG (W3C, 3rd edition), RFC 1950 (zlib) | Clipboard images as image/png | M6 |
+| HTML Clipboard Format (CF_HTML), RFC 2483 (text/uri-list), RFC 8089 (file URIs) | Clipboard HTML and files | M6 |
 | MS-RDPEA, MS-RDPEAI | Audio output and input | M6 |
 | MS-RDPEI | Touch and pen input | M6 |
 | MS-RDPECAM | Camera redirection | M6 (optional) |

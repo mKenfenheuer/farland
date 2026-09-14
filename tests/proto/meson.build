@@ -10,6 +10,7 @@ unit_test_sources += files(
   'test_mcs.cpp',
   'test_output.cpp',
   'test_pointer.cpp',
+  'test_save_session_info.cpp',
   'test_spec_activation.cpp',
   'test_spec_vectors.cpp',
   'test_x224.cpp',

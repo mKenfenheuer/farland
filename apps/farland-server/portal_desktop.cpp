@@ -6,9 +6,12 @@
 #include <farland/base/log.hpp>
 #include <farland/platform/portal/ei_input.hpp>
 #include <farland/platform/portal/pipewire_capture.hpp>
+#include <farland/platform/portal/portal_clipboard.hpp>
 #include <farland/platform/portal/portal_input.hpp>
 #include <farland/platform/portal/portal_session.hpp>
 
+#include <algorithm>
+#include <format>
 #include <poll.h>
 
 namespace farland::app {
@@ -22,7 +25,8 @@ constexpr std::string_view log_component = "app.portal";
 constexpr auto first_frame_timeout = std::chrono::seconds(10);
 
 /// A permission for existing monitors does not restore a virtual one and the
-/// other way round, so each mode keeps its own token.
+/// other way round, so each mode keeps its own token. The token covers every
+/// stream the user picked.
 std::optional<std::filesystem::path> restore_token_path(const PortalDesktopOptions& options)
 {
     if (options.restore_token_file) {
@@ -35,12 +39,26 @@ std::optional<std::filesystem::path> restore_token_path(const PortalDesktopOptio
     return path;
 }
 
+/// Streams left to right as the compositor arranges them (then top to
+/// bottom); streams without a position (virtual monitors, windows) after
+/// them, in the portal's order.
+std::vector<portal::PortalStream> in_screen_order(std::vector<portal::PortalStream> streams)
+{
+    std::ranges::stable_sort(streams, [](const portal::PortalStream& a, const portal::PortalStream& b) {
+        if (a.position.has_value() != b.position.has_value()) {
+            return a.position.has_value();
+        }
+        return a.position && b.position && *a.position < *b.position;
+    });
+    return streams;
+}
+
 class PortalDesktop final : public Desktop {
 public:
     [[nodiscard]] Result<void> start(const PortalDesktopOptions& options);
 
-    [[nodiscard]] platform::FrameSource& frames() override { return capture_->frames(); }
-    [[nodiscard]] platform::CursorSource* cursor() override { return &capture_->cursor(); }
+    [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
+    [[nodiscard]] platform::CursorSource* cursor() override { return &screens_.front().capture->cursor(); }
     [[nodiscard]] platform::InputSink& input() override
     {
         if (ei_) {
@@ -65,19 +83,43 @@ public:
     }
     [[nodiscard]] bool closed() const override
     {
-        return session_->closed() || !capture_ || capture_->closed() || (ei_ && ei_->closed());
+        return session_->closed() || screens_.empty() ||
+               std::ranges::any_of(screens_, [](const Screen& s) { return !s.capture || s.capture->closed(); }) ||
+               (ei_ && ei_->closed());
     }
+    [[nodiscard]] platform::Clipboard* clipboard() override { return clipboard_.get(); }
+
+    [[nodiscard]] std::size_t screen_count() const override { return screens_.size(); }
+    [[nodiscard]] platform::FrameSource& screen_frames(std::size_t index) override
+    {
+        return screens_.at(index).capture->frames();
+    }
+    [[nodiscard]] platform::CursorSource* screen_cursor(std::size_t index) override
+    {
+        return &screens_.at(index).capture->cursor();
+    }
+    [[nodiscard]] bool resizable() const override { return virtual_monitor_; }
+    void request_screen_sizes(std::span<const std::pair<std::uint32_t, std::uint32_t>> sizes) override;
+    bool set_screen_targets(std::span<const std::optional<platform::Rect>> targets) override;
 
 private:
+    struct Screen {
+        portal::PortalStream stream;
+        std::unique_ptr<portal::PipeWireCapture> capture;
+    };
+
+    void start_clipboard();
     [[nodiscard]] Result<void> start_session(portal::PortalOptions& options);
     [[nodiscard]] Result<void> connect_input();
-    [[nodiscard]] Result<void> wait_for_first_frame();
+    [[nodiscard]] Result<void> wait_for_first_frames();
 
-    // Declared first, destroyed last: the capture and the input need the session.
+    // Declared first, destroyed last: the captures and the input need the session.
     std::unique_ptr<portal::PortalSession> session_ = std::make_unique<portal::PortalSession>();
-    std::unique_ptr<portal::PipeWireCapture> capture_;
+    std::vector<Screen> screens_;
     std::unique_ptr<portal::EiInput> ei_;
     std::unique_ptr<portal::PortalNotifyInput> notify_;
+    bool virtual_monitor_ = false;
+    std::unique_ptr<portal::PortalClipboard> clipboard_;
 };
 
 Result<void> PortalDesktop::start(const PortalDesktopOptions& options)
@@ -85,8 +127,12 @@ Result<void> PortalDesktop::start(const PortalDesktopOptions& options)
     portal::PortalOptions portal_options;
     portal_options.virtual_monitor = options.virtual_monitor;
     portal_options.monitors = !options.virtual_monitor;
-    portal_options.multiple = false;  // one monitor; multi-monitor comes with the disp channel (M6)
+    // Every monitor the user picks; a portal session has one virtual monitor
+    // at most (xdg-desktop-portal-gnome and -kde both).
+    portal_options.multiple = !options.virtual_monitor;
     portal_options.timeout = options.timeout;
+    virtual_monitor_ = options.virtual_monitor;
+    portal_options.clipboard = options.clipboard;
 
     const auto token_file = restore_token_path(options);
     if (token_file) {
@@ -104,35 +150,97 @@ Result<void> PortalDesktop::start(const PortalDesktopOptions& options)
         }
     }
 
-    const auto& streams = session_->streams();  // start() fails without any
-    const auto& stream = streams.front();
-    if (streams.size() > 1) {
-        log::info(log_component, "the portal offers {} streams; sharing the first", streams.size());
+    if (options.clipboard) {
+        start_clipboard();
     }
+
     auto remote = session_->open_pipewire_remote();
     if (!remote) {
         log::error(log_component, "OpenPipeWireRemote: {}", remote.error().message);
         return fail(Errc::io, "the desktop portal gave no PipeWire connection");
     }
-    portal::PipeWireCaptureOptions capture_options;
-    capture_options.render_node = options.render_node;
-    auto capture = portal::PipeWireCapture::create(remote->get(), stream.node_id, capture_options);
-    if (!capture) {
-        log::error(log_component, "PipeWire capture of node {}: {}", stream.node_id, capture.error().message());
-        return fail(Errc::io, "cannot capture the screen cast stream");
+    // start() fails without any stream.
+    for (auto& stream : in_screen_order(session_->streams())) {
+        portal::PipeWireCaptureOptions capture_options;
+        capture_options.render_node = options.render_node;
+        capture_options.stream_name = std::format("farland-capture-{}", screens_.size());
+        auto capture = portal::PipeWireCapture::create(remote->get(), stream.node_id, capture_options);
+        if (!capture) {
+            log::error(log_component, "PipeWire capture of node {}: {}", stream.node_id, capture.error().message());
+            return fail(Errc::io, "cannot capture the screen cast stream");
+        }
+        screens_.push_back(Screen{std::move(stream), std::move(*capture)});
     }
-    capture_ = std::move(*capture);
     FARLAND_TRY_VOID(connect_input());
-    FARLAND_TRY_VOID(wait_for_first_frame());
+    FARLAND_TRY_VOID(wait_for_first_frames());
 
-    const auto [width, height] = capture_->frames().size();
-    if (ei_) {
-        ei_->set_outputs({{platform::Rect{0, 0, static_cast<std::int32_t>(width), static_cast<std::int32_t>(height)},
-                           stream.mapping_id}});
+    // Until a session places the screens: side by side at their sizes.
+    std::vector<std::optional<platform::Rect>> targets;
+    std::int32_t x = 0;
+    for (const auto& screen : screens_) {
+        const auto [width, height] = screen.capture->frames().size();
+        targets.emplace_back(platform::Rect{x, 0, static_cast<std::int32_t>(width), static_cast<std::int32_t>(height)});
+        x += static_cast<std::int32_t>(width);
+        std::string where;
+        if (screen.stream.position) {
+            where = std::format(" at {},{}", screen.stream.position->first, screen.stream.position->second);
+        }
+        log::info(log_component, "sharing {}x{}{}{} (PipeWire node {})", width, height, where,
+                  screen.stream.source_type == portal::source_virtual ? ", a virtual monitor" : "",
+                  screen.stream.node_id);
     }
-    log::info(log_component, "sharing {}x{} (PipeWire node {}), input through {}", width, height, stream.node_id,
+    static_cast<void>(set_screen_targets(targets));
+    log::info(log_component, "{} screen{}, input through {}", screens_.size(), screens_.size() == 1 ? "" : "s",
               ei_ ? "libei" : "the portal");
     return {};
+}
+
+void PortalDesktop::request_screen_sizes(std::span<const std::pair<std::uint32_t, std::uint32_t>> sizes)
+{
+    if (!virtual_monitor_) {
+        return;
+    }
+    for (std::size_t i = 0; i < std::min(sizes.size(), screens_.size()); ++i) {
+        const auto [width, height] = sizes[i];
+        if (width > 0 && height > 0) {
+            screens_[i].capture->request_size(width, height);
+        }
+    }
+}
+
+bool PortalDesktop::set_screen_targets(std::span<const std::optional<platform::Rect>> targets)
+{
+    if (ei_) {
+        std::vector<portal::EiInput::Output> outputs;
+        for (std::size_t i = 0; i < std::min(targets.size(), screens_.size()); ++i) {
+            if (targets[i]) {
+                outputs.push_back(portal::EiInput::Output{*targets[i], screens_[i].stream.mapping_id});
+            }
+        }
+        ei_->set_outputs(std::move(outputs));
+        return true;
+    }
+    if (notify_) {
+        std::vector<portal::StreamRegion> regions;
+        for (std::size_t i = 0; i < std::min(targets.size(), screens_.size()); ++i) {
+            if (!targets[i]) {
+                continue;
+            }
+            const auto& stream = screens_[i].stream;
+            const auto [width, height] = screens_[i].capture->frames().size();
+            portal::StreamRegion region{stream.node_id, *targets[i], static_cast<std::int32_t>(width),
+                                        static_cast<std::int32_t>(height)};
+            if (stream.size) {
+                // NotifyPointerMotionAbsolute takes the stream's logical coordinates.
+                region.logical_width = stream.size->first;
+                region.logical_height = stream.size->second;
+            }
+            regions.push_back(region);
+        }
+        notify_->set_layout(std::move(regions));
+        return true;
+    }
+    return false;
 }
 
 Result<void> PortalDesktop::start_session(portal::PortalOptions& options)
@@ -161,6 +269,25 @@ Result<void> PortalDesktop::start_session(portal::PortalOptions& options)
     return {};
 }
 
+void PortalDesktop::start_clipboard()
+{
+    if (!session_->clipboard_enabled()) {
+        log::warn(log_component, "{}",
+                  session_->capabilities().clipboard_version == 0
+                      ? "the desktop portal has no Clipboard interface: no clipboard"
+                      : "the desktop portal did not grant clipboard access: no clipboard (a permission stored "
+                        "without it is restored that way; remove the restore token to be asked again)");
+        return;
+    }
+    auto clipboard = portal::PortalClipboard::create(*session_);
+    if (!clipboard) {
+        log::warn(log_component, "no clipboard: {}", clipboard.error().message);
+        return;
+    }
+    clipboard_ = std::move(*clipboard);
+    log::info(log_component, "sharing the clipboard through the portal");
+}
+
 Result<void> PortalDesktop::connect_input()
 {
     auto eis = session_->connect_to_eis();
@@ -181,20 +308,22 @@ Result<void> PortalDesktop::connect_input()
     return {};
 }
 
-Result<void> PortalDesktop::wait_for_first_frame()
+Result<void> PortalDesktop::wait_for_first_frames()
 {
     const auto deadline = Clock::now() + first_frame_timeout;
-    while (capture_->frames().size().first == 0) {
-        if (closed()) {
-            log::error(log_component, "the screen cast ended before its first frame: {}", capture_->error());
-            return fail(Errc::io, "the screen cast stream closed");
+    for (const auto& screen : screens_) {
+        while (screen.capture->frames().size().first == 0) {
+            if (closed()) {
+                log::error(log_component, "the screen cast ended before its first frame: {}", screen.capture->error());
+                return fail(Errc::io, "the screen cast stream closed");
+            }
+            if (Clock::now() > deadline) {
+                return fail(Errc::io, "no frame from the screen cast stream");
+            }
+            pollfd pfd{screen.capture->frames().wake_fd(), POLLIN, 0};
+            ::poll(&pfd, 1, 100);
+            dispatch();
         }
-        if (Clock::now() > deadline) {
-            return fail(Errc::io, "no frame from the screen cast stream");
-        }
-        pollfd pfd{capture_->frames().wake_fd(), POLLIN, 0};
-        ::poll(&pfd, 1, 100);
-        dispatch();
     }
     return {};
 }

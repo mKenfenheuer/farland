@@ -12,7 +12,8 @@
 /// The obsolete primitives NTLM is built from ([MS-NLMP] 3.3, 3.4). MD4 and
 /// RC4 are implemented here because OpenSSL 3 moved them to the legacy
 /// provider, which farland does not load; MD5 and HMAC-MD5 wrap OpenSSL's
-/// default provider. Nothing but NTLM may use these.
+/// default provider. Nothing but NTLM and the auto-reconnect verifier
+/// ([MS-RDPBCGR] 5.5, auto_reconnect.hpp) may use these.
 namespace farland::auth::legacy {
 
 using Digest = std::array<std::byte, 16>;

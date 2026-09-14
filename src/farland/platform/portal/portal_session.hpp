@@ -118,6 +118,10 @@ struct PortalOptions {
     std::string parent_window;
     /// How long start() waits in total, including for the user to answer the dialog.
     std::chrono::milliseconds timeout = std::chrono::minutes(5);
+    /// Ask for clipboard access (org.freedesktop.portal.Clipboard, requested
+    /// before Start) when the portal has it; clipboard_enabled() tells
+    /// whether it was granted. See PortalClipboard.
+    bool clipboard = false;
 };
 
 /// What the portal offers, read before the session is created.
@@ -127,6 +131,8 @@ struct PortalCapabilities {
     std::uint32_t device_types = 0;  ///< device_* bits
     std::uint32_t source_types = 0;  ///< source_* bits
     std::uint32_t cursor_modes = 0;  ///< CursorMode bits; 0 before ScreenCast version 2
+    /// org.freedesktop.portal.Clipboard; read only with PortalOptions::clipboard.
+    std::uint32_t clipboard_version = 0;
 };
 
 /// One ScreenCast stream of the started session.
@@ -206,8 +212,13 @@ public:
     /// Called from start() or process() when the session gets closed by the other side.
     void set_closed_callback(std::function<void()> callback) { closed_callback_ = std::move(callback); }
 
-    /// For PortalNotifyInput.
+    /// For PortalNotifyInput and PortalClipboard.
     [[nodiscard]] detail::Bus* bus() const noexcept { return bus_.get(); }
+    /// The portal's unique bus name, which signals are matched on.
+    [[nodiscard]] const std::string& portal_owner() const noexcept { return portal_owner_; }
+    /// For PortalClipboard: a SelectionOwnerChanged that arrived while the
+    /// session started, if any. Ends that early subscription.
+    [[nodiscard]] detail::MessagePtr take_clipboard_owner_signal();
 
 private:
     enum class State : std::uint8_t { idle, starting, started, failed };
@@ -215,6 +226,9 @@ private:
     PortalResult<void> run_start(const PortalOptions& options, std::chrono::steady_clock::time_point deadline);
     PortalResult<void> read_capabilities(std::chrono::steady_clock::time_point deadline);
     PortalResult<void> watch_session(const std::string& handle);
+    // In portal_clipboard.cpp.
+    PortalResult<void> read_clipboard_version(std::chrono::steady_clock::time_point deadline);
+    PortalResult<void> request_clipboard(std::chrono::steady_clock::time_point deadline);
     [[nodiscard]] PortalResult<void> check_started() const;
     void mark_closed(std::string_view reason);
     void close_portal_session() noexcept;
@@ -235,6 +249,8 @@ private:
     CursorMode cursor_mode_ = CursorMode::none;
     bool clipboard_enabled_ = false;
     std::optional<std::string> restore_token_;
+    detail::SlotPtr clipboard_watch_;
+    detail::MessagePtr clipboard_owner_signal_;
 };
 
 /// Where farland keeps the restore token: $XDG_STATE_HOME/farland/portal-restore-token,

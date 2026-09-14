@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 unit_test_sources += files(
+  'test_auto_reconnect.cpp',
   'test_credential_store.cpp',
   'test_credssp.cpp',
   'test_ntlm.cpp',

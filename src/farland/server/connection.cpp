@@ -281,7 +281,9 @@ Result<void> Connection::on_connect_initial(Reader& data)
         return {};
     }
 
-    const auto [width, height] = config_.desktop_size.value_or(std::pair{core.desktop_width, core.desktop_height});
+    const auto [width, height] =
+        config_.choose_desktop_size ? config_.choose_desktop_size(client)
+                                    : config_.desktop_size.value_or(std::pair{core.desktop_width, core.desktop_height});
     session_.desktop_width = std::clamp(width, config_.min_desktop_size, config_.max_desktop_size);
     session_.desktop_height = std::clamp(height, config_.min_desktop_size, config_.max_desktop_size);
     session_.bits_per_pixel = choose_bits_per_pixel(core, config_.max_bits_per_pixel);

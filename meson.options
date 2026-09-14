@@ -16,3 +16,5 @@ option('portal', type: 'feature', value: 'auto',
 
 option('nvenc', type: 'feature', value: 'auto',
   description: 'NVENC H.264 encoder backend (Linux): NVIDIA GPU encoding with zero-copy dmabuf input. Needs nothing to build; the driver libraries are loaded at runtime')
+option('png', type: 'feature', value: 'auto',
+  description: 'PNG images on the clipboard, with deflate from zlib. Without it, images are exchanged as BMP only')

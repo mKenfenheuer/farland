@@ -125,8 +125,7 @@ std::optional<ScrollMove> detect_vertical_scroll(const codec::ImageView& previou
     // (whose source lies inside the area) did.
     const auto moved = [&](const Strip& strip, std::uint32_t row) {
         const std::int64_t source = std::int64_t{row} - dy;
-        return source >= 0 && source < rows &&
-               strip.current[row] == strip.previous[static_cast<std::size_t>(source)];
+        return source >= 0 && source < rows && strip.current[row] == strip.previous[static_cast<std::size_t>(source)];
     };
     const std::uint64_t possible = rows - static_cast<std::uint64_t>(std::abs(dy));
     std::vector<bool> good;

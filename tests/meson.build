@@ -23,12 +23,14 @@ subdir('base')
 subdir('proto')
 subdir('codec')
 subdir('video')
+subdir('audio')
 subdir('channels')
 subdir('auth')
 subdir('platform')
 subdir('platform/portal')
 subdir('server')
 subdir('integration')
+subdir('apps')
 
 unit_tests = executable(
   'farland-unit-tests',

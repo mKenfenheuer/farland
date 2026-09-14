@@ -81,6 +81,12 @@ public:
     /// "metadata"; with "embedded" no cursor updates arrive).
     [[nodiscard]] CursorSource& cursor() noexcept;
 
+    /// Asks the producer for frames of `width` x `height` from now on: the
+    /// stream renegotiates, offering that size first and any size after it.
+    /// Mutter sizes a virtual monitor to what its consumer asks for; other
+    /// producers (monitors, KWin's virtual output) keep their size.
+    void request_size(std::uint32_t width, std::uint32_t height);
+
     [[nodiscard]] CaptureState state() const;
     [[nodiscard]] bool closed() const { return state() == CaptureState::closed; }
     /// Why the stream closed; empty while it is open.

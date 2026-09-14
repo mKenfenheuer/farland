@@ -221,6 +221,74 @@ bool MockPortal::close_sessions() const
                               "CloseSessions", error.get(), nullptr, "") >= 0;
 }
 
+bool MockPortal::copy(const std::vector<std::string>& mime_types, const std::vector<std::string>& contents) const
+{
+    auto bus = connect(address_);
+    if (!bus) {
+        return false;
+    }
+    sd_bus_message* raw = nullptr;
+    if (sd_bus_message_new_method_call(bus.get(), &raw, "org.freedesktop.portal.Desktop", "/org/farland/Mock",
+                                       "org.farland.Mock", "Copy") < 0) {
+        return false;
+    }
+    platform::portal::detail::MessagePtr call(raw);
+    for (const auto* list : {&mime_types, &contents}) {
+        std::vector<char*> strv;
+        for (const auto& text : *list) {
+            strv.push_back(const_cast<char*>(text.c_str()));
+        }
+        strv.push_back(nullptr);
+        if (sd_bus_message_append_strv(call.get(), strv.data()) < 0) {
+            return false;
+        }
+    }
+    platform::portal::detail::BusError error;
+    return sd_bus_call(bus.get(), call.get(), 0, error.get(), nullptr) >= 0;
+}
+
+std::optional<std::uint32_t> MockPortal::paste(const std::string& mime_type) const
+{
+    auto bus = connect(address_);
+    if (!bus) {
+        return std::nullopt;
+    }
+    platform::portal::detail::BusError error;
+    sd_bus_message* raw = nullptr;
+    if (sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock", "org.farland.Mock",
+                           "Paste", error.get(), &raw, "s", mime_type.c_str()) < 0) {
+        return std::nullopt;
+    }
+    platform::portal::detail::MessagePtr reply(raw);
+    std::uint32_t serial = 0;
+    if (sd_bus_message_read_basic(reply.get(), 'u', &serial) <= 0) {
+        return std::nullopt;
+    }
+    return serial;
+}
+
+std::optional<std::pair<bool, std::string>> MockPortal::written(std::uint32_t serial) const
+{
+    auto bus = connect(address_);
+    if (!bus) {
+        return std::nullopt;
+    }
+    platform::portal::detail::BusError error;
+    sd_bus_message* raw = nullptr;
+    if (sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock", "org.farland.Mock",
+                           "Written", error.get(), &raw, "u", serial) < 0) {
+        return std::nullopt;
+    }
+    platform::portal::detail::MessagePtr reply(raw);
+    int finished = 0;
+    int success = 0;
+    const char* data = nullptr;
+    if (sd_bus_message_read(reply.get(), "bbs", &finished, &success, &data) < 0 || finished == 0) {
+        return std::nullopt;
+    }
+    return std::pair(success != 0, std::string(data != nullptr ? data : ""));
+}
+
 platform::portal::PortalOptions MockPortal::options() const
 {
     platform::portal::PortalOptions options;

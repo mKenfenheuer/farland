@@ -5,7 +5,9 @@
 """A fake xdg-desktop-portal for the portal client tests.
 
 Implements what farland uses of org.freedesktop.portal.RemoteDesktop,
-.ScreenCast, .Request and .Session, and checks the argument types strictly.
+.ScreenCast, .Clipboard, .Request and .Session, and checks the argument types
+strictly. org.farland.Mock also plays the desktop's side of the clipboard:
+Copy, Paste and Written.
 org.farland.Mock at /org/farland/Mock returns the calls it saw, one line each:
 the method name followed by its options or arguments as sorted key=value
 pairs (handle tokens left out).
@@ -17,6 +19,7 @@ when python3-dbus or PyGObject is missing, so the tests can skip.
 import argparse
 import os
 import sys
+import threading
 
 try:
     import dbus
@@ -31,6 +34,7 @@ PORTAL = "org.freedesktop.portal.Desktop"
 PATH = "/org/freedesktop/portal/desktop"
 RD = "org.freedesktop.portal.RemoteDesktop"
 SC = "org.freedesktop.portal.ScreenCast"
+CLIPBOARD = "org.freedesktop.portal.Clipboard"
 REQUEST = "org.freedesktop.portal.Request"
 SESSION = "org.freedesktop.portal.Session"
 PROPERTIES = "org.freedesktop.DBus.Properties"
@@ -111,6 +115,9 @@ class Session(dbus.service.Object):
         self.persist_mode = 0
         self.eis = False
         self.closed = False
+        self.started = False
+        self.clipboard_requested = False
+        self.clipboard_enabled = False
 
     @dbus.service.method(SESSION, in_signature="", out_signature="")
     def Close(self):
@@ -140,6 +147,13 @@ class Portal(dbus.service.Object):
         self.sessions = {}
         self.tokens = 0
         self.legacy_requests = 0
+        # The desktop's clipboard (MIME type -> bytes) and the pastes of the
+        # session's clipboard (serial -> {"data", "done"}).
+        self.local = {}
+        if config.clipboard_owner_at_start:
+            self.local = {"text/plain;charset=utf-8": b"at start"}
+        self.transfers = {}
+        self.serials = 0
 
     # --- helpers
 
@@ -221,6 +235,8 @@ class Portal(dbus.service.Object):
             if config.sc_version >= 2:
                 props["AvailableCursorModes"] = dbus.UInt32(config.cursor_modes)
             return props
+        if interface == CLIPBOARD and config.clipboard_version > 0:
+            return {"version": dbus.UInt32(config.clipboard_version)}
         raise Failure(f"No such interface {interface}", INVALID_ARGS)
 
     @dbus.service.method(PROPERTIES, in_signature="ss", out_signature="v")
@@ -273,8 +289,13 @@ class Portal(dbus.service.Object):
             return
         results = {}
         if config.start_response == 0:
+            session.started = True
+            session.clipboard_enabled = session.clipboard_requested and not config.no_grant_clipboard
             results["devices"] = dbus.UInt32(session.device_types & config.device_types)
-            results["clipboard_enabled"] = dbus.Boolean(False)
+            results["clipboard_enabled"] = dbus.Boolean(session.clipboard_enabled)
+            if session.clipboard_enabled and self.local:
+                # Before the Start response, as a real portal may.
+                self.announce(session, list(self.local), False)
             results["streams"] = self.streams(session)
             if session.persist_mode == 2:
                 self.tokens += 1
@@ -347,6 +368,94 @@ class Portal(dbus.service.Object):
         return self.pipe_with(b"pipewire")
 
 
+    # --- Clipboard
+
+    def clipboard_session(self, handle, sender):
+        session = self.session(handle, sender)
+        if not session.clipboard_enabled:
+            raise Failure("clipboard access was not granted", "org.freedesktop.portal.Error.NotAllowed")
+        return session
+
+    def announce(self, session, mimes, own):
+        options = {"mime_types": dbus.Array(mimes, signature="s"), "session_is_owner": dbus.Boolean(own)}
+        self.SelectionOwnerChanged(dbus.ObjectPath(session.path), dbus.Dictionary(options, signature="sv"))
+
+    @dbus.service.method(CLIPBOARD, in_signature="oa{sv}", out_signature="", sender_keyword="sender")
+    def RequestClipboard(self, handle, options, sender):
+        session = self.session(handle, sender)
+        if session.started:
+            raise Failure("RequestClipboard after Start", INVALID_ARGS)
+        calls.append(describe("RequestClipboard", options))
+        session.clipboard_requested = True
+
+    @dbus.service.method(CLIPBOARD, in_signature="oa{sv}", out_signature="", sender_keyword="sender")
+    def SetSelection(self, handle, options, sender):
+        session = self.clipboard_session(handle, sender)
+        mimes = options.get("mime_types")
+        if not isinstance(mimes, dbus.Array) or any(not isinstance(m, dbus.String) for m in mimes):
+            raise Failure("mime_types must be as", INVALID_ARGS)
+        calls.append("SetSelection mime_types=" + ",".join(str(m) for m in mimes))
+        self.announce(session, [str(m) for m in mimes], True)
+
+    @dbus.service.method(CLIPBOARD, in_signature="ou", out_signature="h", sender_keyword="sender")
+    def SelectionWrite(self, handle, serial, sender):
+        self.clipboard_session(handle, sender)
+        transfer = self.transfers.get(int(serial))
+        if transfer is None:
+            raise Failure(f"no transfer {serial}", INVALID_ARGS)
+        read_end, write_end = os.pipe()
+
+        def drain():
+            chunks = []
+            while True:
+                data = os.read(read_end, 65536)
+                if not data:
+                    break
+                chunks.append(data)
+            os.close(read_end)
+            transfer["data"] = b"".join(chunks)
+
+        threading.Thread(target=drain, daemon=True).start()
+        fd = dbus.types.UnixFd(write_end)
+        os.close(write_end)
+        return fd
+
+    @dbus.service.method(CLIPBOARD, in_signature="oub", out_signature="", sender_keyword="sender")
+    def SelectionWriteDone(self, handle, serial, success, sender):
+        self.clipboard_session(handle, sender)
+        calls.append(describe("SelectionWriteDone", serial=serial, success=success))
+        if int(serial) in self.transfers:
+            self.transfers[int(serial)]["done"] = bool(success)
+
+    @dbus.service.method(CLIPBOARD, in_signature="os", out_signature="h", sender_keyword="sender")
+    def SelectionRead(self, handle, mime_type, sender):
+        self.clipboard_session(handle, sender)
+        calls.append(describe("SelectionRead", mime_type=mime_type))
+        data = self.local.get(str(mime_type))
+        if data is None:
+            raise Failure(f"the clipboard has no {mime_type}")
+        read_end, write_end = os.pipe()
+
+        def feed():
+            view = memoryview(data)
+            while view:
+                view = view[os.write(write_end, view):]
+            os.close(write_end)
+
+        threading.Thread(target=feed, daemon=True).start()
+        fd = dbus.types.UnixFd(read_end)
+        os.close(read_end)
+        return fd
+
+    @dbus.service.signal(CLIPBOARD, signature="oa{sv}")
+    def SelectionOwnerChanged(self, session_handle, options):
+        pass
+
+    @dbus.service.signal(CLIPBOARD, signature="osu")
+    def SelectionTransfer(self, session_handle, mime_type, serial):
+        pass
+
+
 class Mock(dbus.service.Object):
     def __init__(self, bus, portal):
         super().__init__(bus, "/org/farland/Mock")
@@ -360,6 +469,35 @@ class Mock(dbus.service.Object):
     def CloseSessions(self):
         for session in list(self.portal.sessions.values()):
             session.close_from_portal()
+
+    def clipboard_sessions(self):
+        return [s for s in self.portal.sessions.values() if s.clipboard_enabled and not s.closed]
+
+    @dbus.service.method(MOCK, in_signature="asas", out_signature="")
+    def Copy(self, mime_types, contents):
+        """Someone on the desktop copies: one content per MIME type."""
+        self.portal.local = {str(m): str(c).encode() for m, c in zip(mime_types, contents)}
+        for session in self.clipboard_sessions():
+            self.portal.announce(session, [str(m) for m in mime_types], False)
+
+    @dbus.service.method(MOCK, in_signature="s", out_signature="u")
+    def Paste(self, mime_type):
+        """Someone on the desktop pastes; returns the transfer's serial."""
+        self.portal.serials += 1
+        serial = self.portal.serials
+        self.portal.transfers[serial] = {"data": None, "done": None}
+        for session in self.clipboard_sessions():
+            self.portal.SelectionTransfer(dbus.ObjectPath(session.path), mime_type, dbus.UInt32(serial))
+        return dbus.UInt32(serial)
+
+    @dbus.service.method(MOCK, in_signature="u", out_signature="bbs")
+    def Written(self, serial):
+        """(finished, success, data) of a paste: finished once SelectionWriteDone came and the data is in."""
+        transfer = self.portal.transfers.get(int(serial))
+        if transfer is None or transfer["done"] is None or (transfer["done"] and transfer["data"] is None):
+            return (dbus.Boolean(False), dbus.Boolean(False), "")
+        data = (transfer["data"] or b"").decode("utf-8", "replace")
+        return (dbus.Boolean(True), dbus.Boolean(transfer["done"]), data)
 
 
 def main():
@@ -376,6 +514,9 @@ def main():
     parser.add_argument("--close-after-ms", type=int, default=-1)
     parser.add_argument("--response-before-reply", action="store_true")
     parser.add_argument("--legacy-request-path", action="store_true")
+    parser.add_argument("--clipboard-version", type=int, default=1)
+    parser.add_argument("--no-grant-clipboard", action="store_true")
+    parser.add_argument("--clipboard-owner-at-start", action="store_true")
     config = parser.parse_args()
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)

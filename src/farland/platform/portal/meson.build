@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
 # SPDX-License-Identifier: Apache-2.0
 
-# The portal backend (docs/PLAN.md §3.3): xdg-desktop-portal RemoteDesktop and
-# ScreenCast over sd-bus, PipeWire capture and libei input. Linux only.
+# The portal backend (docs/PLAN.md §3.3): xdg-desktop-portal RemoteDesktop,
+# ScreenCast and Clipboard over sd-bus, PipeWire capture and libei input.
+# Linux only.
 #
 # Glue around C libraries that hand out raw pointers, so it is not built with
 # the safe-buffer warnings.
@@ -18,6 +19,23 @@ sd_bus_dep = dependency('libsystemd', 'basu', required: portal_opt, include_type
 libei_dep = dependency('libei-1.0', version: '>= 1.1', required: portal_opt, include_type: 'system')
 pipewire_dep = dependency('libpipewire-0.3', version: '>= 1.0', required: portal_opt, include_type: 'system')
 
+# Session audio (the default sink's monitor and a virtual microphone) needs
+# only PipeWire, so it also works without the rest of the portal backend.
+farland_pipewire_audio_dep = dependency('', required: false)
+if pipewire_dep.found()
+  farland_pipewire_audio_lib = static_library(
+    'farland-pipewire-audio',
+    'pipewire_audio.cpp',
+    include_directories: farland_inc,
+    dependencies: [farland_audio_dep, pipewire_dep],
+  )
+  farland_pipewire_audio_dep = declare_dependency(
+    link_with: farland_pipewire_audio_lib,
+    include_directories: farland_inc,
+    dependencies: [farland_audio_dep, pipewire_dep],
+  )
+endif
+
 farland_platform_portal_dep = dependency('', required: false)
 if sd_bus_dep.found() and libei_dep.found() and pipewire_dep.found()
   portal_compile_args = sd_bus_dep.name() == 'basu' ? ['-DFARLAND_SD_BUS_BASU'] : []
@@ -32,6 +50,10 @@ if sd_bus_dep.found() and libei_dep.found() and pipewire_dep.found()
     portal_private_args += '-DFARLAND_HAVE_GBM=1'
     portal_private_deps += [gbm_dep, egl_dep]
   endif
+  # ei_touch_cancel() arrived after libei 1.2; without it a canceled touch is lifted.
+  if meson.get_compiler('cpp').has_header_symbol('libei.h', 'ei_touch_cancel', dependencies: libei_dep)
+    portal_private_args += '-DFARLAND_HAVE_EI_TOUCH_CANCEL=1'
+  endif
 
   farland_platform_portal_lib = static_library(
     'farland-platform-portal',
@@ -40,6 +62,7 @@ if sd_bus_dep.found() and libei_dep.found() and pipewire_dep.found()
     'pipewire_capture.cpp',
     'pixel_formats.cpp',
     'portal_bus.cpp',
+    'portal_clipboard.cpp',
     'portal_input.cpp',
     'portal_session.cpp',
     'restore_token.cpp',
@@ -56,4 +79,5 @@ if sd_bus_dep.found() and libei_dep.found() and pipewire_dep.found()
   )
 endif
 
-summary({'portal': farland_platform_portal_dep.found()}, section: 'Platform backends', bool_yn: true)
+summary({'portal': farland_platform_portal_dep.found(), 'PipeWire audio': farland_pipewire_audio_dep.found()},
+  section: 'Platform backends', bool_yn: true)

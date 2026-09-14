@@ -80,7 +80,7 @@ jobs:
           seconds=60
           if [ "${{ github.event_name }}" = schedule ]; then seconds=900; fi
           mkdir -p artifacts
-          for target in ber per planar x224 mcs_gcc share input server ntlm credssp privsep drdynvc svc zgfx rdpgfx progressive avc420 clear pointer autodetect; do
+          for target in ber per planar x224 mcs_gcc share input server ntlm credssp privsep drdynvc svc zgfx rdpgfx progressive avc420 clear pointer autodetect rdpei disp rdpsnd audin broker save_session_info; do
             mkdir -p "corpus-$target" && cp fuzz/corpus/$target/* "corpus-$target/"
             "./build-fuzz/fuzz/fuzz-$target" -max_total_time=$seconds -artifact_prefix=artifacts/ "corpus-$target"
           done

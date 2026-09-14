@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <farland/channels/rdpei_server.hpp>
 #include <farland/platform/backend.hpp>
 #include <farland/platform/keymap.hpp>
 #include <farland/proto/input.hpp>
@@ -54,6 +55,15 @@ struct LockState {
 /// state. It is kept for take_sync(): a backend that can read the actual state
 /// taps the lock keys that differ.
 ///
+/// Touch and pen contacts ([MS-RDPEI], validated by RdpeiServer) use the same
+/// geometry. A touch contact becomes a touch slot of the same id when the
+/// sink accepts touch; otherwise the first contact down drives the pointer
+/// with the left button, as a mouse would, and the others are dropped. A pen
+/// moves the pointer while it hovers and holds the left button while it
+/// touches (the right one when its barrel button is pressed as it comes
+/// down): libei has no tablet devices, so pressure, tilt and rotation are
+/// dropped.
+///
 /// Nothing a client sends makes the translator fail; what does not map is dropped.
 class InputTranslator {
 public:
@@ -69,9 +79,13 @@ public:
     /// Translates the events of one input PDU, then calls InputSink::flush()
     /// if anything reached the sink.
     void translate(std::span<const proto::InputEvent> events);
+    /// Translates the contacts of one touch or pen frame, then flushes if
+    /// anything reached the sink.
+    void translate(std::span<const channels::rdpei::Contact> contacts);
 
-    /// Releases every key and button still down, then flushes if there were
-    /// any. For the end of the session and for input focus changes.
+    /// Releases every key and button still down and cancels every touch,
+    /// then flushes if there were any. For the end of the session and for
+    /// input focus changes.
     void release_all();
 
     /// The toggle state of the newest Synchronize Event since the last call;
@@ -97,10 +111,17 @@ private:
     void handle(const proto::ExtendedMouseEvent& event);
     void handle(const proto::RelativeMouseEvent& event);
     void handle(const proto::SyncEvent& event);
+    void handle_touch(const channels::rdpei::Contact& contact);
+    void handle_pen(const channels::rdpei::Contact& contact);
 
     void set_key(std::uint32_t code, bool pressed);
     void set_button(std::size_t index, bool pressed);
     void move_to(std::uint16_t x, std::uint16_t y, bool always);
+    /// A contact's position (which may lie outside the client desktop) in
+    /// desktop pixels.
+    [[nodiscard]] std::pair<double, double> map_point(std::int32_t x, std::int32_t y) const;
+    /// Moves the pointer to a contact's position.
+    void move_pointer(std::int32_t x, std::int32_t y);
     void scroll(std::int32_t x_v120, std::int32_t y_v120);
     void text(char32_t codepoint);
     void release_everything();
@@ -117,6 +138,12 @@ private:
     std::uint16_t high_surrogate_ = 0;
     /// E1 1D (Pause) was seen, so a 45 that follows is part of it.
     bool pause_pending_ = false;
+    /// Touch contacts down on the sink, by contact id.
+    std::bitset<256> touches_;
+    /// The touch contact emulating the pointer when the sink has no touch.
+    std::optional<std::uint8_t> primary_touch_;
+    /// The button the pen holds down while it touches.
+    std::optional<std::size_t> pen_button_;
     /// Something reached the sink since the last flush().
     bool emitted_ = false;
 };

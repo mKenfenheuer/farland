@@ -123,15 +123,17 @@ PipeWire frame (dmabuf) ──► damage regions ──► region classifier ─
 
 ### 3.5 Authentication model (server)
 
-NTLM-based NLA means the server must know the account's **NT hash**, so it cannot verify system (PAM) passwords directly. farland therefore offers three modes:
+NTLM-based NLA means the server must know the account's **NT hash**, so it cannot verify system (PAM) passwords directly. farland therefore offers these modes:
 
 | Mode | How | Use case |
 |---|---|---|
-| **Per-server credential** (default) | NT hash stored at `0600` in the daemon config or a keyring; NTLMv2 and MIC verified | Screen sharing / single user, like GRD's user mode |
+| **Per-server credential** (default) | NT hash stored at `0600` in the user file (`user:domain:hash`); NTLMv2 and MIC verified | Screen sharing / single user, like GRD's user mode |
+| **Self-enrolled store** | Each user enrols once with `farlandctl passwd`: over D-Bus and polkit (`auth_self`), farlandd checks the account password through PAM and stores the NT hash with the local account (`user:domain:hash:account`) | Multi-user headless sessions without a directory |
 | **Kerberos** | GSSAPI acceptor with a keytab (`TERMSRV/host`) via SPNEGO; the principal is mapped to a local user | AD-, FreeIPA- or SSSD-joined hosts; multi-user without shared secrets |
-| **Delegated login** | After NLA with the gateway credential, the delegated plaintext `TSCredentials` are checked through PAM, and a session is started for that user (the GRD system-daemon model, optionally with an in-session greeter) | Multi-user terminal-server style |
 
-For multi-session hand-over from the system daemon to a user session, farland uses a Server Redirection PDU with RDSTLS, the same way GRD does.
+A "delegated login" that checks the client's plaintext `TSCredentials` through PAM cannot replace the store: NTLM needs the NT hash before any credentials are delegated. Delegated credentials can still be handed to PAM afterwards, to unlock the keyring in the user's session.
+
+For multi-session, the system daemon (farlandd) keeps the single port, and its sandboxed network process keeps TLS for the connection's lifetime. After NLA the plaintext connection goes to the user's session agent (farland-agent, running in the user's logind session) as a descriptor over a Unix socket (SCM_RIGHTS). This is one TCP connection that every client accepts, without RDSTLS, and the TLS key never leaves the daemon. GNOME sessions come from GDM's RemoteDisplayFactory (headless, preauthenticated); Plasma, wlroots and cage sessions from farland's own PAM and logind launcher. Server Redirection with RDSTLS, as GRD uses it, remains an option for spreading sessions over several hosts.
 
 ---
 

@@ -37,12 +37,15 @@ std::filesystem::path default_store()
 void usage()
 {
     std::cout << "usage: farlandctl [--file FILE] COMMAND\n"
-                 "  passwd USER [--domain DOMAIN] [--stdin]   add a user or change the password\n"
+                 "  passwd USER [--domain DOMAIN] [--local-account ACCOUNT] [--stdin]\n"
+                 "                                            add a user or change the password\n"
                  "  remove USER [--domain DOMAIN]             remove a user\n"
                  "  users                                     list users\n"
                  "\n"
                  "FILE defaults to $XDG_CONFIG_HOME/farland/users, which farland-server reads.\n"
                  "An empty domain (the default) matches any domain the client sends.\n"
+                 "--local-account names the local account a multi-session login runs as\n"
+                 "(default: the user name); changing only the password keeps it.\n"
                  "--stdin reads the password from the first line of standard input.\n";
 }
 
@@ -73,7 +76,8 @@ std::optional<SecretString> read_password(std::string_view prompt, bool from_std
     return SecretString(std::move(line));
 }
 
-int passwd(const std::filesystem::path& file, const std::string& user, const std::string& domain, bool from_stdin)
+int passwd(const std::filesystem::path& file, const std::string& user, const std::string& domain,
+           const std::string& local_account, bool from_stdin)
 {
     auto store = CredentialStore::load(file);
     if (!store) {
@@ -95,6 +99,9 @@ int passwd(const std::filesystem::path& file, const std::string& user, const std
     auto hash = farland::auth::ntlm::nt_hash(password->view());
     store->set(user, domain, hash);
     farland::secure_zero(hash);
+    if (!local_account.empty()) {
+        static_cast<void>(store->set_local_account(user, domain, local_account));
+    }
     if (auto saved = store->save(file); !saved) {
         std::cerr << "farlandctl: " << saved.error().message() << "\n";
         return 1;
@@ -129,7 +136,11 @@ int users(const std::filesystem::path& file)
         return 1;
     }
     for (const auto& entry : store->entries()) {
-        std::cout << (entry.domain.empty() ? "*" : entry.domain) << "\\" << entry.user << "\n";
+        std::cout << (entry.domain.empty() ? "*" : entry.domain) << "\\" << entry.user;
+        if (!entry.local_account.empty()) {
+            std::cout << " -> " << entry.local_account;
+        }
+        std::cout << "\n";
     }
     return 0;
 }
@@ -142,6 +153,7 @@ int main(int argc, char** argv)
     std::filesystem::path file = default_store();
     std::vector<std::string> positional;
     std::string domain;
+    std::string local_account;
     bool from_stdin = false;
     for (std::size_t i = 1; i < args.size(); ++i) {
         const std::string_view arg = args[i];
@@ -149,6 +161,12 @@ int main(int argc, char** argv)
             file = args[++i];
         } else if (arg == "--domain" && i + 1 < args.size()) {
             domain = args[++i];
+        } else if (arg == "--local-account" && i + 1 < args.size()) {
+            local_account = args[++i];
+            if (!CredentialStore::valid_local_account(local_account)) {
+                std::cerr << "farlandctl: invalid local account name\n";
+                return 2;
+            }
         } else if (arg == "--stdin") {
             from_stdin = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -176,7 +194,12 @@ int main(int argc, char** argv)
             std::cerr << "farlandctl: names may not contain ':' or control characters\n";
             return 2;
         }
-        return command == "passwd" ? passwd(file, user, domain, from_stdin) : remove(file, user, domain);
+        if (command == "passwd") {
+            return passwd(file, user, domain, local_account, from_stdin);
+        }
+        if (local_account.empty()) {
+            return remove(file, user, domain);
+        }
     }
     usage();
     return 2;

@@ -14,6 +14,7 @@
 struct ei;
 struct ei_event;
 struct ei_seat;
+struct ei_touch;
 
 /// Input injection through libei (docs/PLAN.md §3.3): the sender side of the
 /// emulated-input protocol whose socket the RemoteDesktop portal's
@@ -84,6 +85,15 @@ public:
     /// compositor's keymap (docs/PLAN.md §7).
     void text(char32_t codepoint) override;
     void flush() override;
+    /// Touches go to a touch device, mapped into its regions like absolute
+    /// motion; a touch stays on the device it came down on. A touch on a
+    /// device that pauses or goes away is dropped (the compositor ends it),
+    /// and its later motion and up are ignored.
+    [[nodiscard]] bool accepts_touch() const override { return can_send(Capability::touch); }
+    void touch_down(std::uint32_t slot, double x, double y) override;
+    void touch_motion(std::uint32_t slot, double x, double y) override;
+    void touch_up(std::uint32_t slot) override;
+    void touch_cancel(std::uint32_t slot) override;
 
     EiInput(const EiInput&) = delete;
     EiInput& operator=(const EiInput&) = delete;
@@ -106,9 +116,16 @@ private:
 
     [[nodiscard]] Device* find(struct ei_event* event) const noexcept;
     [[nodiscard]] Device* pick(Capability capability) const noexcept;
-    [[nodiscard]] std::vector<Target> absolute_targets() const;
+    /// Regions of the resumed devices with `capability` (absolute pointer or
+    /// touch) in the desktop; only those of `only` when set.
+    [[nodiscard]] std::vector<Target> absolute_targets(Capability capability = Capability::pointer_absolute,
+                                                       const Device* only = nullptr) const;
     static void send_held(Device& device, bool key, std::uint32_t code, bool pressed);
     void press_or_release(bool key, std::uint32_t code, bool pressed);
+    /// Ends the touch in `slot` with an up or a cancel.
+    void end_touch(std::uint32_t slot, bool cancel);
+    /// Forgets the touches on `device` without sending anything.
+    void drop_touches(const Device& device);
 
     struct ei* ei_ = nullptr;
     struct ei_seat* seat_ = nullptr;
@@ -119,6 +136,13 @@ private:
     /// The device that got the latest pointer motion; buttons and wheel steps
     /// prefer it so they land where the pointer is.
     Device* last_pointer_ = nullptr;
+    /// Touches down, with the device they came down on.
+    struct Touch {
+        std::uint32_t slot = 0;
+        Device* device = nullptr;
+        struct ei_touch* handle = nullptr;
+    };
+    std::vector<Touch> touches_;
 };
 
 }  // namespace farland::platform::portal

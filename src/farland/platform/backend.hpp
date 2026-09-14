@@ -183,6 +183,20 @@ public:
     virtual void text(char32_t codepoint) = 0;
     /// Ends one RDP input PDU, for backends that group events (libei frames).
     virtual void flush() = 0;
+
+    /// True while touch_down() reaches a touchscreen. Otherwise the
+    /// translator emulates the pointer with the first contact.
+    [[nodiscard]] virtual bool accepts_touch() const { return false; }
+    /// A touch contact, at an absolute position in desktop pixels as for
+    /// pointer_motion_absolute(). `slot` names the contact from its down to
+    /// its up or cancel, and is not reused before; flush() ends a touch frame.
+    /// Backends without touch ignore these.
+    virtual void touch_down(std::uint32_t /*slot*/, double /*x*/, double /*y*/) {}
+    virtual void touch_motion(std::uint32_t /*slot*/, double /*x*/, double /*y*/) {}
+    virtual void touch_up(std::uint32_t /*slot*/) {}
+    /// The contact was not meant as input (a palm, a gesture taken over);
+    /// backends without cancellation lift it.
+    virtual void touch_cancel(std::uint32_t slot) { touch_up(slot); }
 };
 
 }  // namespace farland::platform

@@ -409,6 +409,9 @@ PortalResult<void> PortalSession::run_start(const PortalOptions& options, Clock:
 {
     FARLAND_TRY(bus_, Bus::open(options.bus_address));
     FARLAND_TRY_VOID(read_capabilities(deadline));
+    if (options.clipboard) {
+        FARLAND_TRY_VOID(read_clipboard_version(deadline));
+    }
 
     // Signals are matched on the portal's unique name: a well-known name
     // cannot be checked locally, and anyone can emit a signal.
@@ -512,6 +515,11 @@ PortalResult<void> PortalSession::run_start(const PortalOptions& options, Clock:
         }
         FARLAND_TRY(auto results, portal_request(ctx, detail::screen_cast_interface, "SelectSources", &session_handle_,
                                                  nullptr, select));
+    }
+
+    // Clipboard.RequestClipboard must come before Start.
+    if (options.clipboard && capabilities_.clipboard_version >= 1) {
+        FARLAND_TRY_VOID(request_clipboard(deadline));
     }
 
     // 4. RemoteDesktop.Start: the dialog.

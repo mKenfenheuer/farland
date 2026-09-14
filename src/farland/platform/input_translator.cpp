@@ -47,10 +47,9 @@ static_assert(wheel_rotation(ptr::wheel_negative | 0x88) == -120);
 static_assert(wheel_rotation(0x78) == 120);
 
 /// One axis of an absolute position, mapped from client to desktop pixels.
-double map_axis(std::uint16_t value, std::uint32_t client_size, std::uint32_t desktop_size, std::int32_t origin)
+double map_axis(double value, std::uint32_t client_size, std::uint32_t desktop_size, std::int32_t origin)
 {
-    const double scaled =
-        static_cast<double>(value) * static_cast<double>(desktop_size) / static_cast<double>(client_size);
+    const double scaled = value * static_cast<double>(desktop_size) / static_cast<double>(client_size);
     return static_cast<double>(origin) + std::clamp(scaled, 0.0, static_cast<double>(desktop_size - 1));
 }
 
@@ -82,10 +81,106 @@ void InputTranslator::translate(std::span<const proto::InputEvent> events)
     finish();
 }
 
+void InputTranslator::translate(std::span<const channels::rdpei::Contact> contacts)
+{
+    for (const auto& contact : contacts) {
+        if (contact.kind == channels::rdpei::ContactKind::touch) {
+            handle_touch(contact);
+        } else {
+            handle_pen(contact);
+        }
+    }
+    finish();
+}
+
 void InputTranslator::release_all()
 {
+    for (std::size_t id = 0; id < touches_.size(); ++id) {
+        if (touches_.test(id)) {
+            sink_->touch_cancel(static_cast<std::uint32_t>(id));
+            emitted_ = true;
+        }
+    }
+    touches_.reset();
+    primary_touch_.reset();
+    pen_button_.reset();
     release_everything();
     finish();
+}
+
+void InputTranslator::handle_touch(const channels::rdpei::Contact& contact)
+{
+    using Action = channels::rdpei::ContactAction;
+    const std::uint8_t id = contact.id;
+    if (contact.action == Action::down) {
+        if (touches_.test(id) || primary_touch_ == id) {
+            return;
+        }
+        if (sink_->accepts_touch()) {
+            const auto [x, y] = map_point(contact.x, contact.y);
+            sink_->touch_down(id, x, y);
+            touches_.set(id);
+            emitted_ = true;
+        } else if (!primary_touch_) {
+            primary_touch_ = id;
+            move_pointer(contact.x, contact.y);
+            set_button(0, true);
+        }
+        return;
+    }
+    // Hover and leave need nothing: touchscreens have no hover.
+    const bool lifted = contact.action == Action::up || contact.action == Action::cancel;
+    if (touches_.test(id)) {
+        if (contact.action == Action::move) {
+            const auto [x, y] = map_point(contact.x, contact.y);
+            sink_->touch_motion(id, x, y);
+            emitted_ = true;
+        } else if (lifted) {
+            if (contact.action == Action::cancel) {
+                sink_->touch_cancel(id);
+            } else {
+                sink_->touch_up(id);
+            }
+            touches_.reset(id);
+            emitted_ = true;
+        }
+    } else if (primary_touch_ == id) {
+        if (contact.action == Action::move) {
+            move_pointer(contact.x, contact.y);
+        } else if (lifted) {
+            set_button(0, false);
+            primary_touch_.reset();
+        }
+    }
+}
+
+void InputTranslator::handle_pen(const channels::rdpei::Contact& contact)
+{
+    using Action = channels::rdpei::ContactAction;
+    switch (contact.action) {
+    case Action::hover:
+    case Action::move:
+        move_pointer(contact.x, contact.y);
+        break;
+    case Action::down:
+        move_pointer(contact.x, contact.y);
+        if (!pen_button_) {
+            // The barrel button held as the pen comes down makes it a right click, as on Windows.
+            const std::size_t index = (contact.pen_flags & channels::rdpei::pen_flags::barrel_pressed) != 0 ? 1 : 0;
+            pen_button_ = index;
+            set_button(index, true);
+        }
+        break;
+    case Action::up:
+    case Action::cancel:
+        if (pen_button_) {
+            set_button(*pen_button_, false);
+            pen_button_.reset();
+        }
+        break;
+    case Action::leave:
+        break;
+    }
 }
 
 void InputTranslator::handle(const proto::KeyboardEvent& event)
@@ -256,6 +351,24 @@ void InputTranslator::move_to(std::uint16_t x, std::uint16_t y, bool always)
     } else {
         sink_->pointer_motion_absolute(x, y);
     }
+    emitted_ = true;
+}
+
+std::pair<double, double> InputTranslator::map_point(std::int32_t x, std::int32_t y) const
+{
+    if (!geometry_.has_value()) {
+        return {static_cast<double>(x), static_cast<double>(y)};
+    }
+    const Geometry& g = *geometry_;
+    return {map_axis(static_cast<double>(x), g.client_width, g.desktop_width, g.desktop_x),
+            map_axis(static_cast<double>(y), g.client_height, g.desktop_height, g.desktop_y)};
+}
+
+void InputTranslator::move_pointer(std::int32_t x, std::int32_t y)
+{
+    const auto [px, py] = map_point(x, y);
+    sink_->pointer_motion_absolute(px, py);
+    position_.reset();  // the next mouse event moves the pointer back where it says
     emitted_ = true;
 }
 

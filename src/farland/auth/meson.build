@@ -8,6 +8,7 @@ farland_openssl_dep = openssl_dep.as_system('system')
 
 farland_auth_lib = static_library(
   'farland-auth',
+  'auto_reconnect.cpp',
   'credential_store.cpp',
   'credssp.cpp',
   'legacy_crypto.cpp',

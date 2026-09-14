@@ -79,7 +79,7 @@ public:
 
     ~FakeEis()
     {
-        for (auto* device : {keyboard, pointer, absolute}) {
+        for (auto* device : {keyboard, pointer, absolute, touchscreen}) {
             if (device != nullptr) {
                 eis_device_unref(device);
             }
@@ -117,12 +117,15 @@ public:
     struct eis_device* keyboard = nullptr;
     struct eis_device* pointer = nullptr;
     struct eis_device* absolute = nullptr;
+    struct eis_device* touchscreen = nullptr;
     std::vector<Received> events;
     std::string client_name;
     bool client_is_sender = false;
     bool client_gone = false;
     /// Adds the keyboard paused instead of resumed.
     bool keyboard_paused = false;
+    /// Adds a touchscreen over both monitors.
+    bool with_touch = false;
 
 private:
     struct RegionSpec {
@@ -196,6 +199,11 @@ private:
                                       {EIS_DEVICE_CAP_POINTER_ABSOLUTE, EIS_DEVICE_CAP_BUTTON, EIS_DEVICE_CAP_SCROLL},
                                       {{0, 0, 1920, 1080, 1.0, "monitor-a"}, {1920, 0, 1280, 720, 1.5, "monitor-b"}});
             }
+            if (with_touch && touchscreen == nullptr && eis_event_seat_has_capability(event, EIS_DEVICE_CAP_TOUCH)) {
+                touchscreen =
+                    add_device("touch", {EIS_DEVICE_CAP_TOUCH},
+                               {{0, 0, 1920, 1080, 1.0, "monitor-a"}, {1920, 0, 1280, 720, 1.5, "monitor-b"}});
+            }
             return;
         case EIS_EVENT_DEVICE_START_EMULATING:
             r.sequence = eis_event_emulating_get_sequence(event);
@@ -224,6 +232,21 @@ private:
             r.x = eis_event_pointer_get_absolute_x(event);
             r.y = eis_event_pointer_get_absolute_y(event);
             r.text = std::format("{} abs {:.2f} {:.2f}", r.device, r.x, r.y);
+            break;
+        case EIS_EVENT_TOUCH_DOWN:
+        case EIS_EVENT_TOUCH_MOTION:
+            // libei numbers touches itself; the id goes into `sequence`.
+            r.sequence = eis_event_touch_get_id(event);
+            r.x = eis_event_touch_get_x(event);
+            r.y = eis_event_touch_get_y(event);
+            r.text = std::format("{} {} {:.2f} {:.2f}", r.device, type == EIS_EVENT_TOUCH_DOWN ? "down" : "motion", r.x,
+                                 r.y);
+            break;
+        case EIS_EVENT_TOUCH_UP:
+            // A cancel is an up too (with eis_event_touch_get_is_cancel()
+            // from libeis 1.3 on).
+            r.sequence = eis_event_touch_get_id(event);
+            r.text = r.device + " up";
             break;
         case EIS_EVENT_SCROLL_DISCRETE:
             r.text = std::format("{} discrete {} {}", r.device, eis_event_scroll_get_discrete_dx(event),
@@ -279,17 +302,19 @@ struct Session {
     std::unique_ptr<EiInput> input;
     std::vector<Received> started;
 
-    /// With `keyboard_paused`, the keyboard is added but not resumed.
-    explicit Session(bool keyboard_paused = false)
+    /// With `keyboard_paused`, the keyboard is added but not resumed; with
+    /// `touch`, a touchscreen is added as well.
+    explicit Session(bool keyboard_paused = false, bool touch = false)
     {
         server.keyboard_paused = keyboard_paused;
+        server.with_touch = touch;
         auto connected = EiInput::connect_fd(server.add_client());
         REQUIRE(connected.has_value());
         input = std::move(*connected);
-        const auto expected_starts = keyboard_paused ? 2 : 3;
+        const auto expected_starts = (keyboard_paused ? 2 : 3) + (touch ? 1 : 0);
         REQUIRE(pump(server, input.get(), [&] {
             return input->can_send(Capability::keyboard) != keyboard_paused && input->can_send(Capability::pointer) &&
-                   input->can_send(Capability::pointer_absolute) &&
+                   input->can_send(Capability::pointer_absolute) && input->can_send(Capability::touch) == touch &&
                    std::ranges::count(server.events, EIS_EVENT_DEVICE_START_EMULATING, &Received::type) ==
                        expected_starts;
         }));
@@ -410,6 +435,52 @@ TEST_CASE("EiInput maps desktop pixels into the absolute device's regions")
         s.input->pointer_motion_absolute(100, 200);
         s.input->flush();
         CHECK(texts(s.sync()) == std::vector<std::string>{"absolute abs 100.00 200.00", "absolute frame"});
+    }
+}
+
+TEST_CASE("EiInput sends touches through the touch device, mapped into its regions")
+{
+    Session s(false, true);
+    CHECK(s.input->accepts_touch());
+    s.input->touch_down(7, 100, 200);
+    s.input->touch_down(9, 2880, 540);  // the second monitor
+    s.input->flush();
+    s.input->touch_motion(7, 110, 210);
+    s.input->touch_motion(9, 100, 100);  // onto the first monitor, on the same touchscreen
+    s.input->touch_motion(3, 1, 1);      // never down
+    s.input->touch_up(7);
+    s.input->touch_cancel(9);
+    s.input->touch_up(7);  // already up
+    s.input->flush();
+    const auto events = s.sync();
+    // libei ends a frame after each touch that goes up.
+    CHECK(texts(events) == std::vector<std::string>{"touch down 100.00 200.00", "touch down 2560.00 360.00",
+                                                    "touch frame", "touch motion 110.00 210.00",
+                                                    "touch motion 100.00 100.00", "touch up", "touch frame", "touch up",
+                                                    "touch frame"});
+    REQUIRE(events.size() == 9);
+    CHECK(events[0].sequence != events[1].sequence);
+    CHECK(events[3].sequence == events[0].sequence);
+    CHECK(events[4].sequence == events[1].sequence);
+
+    SECTION("a second down of a slot moves it")
+    {
+        s.input->touch_down(1, 10, 10);
+        s.input->touch_down(1, 20, 20);
+        s.input->flush();
+        CHECK(texts(s.sync()) ==
+              std::vector<std::string>{"touch down 10.00 10.00", "touch motion 20.00 20.00", "touch frame"});
+    }
+
+    SECTION("touches still down are lifted when EiInput goes away")
+    {
+        s.input->touch_down(1, 10, 10);
+        s.input->flush();
+        static_cast<void>(s.sync());
+        s.input.reset();
+        REQUIRE(pump(s.server, nullptr, [&] { return s.server.client_gone; }));
+        CHECK(texts(s.server.take(), "touch") ==
+              std::vector<std::string>{"touch up", "touch frame", "touch stop", "touch EIS_EVENT_DEVICE_CLOSED"});
     }
 }
 

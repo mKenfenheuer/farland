@@ -49,8 +49,9 @@
 #endif
 
 // Inlined into both the baseline and the AVX2 entry points, so each gets its
-// own vectorised copy.
-#define FARLAND_KERNEL [[gnu::always_inline]] inline
+// own vectorised copy. In the GNU spelling, because it follows
+// __attribute__((target)) in places, where a standard attribute list may not.
+#define FARLAND_KERNEL __attribute__((always_inline)) inline
 
 namespace farland::codec::rfx {
 
@@ -730,7 +731,7 @@ public:
 private:
     // A short-lived writer on the caller's buffer, never copied or stored.
     std::vector<std::byte>& out_;  // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
-    std::uint64_t acc_ = 0;  // the low `pending_` bits are unwritten output
+    std::uint64_t acc_ = 0;        // the low `pending_` bits are unwritten output
     std::uint32_t pending_ = 0;
 };
 

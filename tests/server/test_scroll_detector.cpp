@@ -79,12 +79,14 @@ bool move_is_exact(const Screen& previous, const Screen& current, const ScrollMo
 {
     const auto destination = move.destination();
     for (std::uint32_t i = 0; i < move.source.height; ++i) {
-        const auto from = std::span(previous.pixels)
-                              .subspan((std::size_t{move.source.y + i} * previous.stride) + (std::size_t{move.source.x} * 4),
-                                       std::size_t{move.source.width} * 4);
-        const auto to = std::span(current.pixels)
-                            .subspan((std::size_t{destination.y + i} * current.stride) + (std::size_t{destination.x} * 4),
-                                     std::size_t{move.source.width} * 4);
+        const auto from =
+            std::span(previous.pixels)
+                .subspan((std::size_t{move.source.y + i} * previous.stride) + (std::size_t{move.source.x} * 4),
+                         std::size_t{move.source.width} * 4);
+        const auto to =
+            std::span(current.pixels)
+                .subspan((std::size_t{destination.y + i} * current.stride) + (std::size_t{destination.x} * 4),
+                         std::size_t{move.source.width} * 4);
         if (!std::ranges::equal(from, to)) {
             return false;
         }
@@ -155,9 +157,9 @@ TEST_CASE("Scroll detection keeps to its limits", "[server][scroll]")
 
     SECTION("farther than max_distance")
     {
-        CHECK_FALSE(
-            detect_vertical_scroll(previous.view(), current.view(), everything, ScrollDetectorConfig{.max_distance = 20})
-                .has_value());
+        CHECK_FALSE(detect_vertical_scroll(previous.view(), current.view(), everything,
+                                           ScrollDetectorConfig{.max_distance = 20})
+                        .has_value());
     }
     SECTION("an area too short for min_rows of moved content")
     {

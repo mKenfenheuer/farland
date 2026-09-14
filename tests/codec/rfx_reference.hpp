@@ -380,7 +380,14 @@ inline void rlgr_encode(rfx::RlgrMode mode, std::span<const std::int16_t> data, 
             const std::uint32_t two_ms2 = two_mag_sign(next());
             const std::uint32_t sum = two_ms1 + two_ms2;
             code_gr(krp, sum);
-            bs.put(two_ms1, static_cast<std::uint32_t>(std::bit_width(sum)));
+            // GetMinBits by hand: GCC 16 at -O2 with -fwrapv (which the
+            // test gets through libspa's -fno-strict-overflow) miscompiles
+            // std::bit_width here.
+            std::uint32_t min_bits = 0;
+            for (std::uint32_t rest = sum; rest != 0; rest >>= 1U) {
+                ++min_bits;
+            }
+            bs.put(two_ms1, min_bits);
             if (two_ms1 != 0 && two_ms2 != 0) {
                 k = update_param(kp, -6);
             } else if (two_ms1 == 0 && two_ms2 == 0) {

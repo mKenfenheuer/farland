@@ -4,12 +4,16 @@
 # Every parser of network input gets a target here (CONTRIBUTING.md): the
 # source is fuzz_<name>.cpp and the seeds live in corpus/<name>/.
 fuzz_targets = {
+  'audin': farland_channels_dep,
   'autodetect': farland_server_dep,
   'avc420': farland_codec_dep,
   'ber': farland_base_dep,
+  'broker': farland_server_dep,
   'clear': farland_codec_dep,
+  'cliprdr': [farland_channels_dep, farland_codec_dep],
   'per': farland_base_dep,
   'credssp': farland_auth_dep,
+  'disp': farland_server_dep,
   'drdynvc': farland_channels_dep,
   'ntlm': farland_auth_dep,
   'mcs_gcc': farland_proto_dep,
@@ -18,7 +22,10 @@ fuzz_targets = {
   'pointer': farland_proto_dep,
   'privsep': farland_server_dep,
   'progressive': farland_codec_dep,
+  'rdpei': farland_channels_dep,
   'rdpgfx': farland_channels_dep,
+  'rdpsnd': farland_channels_dep,
+  'save_session_info': farland_proto_dep,
   'server': farland_server_dep,
   'share': farland_proto_dep,
   'svc': farland_channels_dep,

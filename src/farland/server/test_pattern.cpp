@@ -84,6 +84,13 @@ codec::ImageView TestPattern::render(std::uint64_t frame)
         fill(8 + (static_cast<std::uint32_t>(i) * 20U), height_ > 28 ? height_ - 28 : 0, 16, 20,
              ((code * 0x9E3779B1U) >> 8U) & 0xFFFFFFU);
     }
+    // Touch and pen contacts: a square coloured by id, filled while it
+    // touches, small while it hovers; pens are white.
+    for (const auto& c : contacts_) {
+        const std::uint32_t rgb =
+            c.kind == channels::rdpei::ContactKind::pen ? 0xFFFFFFU : (((c.id + 1U) * 0x9E3779B1U) >> 8U) | 0x404040U;
+        square(c.x, c.y, c.engaged ? 33 : 9, rgb & 0xFFFFFFU);
+    }
     // Crosshair at the pointer, red while a button is held.
     const std::uint32_t color = button_down_ ? 0xFF2020 : 0xFFFFFF;
     fill(pointer_x_ > 12 ? pointer_x_ - 12 : 0, pointer_y_, 25, 1, color);
@@ -109,6 +116,68 @@ void TestPattern::apply(const proto::InputEvent& event)
             }
         }
     }
+}
+
+void TestPattern::square(std::uint32_t x, std::uint32_t y, std::uint32_t size, std::uint32_t rgb)
+{
+    const std::uint32_t half = size / 2;
+    fill(x > half ? x - half : 0, y > half ? y - half : 0, size, size, rgb);
+}
+
+void TestPattern::apply(const channels::rdpei::Contact& contact)
+{
+    using Action = channels::rdpei::ContactAction;
+    const auto it =
+        std::ranges::find_if(contacts_, [&](const Point& p) { return p.kind == contact.kind && p.id == contact.id; });
+    if (contact.action == Action::up || contact.action == Action::cancel || contact.action == Action::leave) {
+        if (it != contacts_.end()) {
+            contacts_.erase(it);
+        }
+        return;
+    }
+    if (width_ == 0 || height_ == 0) {
+        return;
+    }
+    const Point point{
+        .kind = contact.kind,
+        .id = contact.id,
+        .x = static_cast<std::uint32_t>(std::clamp<std::int64_t>(contact.x, 0, std::int64_t{width_} - 1)),
+        .y = static_cast<std::uint32_t>(std::clamp<std::int64_t>(contact.y, 0, std::int64_t{height_} - 1)),
+        .engaged = contact.action != Action::hover,
+    };
+    if (it != contacts_.end()) {
+        *it = point;
+    } else {
+        contacts_.push_back(point);
+    }
+}
+
+std::string TestPattern::describe(const channels::rdpei::Contact& contact)
+{
+    using Action = channels::rdpei::ContactAction;
+    const char* action = "move";
+    switch (contact.action) {
+    case Action::down:
+        action = "down";
+        break;
+    case Action::move:
+        break;
+    case Action::up:
+        action = "up";
+        break;
+    case Action::cancel:
+        action = "cancel";
+        break;
+    case Action::hover:
+        action = "hover";
+        break;
+    case Action::leave:
+        action = "leave";
+        break;
+    }
+    return std::format("{} {} {} {},{}{}", contact.kind == channels::rdpei::ContactKind::pen ? "pen" : "touch",
+                       contact.id, action, contact.x, contact.y,
+                       contact.pressure ? std::format(" pressure {}", *contact.pressure) : std::string());
 }
 
 std::string TestPattern::describe(const proto::InputEvent& event)
