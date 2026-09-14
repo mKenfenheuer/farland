@@ -658,7 +658,12 @@ void EiInput::scroll_discrete(std::int32_t x_v120, std::int32_t y_v120)
     if (device == nullptr) {
         return;
     }
-    ei_device_scroll_discrete(device->handle, x_v120, y_v120);
+    ei_device_scroll_delta(
+        device->handle,
+        static_cast<double>(x) / 4.0,
+        static_cast<double>(y / 4.0)
+    );
+
     device->dirty = true;
 }
 
