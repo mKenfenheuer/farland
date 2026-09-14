@@ -172,4 +172,99 @@ Bytes fastpath_input(std::span<const proto::InputEvent> events)
     return std::move(w).take();
 }
 
+void request_autodetect(proto::gcc::ClientData& data)
+{
+    data.core.early_capability_flags = static_cast<std::uint16_t>(
+        data.core.early_capability_flags.value_or(0) | proto::gcc::cs_early_flags::support_netchar_autodetect |
+        proto::gcc::cs_early_flags::support_heartbeat_pdu);
+    data.message_channel = proto::gcc::ClientMessageChannelData{0};
+}
+
+std::optional<std::uint16_t> message_channel_id(std::span<const std::byte> connect_response)
+{
+    Reader r(connect_response);
+    Reader tpdu = proto::read_tpkt(r).value();
+    Reader data = proto::decode_data_tpdu(tpdu).value();
+    const auto response = mcs::decode_connect_response(data).value();
+    Reader user_data(response.user_data);
+    Reader blocks(proto::gcc::decode_conference_create_response(user_data).value());
+    return proto::gcc::decode_server_data(blocks).value().message_channel_id;
+}
+
+bool AutoDetectResponder::on_message_channel(std::span<const std::byte> pdu) const
+{
+    if (pdu.empty() || std::to_integer<unsigned>(pdu[0]) != 0x03) {
+        return false;
+    }
+    Reader r(pdu);
+    Reader tpdu = proto::read_tpkt(r).value();
+    auto data = proto::decode_data_tpdu(tpdu);
+    if (!data) {
+        return false;
+    }
+    const auto domain_pdu = mcs::decode_domain_pdu(*data);
+    const auto* send = domain_pdu ? std::get_if<mcs::SendDataIndication>(&*domain_pdu) : nullptr;
+    return send != nullptr && send->channel_id == message_channel_;
+}
+
+std::optional<Bytes> AutoDetectResponder::answer(std::span<const std::byte> pdu, Clock::time_point now)
+{
+    namespace ad = proto::autodetect;
+    if (!on_message_channel(pdu)) {
+        if (measuring_) {
+            measured_bytes_ += pdu.size();  // as FreeRDP counts: every PDU in between
+        }
+        return std::nullopt;
+    }
+    Reader r(pdu);
+    Reader tpdu = proto::read_tpkt(r).value();
+    Reader data = proto::decode_data_tpdu(tpdu).value();
+    const auto domain_pdu = mcs::decode_domain_pdu(data).value();
+    Reader payload(std::get<mcs::SendDataIndication>(domain_pdu).data);
+    const std::uint16_t flags = proto::read_basic_security_header(payload).value();
+    if ((flags & proto::sec_flags::heartbeat) != 0) {
+        ++heartbeats;
+        return std::nullopt;
+    }
+    if ((flags & proto::sec_flags::autodetect_req) == 0) {
+        return std::nullopt;
+    }
+    const auto request = ad::decode_request(payload).value();
+    if (const auto* rtt = std::get_if<ad::RttRequest>(&request)) {
+        ++rtt_answers;
+        return response(ad::RttResponse{rtt->sequence});
+    }
+    if (std::holds_alternative<ad::BandwidthStart>(request)) {
+        measuring_ = true;
+        measure_start_ = now;
+        measured_bytes_ = 0;
+        return std::nullopt;
+    }
+    if (const auto* p = std::get_if<ad::BandwidthPayload>(&request)) {
+        measured_bytes_ += p->payload.size();
+        return std::nullopt;
+    }
+    if (const auto* stop = std::get_if<ad::BandwidthStop>(&request)) {
+        measured_bytes_ += stop->payload.size();
+        measuring_ = false;
+        const bool connect_time = stop->request_type == ad::request_type::bw_stop_connect_time;
+        ++(connect_time ? connect_time_results : continuous_results);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - measure_start_).count();
+        return response(ad::BandwidthResults{
+            stop->sequence,
+            connect_time ? ad::response_type::bw_results_connect_time : ad::response_type::bw_results_continuous,
+            static_cast<std::uint32_t>(elapsed), static_cast<std::uint32_t>(measured_bytes_)});
+    }
+    result = std::get<ad::NetworkCharacteristicsResult>(request);
+    return std::nullopt;
+}
+
+Bytes AutoDetectResponder::response(const proto::autodetect::Response& response) const
+{
+    Writer payload;
+    proto::write_basic_security_header(payload, proto::sec_flags::autodetect_rsp);
+    proto::autodetect::encode(payload, response);
+    return domain(mcs::SendDataRequest{user_, message_channel_, payload.view()});
+}
+
 }  // namespace farland::test::client

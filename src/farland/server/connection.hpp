@@ -12,8 +12,10 @@
 #include <farland/proto/input.hpp>
 #include <farland/proto/pointer.hpp>
 #include <farland/proto/share.hpp>
+#include <farland/server/autodetect.hpp>
 #include <farland/server/preauth.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -30,7 +32,19 @@
 ///
 /// Contract for callers: after every `receive()` and every command, send
 /// `take_output()` through TLS, then handle each event from `poll_event()`.
+/// The connection keeps no clock: `tick()` tells it the time.
 namespace farland::server {
+
+/// How much network characteristics detection ([MS-RDPBCGR] 1.3.9) to run
+/// with clients that support it (RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT and a
+/// joined message channel).
+enum class AutoDetectMode : std::uint8_t {
+    off,
+    /// RTT probes and bandwidth measurements once the connection is active.
+    continuous,
+    /// Also the connect-time detection before licensing.
+    full,
+};
 
 struct ServerConfig {
     /// Client desktop sizes are clamped to this range.
@@ -41,6 +55,12 @@ struct ServerConfig {
     /// The desktop size to announce instead of the client's request (a shared
     /// desktop has the size it has). Clamped like client sizes.
     std::optional<std::pair<std::uint16_t, std::uint16_t>> desktop_size;
+    AutoDetectMode autodetect = AutoDetectMode::full;
+    AutoDetect::Config autodetect_config;
+    /// A Heartbeat PDU ([MS-RDPBCGR] 2.2.16.1) goes out after this long
+    /// without other output, to clients that set RNS_UD_CS_SUPPORT_HEARTBEAT_PDU
+    /// and joined the message channel. Zero: never.
+    std::chrono::seconds heartbeat_period{5};
 };
 
 enum class State : std::uint8_t {
@@ -48,6 +68,8 @@ enum class State : std::uint8_t {
     wait_erect_domain,
     wait_attach_user,
     wait_channel_joins,
+    /// Connect-time auto-detect between Client Info and licensing ([MS-RDPBCGR] 1.3.1.1, phase 6).
+    connect_time_autodetect,
     wait_confirm_active,
     finalizing,
     active,
@@ -94,6 +116,11 @@ struct Session {
         std::uint16_t large_pointer_flags = 0;  ///< proto::caps::large_pointer_flags
     };
     PointerSupport pointer;
+
+    /// Auto-detect and heartbeats run on the message channel; the
+    /// estimates are in Connection::network().
+    bool autodetect = false;
+    bool heartbeat = false;
 
     /// The MCS channel ID of the static channel `name` (compared without
     /// regard to case), if the client asked for it.
@@ -148,17 +175,29 @@ using Event = std::variant<event::ClientInfo, event::Activated, event::Input, ev
 
 class Connection {
 public:
+    using Clock = std::chrono::steady_clock;
+
     Connection(ServerConfig config, Negotiation negotiation);
 
     /// Decrypted TLS data from the client.
     void receive(std::span<const std::byte> bytes);
+    /// The current time. Call it before every receive() (auto-detect times
+    /// the client's answers with it) and at least a few times a second:
+    /// RTT probes, heartbeats and the connect-time detection's timeout go
+    /// out from here.
+    void tick(Clock::time_point now);
 
+    /// Output since the last call. When a continuous bandwidth measurement is
+    /// due and the output is large enough, it comes wrapped in a Bandwidth
+    /// Measure Start and Stop ([MS-RDPBCGR] 2.2.14.1.2, 2.2.14.1.4).
     [[nodiscard]] std::vector<std::byte> take_output();
     [[nodiscard]] std::optional<Event> poll_event();
 
     [[nodiscard]] State state() const noexcept { return state_; }
     [[nodiscard]] bool active() const noexcept { return state_ == State::active; }
     [[nodiscard]] const Session& session() const noexcept { return session_; }
+    /// What auto-detect measured so far (empty without it).
+    [[nodiscard]] const NetworkEstimate& network() const noexcept { return autodetect_.estimate(); }
 
     /// Bytes of TS_UPDATE_BITMAP_DATA one update may carry, given the
     /// negotiated output path and the client's MultifragmentUpdate limit.
@@ -185,13 +224,23 @@ private:
     Result<void> on_domain_pdu(Reader& data);
     Result<void> on_channel_join(std::uint16_t initiator, std::uint16_t channel_id);
     Result<void> on_client_info(Reader& data);
+    Result<void> on_message_channel(Reader& data);
     Result<void> on_io_data(Reader& data);
     Result<void> on_confirm_active(Reader& body);
     Result<void> on_data_pdu(Reader& body);
     Result<void> on_fastpath_input(Reader& pdu);
 
+    [[nodiscard]] bool message_channel_joined() const;
+    /// Licensing and the Demand Active: the connection sequence after
+    /// Client Info and the optional connect-time auto-detect.
+    void start_licensing();
+    void finish_connect_time_autodetect();
     void send_demand_active();
     void send_io(std::span<const std::byte> payload);
+    /// One PDU on the message channel: basic security header with `flags`,
+    /// then `payload` ([MS-RDPBCGR] 2.2.14.3, 2.2.16.1).
+    void write_message_channel(Writer& out, std::uint16_t flags, std::span<const std::byte> payload) const;
+    void send_autodetect(Writer& out, const proto::autodetect::Request& request) const;
     template <class Pdu>
     void send_data_pdu(const Pdu& pdu);
     void activate();
@@ -206,6 +255,9 @@ private:
     std::deque<Event> events_;
     bool reactivating_ = false;
     std::vector<std::uint16_t> joined_channels_;
+    AutoDetect autodetect_;
+    Clock::time_point now_;
+    Clock::time_point last_output_;
 };
 
 }  // namespace farland::server

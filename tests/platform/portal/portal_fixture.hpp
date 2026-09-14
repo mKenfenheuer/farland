@@ -24,14 +24,17 @@ public:
     ~MockPortal();
 
     [[nodiscard]] const std::string& address() const noexcept { return address_; }
-    /// The calls the mock saw (see mock_portal.py).
+    /// The calls the mock saw (see mock_portal.py). Main thread only: it
+    /// asserts with Catch2, which is not thread-safe.
     [[nodiscard]] std::vector<std::string> calls() const;
     /// Waits until the mock saw at least `count` calls, dispatching `session`
-    /// meanwhile; returns the calls.
+    /// meanwhile; returns the calls (fewer on timeout or when the mock cannot
+    /// be reached). Safe on any thread: no Catch2 assertions.
     [[nodiscard]] std::vector<std::string> wait_for_calls(std::size_t count,
                                                           platform::portal::PortalSession* session = nullptr) const;
-    /// Makes the mock emit Session.Closed for every session.
-    void close_sessions() const;
+    /// Makes the mock emit Session.Closed for every session; false if the mock
+    /// could not be reached. Safe on any thread.
+    [[nodiscard]] bool close_sessions() const;
 
     /// Portal options that talk to this bus.
     [[nodiscard]] platform::portal::PortalOptions options() const;

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace farland::app {
 
@@ -25,6 +26,10 @@ struct PortalDesktopOptions {
     std::optional<std::filesystem::path> restore_token_file;
     /// How long the user may take to confirm the portal dialog.
     std::chrono::seconds timeout{300};
+    /// DRM render node whose GPU imports the captured dmabufs: the H.264
+    /// encoder's, so that the compositor hands out buffers in a layout it
+    /// takes. Empty: the first render node that opens.
+    std::string render_node;
 };
 
 /// Shares the running desktop through xdg-desktop-portal (docs/PLAN.md §3.3):

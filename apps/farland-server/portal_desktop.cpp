@@ -114,7 +114,9 @@ Result<void> PortalDesktop::start(const PortalDesktopOptions& options)
         log::error(log_component, "OpenPipeWireRemote: {}", remote.error().message);
         return fail(Errc::io, "the desktop portal gave no PipeWire connection");
     }
-    auto capture = portal::PipeWireCapture::create(remote->get(), stream.node_id);
+    portal::PipeWireCaptureOptions capture_options;
+    capture_options.render_node = options.render_node;
+    auto capture = portal::PipeWireCapture::create(remote->get(), stream.node_id, capture_options);
     if (!capture) {
         log::error(log_component, "PipeWire capture of node {}: {}", stream.node_id, capture.error().message());
         return fail(Errc::io, "cannot capture the screen cast stream");

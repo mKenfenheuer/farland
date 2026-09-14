@@ -4,6 +4,7 @@
 # Sans-IO PDU codecs for both roles (docs/PLAN.md §3.1).
 farland_proto_lib = static_library(
   'farland-proto',
+  'autodetect.cpp',
   'bitmap.cpp',
   'capabilities.cpp',
   'client_info.cpp',

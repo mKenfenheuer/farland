@@ -128,6 +128,7 @@ if catch2_dep.found()
 endif
 
 subdir('fuzz')
+subdir('benchmarks')
 
 summary(
   {

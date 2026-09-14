@@ -5,6 +5,7 @@
 
 #include <farland/base/error.hpp>
 #include <farland/codec/yuv.hpp>
+#include <farland/video/dmabuf_frame.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -33,22 +34,26 @@
 ///
 /// An encoder is not thread-safe. Keep one per RDPGFX surface.
 ///
-/// VA-API and NVENC (M5) will take GPU surfaces and convert colour on the
-/// GPU. They get their own encode entry point then; configuration, rate
-/// control, IDR requests and EncodedFrame stay the same.
+/// Encoders on a GPU (VA-API, NVENC) also take captured frames as dmabufs and
+/// convert colour on the GPU: encode_dmabuf(). Configuration, rate control,
+/// IDR requests and EncodedFrame stay the same.
 namespace farland::video {
 
 enum class Backend : std::uint8_t {
     openh264,  ///< Cisco OpenH264, loaded at runtime (BSD-2-Clause).
     x264,      ///< libx264, linked at build time with -Dx264=enabled (GPLv2+).
+    vaapi,     ///< VA-API on a DRM render node (AMD, Intel), with -Dvaapi.
+    nvenc,     ///< NVIDIA NVENC, driver libraries loaded at runtime, with -Dnvenc.
 };
 
 [[nodiscard]] std::string_view to_string(Backend backend) noexcept;
 [[nodiscard]] std::optional<Backend> parse_backend(std::string_view name) noexcept;
 
-/// Backends compiled into this build, in the default order of preference.
-/// OpenH264 is always compiled in; whether it works depends on the library at
-/// runtime.
+/// Backends compiled into this build, in the default order of preference:
+/// the GPU encoders (when built) first, as they take the work off the CPU:
+/// NVENC, which fails at once without an NVIDIA GPU, then VA-API (Intel,
+/// AMD); then OpenH264, then x264. OpenH264 is always compiled in; whether a
+/// backend works depends on the library or GPU at runtime.
 [[nodiscard]] std::span<const Backend> compiled_backends() noexcept;
 
 /// Highest H.264 profile the stream may use. RDPGFX does not tell the server
@@ -57,11 +62,29 @@ enum class Backend : std::uint8_t {
 /// OpenH264 backend always produces Constrained Baseline.
 enum class Profile : std::uint8_t { constrained_baseline, main, high };
 
+/// The YUV colour space of the pictures: what the VUI signals and, for
+/// encoders that convert BGRX on the GPU, the conversion they apply. The
+/// default is codec::bgrx_to_yuv420's, full-range BT.709 as [MS-RDPEGFX]
+/// 3.3.8.3.1 requires; GPU and CPU pictures must use the same one. The
+/// software backends always signal the default.
+struct ColorSpace {
+    enum class Matrix : std::uint8_t {
+        bt709,  ///< Kr = 0.2126, Kb = 0.0722
+        bt601,  ///< Kr = 0.299, Kb = 0.114
+    };
+    Matrix matrix = Matrix::bt709;
+    /// Full range (0..255) rather than limited (16..235, 16..240).
+    bool full_range = true;
+
+    friend bool operator==(const ColorSpace&, const ColorSpace&) = default;
+};
+
 struct RateControl {
     enum class Mode : std::uint8_t {
-        /// Constant quality: x264 CRF `quality`. OpenH264 has no CRF: without
-        /// a cap it encodes at the fixed QP `quality`; with a cap it runs
-        /// bitrate control at the cap with `quality` as the minimum QP.
+        /// Constant quality: x264 CRF `quality`. OpenH264 and VA-API have no
+        /// CRF: without a cap they encode at the fixed QP `quality`; with a
+        /// cap they run bitrate control at the cap with `quality` as the
+        /// minimum QP.
         constant_quality,
         /// Average bitrate `bitrate_kbps`.
         bitrate,
@@ -83,6 +106,7 @@ struct RateControl {
 inline constexpr std::uint32_t max_dimension = 8192;
 inline constexpr std::uint32_t max_fps = 240;
 inline constexpr std::uint32_t max_threads = 16;
+inline constexpr std::uint32_t max_reference_frames = 4;
 inline constexpr std::uint32_t max_bitrate_kbps = 1'000'000;
 inline constexpr std::uint32_t max_vbv_window_ms = 10'000;
 
@@ -97,10 +121,14 @@ struct EncoderConfig {
     RateControl rate;
     Profile profile = Profile::constrained_baseline;
     /// Slice threads, 1..max_threads. Slices parallelise without the frame
-    /// delay of x264's frame threads; ZeroVDI used 1.
+    /// delay of x264's frame threads; ZeroVDI used 1. VA-API ignores it.
     std::uint32_t threads = 1;
     /// Largest distance between IDR frames; 0 means IDR only on request.
     std::uint32_t keyint = 0;
+    /// Reference pictures a P picture may predict from, 1..max_reference_frames.
+    /// AVC444 interleaves two views in one stream and needs 2, so each view
+    /// can predict from its own previous picture (video::Avc444Encoder).
+    std::uint32_t reference_frames = 1;
     bool access_unit_delimiters = true;
 
     friend bool operator==(const EncoderConfig&, const EncoderConfig&) = default;
@@ -116,7 +144,7 @@ struct FrameOptions {
     /// (smaller values are bumped). Without it, frame number / fps is used.
     /// OpenH264's rate control follows it. x264 budgets by `fps` instead,
     /// because its variable-frame-rate mode holds every picture back until
-    /// the next one arrives.
+    /// the next one arrives; so does VA-API.
     std::optional<std::uint64_t> timestamp_us;
 };
 
@@ -159,6 +187,25 @@ public:
     [[nodiscard]] virtual Result<EncodedFrame> encode(const codec::Yuv420View& picture,
                                                       const FrameOptions& options = {}) = 0;
 
+    /// True if encode_dmabuf() works: the encoder imports dmabufs and
+    /// converts them to YUV itself.
+    [[nodiscard]] virtual bool accepts_dmabuf() const noexcept { return false; }
+
+    /// Encodes a captured frame in GPU memory, packed 32-bit RGB of at most
+    /// config().width x config().height, placed at the top left of the coded
+    /// picture (the rest is black). Colour is converted with the backend's
+    /// ColorSpace (BackendOptions::color). Errc::unsupported if the backend
+    /// or driver cannot take this buffer (format or modifier); the caller
+    /// then maps it and uses encode(). The default is always unsupported.
+    [[nodiscard]] virtual Result<EncodedFrame> encode_dmabuf(const DmabufFrame& frame,
+                                                             const FrameOptions& options = {});
+
+    /// Drops what encode_dmabuf() keeps of earlier buffers (imports cached
+    /// by buffer identity). A capture that replaced its buffers calls it, so
+    /// the old ones are freed and a reused identity cannot hit a stale
+    /// import. The default does nothing.
+    virtual void forget_dmabufs() noexcept {}
+
 protected:
     H264Encoder() = default;
 };
@@ -166,7 +213,15 @@ protected:
 struct BackendOptions {
     /// OpenH264 library to load: a path or a file name for dlopen. Empty
     /// tries the names in openh264::default_library_names.
-    std::string openh264_library;
+    // NOLINTNEXTLINE(readability-redundant-member-init): for GCC's -Wmissing-field-initializers
+    std::string openh264_library{};
+    /// VA-API and NVENC: the DRM render node to encode on. Empty tries
+    /// /dev/dri/renderD128 and up and takes the first with an H.264 encoder.
+    // NOLINTNEXTLINE(readability-redundant-member-init): for GCC's -Wmissing-field-initializers
+    std::string render_node{};
+    /// VA-API and NVENC: the colour space of the GPU conversion in encode_dmabuf() and
+    /// of the VUI. Keep it equal to the CPU conversion (codec::yuv.hpp).
+    ColorSpace color{};
 };
 
 /// Creates and configures an encoder of one backend. Errc::unsupported if the

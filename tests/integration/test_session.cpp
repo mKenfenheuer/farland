@@ -27,6 +27,7 @@
 #include "support/client_pdus.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <array>
 #include <atomic>
@@ -295,15 +296,42 @@ std::optional<std::uint32_t> negotiate(TestClient& c, std::uint32_t protocol, co
     return std::nullopt;
 }
 
-/// MCS setup, Client Info, licensing, capabilities and finalization, asking
-/// for a `client_width` x `client_height` desktop. Returns the desktop size
-/// the server announced.
+/// The next PDU from the server; auto-detect requests get their answer.
+Bytes next_pdu(TestClient& c, client::AutoDetectResponder& autodetect)
+{
+    auto pdu = c.read_pdu();
+    if (auto reply = autodetect.answer(pdu)) {
+        c.send(*reply);
+    }
+    return pdu;
+}
+
+/// The next PDU that is not on the message channel.
+Bytes next_io_pdu(TestClient& c, client::AutoDetectResponder& autodetect)
+{
+    for (;;) {
+        auto pdu = next_pdu(c, autodetect);
+        if (!autodetect.on_message_channel(pdu)) {
+            return pdu;
+        }
+    }
+}
+
+/// MCS setup, Client Info, connect-time auto-detect, licensing, capabilities
+/// and finalization, asking for a `client_width` x `client_height` desktop.
+/// Like FreeRDP 3, the client supports auto-detect and heartbeats and joins
+/// the message channel; `autodetect` answers for it from here on. Returns
+/// the desktop size the server announced.
 std::pair<std::uint16_t, std::uint16_t> activate(TestClient& c, std::uint32_t protocol, std::uint16_t client_width,
-                                                 std::uint16_t client_height)
+                                                 std::uint16_t client_height,
+                                                 std::optional<client::AutoDetectResponder>& autodetect)
 {
     // MCS connect and domain setup.
-    c.send(client::connect_initial(client::client_data(protocol, 0x0001, client_width, client_height)));
-    static_cast<void>(c.read_pdu());  // Connect Response
+    auto client_data = client::client_data(protocol, 0x0001, client_width, client_height);
+    client::request_autodetect(client_data);
+    c.send(client::connect_initial(client_data));
+    const auto message_channel = client::message_channel_id(c.read_pdu());  // Connect Response
+    REQUIRE(message_channel.has_value());
     c.send(client::erect_domain());
     c.send(client::attach_user());
     std::uint16_t user = 0;
@@ -314,18 +342,22 @@ std::pair<std::uint16_t, std::uint16_t> activate(TestClient& c, std::uint32_t pr
         Reader data = proto::decode_data_tpdu(tpdu).value();
         user = std::get<mcs::AttachUserConfirm>(mcs::decode_domain_pdu(data).value()).initiator.value();
     }
-    for (const std::uint16_t channel : {user, mcs::io_channel_id}) {
+    for (const std::uint16_t channel : {user, mcs::io_channel_id, *message_channel}) {
         c.send(client::channel_join(user, channel));
         static_cast<void>(c.read_pdu());
     }
 
-    // Client Info, license, capabilities, finalization.
+    // Client Info, connect-time auto-detect, license, capabilities, finalization.
+    autodetect.emplace(user, *message_channel);
     c.send(client::client_info(user, "e2e"));
-    static_cast<void>(c.read_pdu());  // license
+    static_cast<void>(next_io_pdu(c, *autodetect));  // license, after the auto-detect exchange
+    CHECK(autodetect->rtt_answers == 1);
+    CHECK(autodetect->connect_time_results == 1);
+    CHECK(autodetect->result.has_value());
     std::uint32_t share_id = 0;
     std::pair<std::uint16_t, std::uint16_t> size{client_width, client_height};
     {
-        const auto payload = indication(c.read_pdu());
+        const auto payload = indication(next_io_pdu(c, *autodetect));
         Reader r(payload);
         auto control = proto::read_share_control(r).value();
         const auto demand = proto::decode_demand_active(control.body).value();
@@ -337,7 +369,7 @@ std::pair<std::uint16_t, std::uint16_t> activate(TestClient& c, std::uint32_t pr
     c.send(client::confirm_active(user, share_id, true, size.first, size.second));
     c.send(client::finalization(user, share_id));
     for (int i = 0; i < 4; ++i) {
-        static_cast<void>(c.read_pdu());  // Synchronize, Cooperate, Granted, Font Map
+        static_cast<void>(next_io_pdu(c, *autodetect));  // Synchronize, Cooperate, Granted, Font Map
     }
     return size;
 }
@@ -351,12 +383,13 @@ void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto:
 
     REQUIRE_FALSE(negotiate(c, protocol, login).has_value());
 
-    activate(c, protocol, width, height);
+    std::optional<client::AutoDetectResponder> autodetect;
+    activate(c, protocol, width, height, autodetect);
 
     // The first frames cover the whole desktop: 5 x 4 tiles.
     Canvas canvas;
     for (int i = 0; i < 400 && canvas.tiles_seen.size() < 20; ++i) {
-        canvas.apply(c.read_pdu());
+        canvas.apply(next_pdu(c, *autodetect));
     }
     REQUIRE(canvas.tiles_seen.size() == 20);
     CHECK(canvas.rgb(5, 5) == 0xFFFFFF);    // first color bar
@@ -369,7 +402,7 @@ void run_client(int fd, std::atomic<bool>& stop, std::uint32_t protocol = proto:
     };
     c.send(client::fastpath_input(input));
     for (int i = 0; i < 400 && canvas.rgb(170, 200) != 0xFF2020; ++i) {
-        canvas.apply(c.read_pdu());
+        canvas.apply(next_pdu(c, *autodetect));
     }
     CHECK(canvas.rgb(170, 200) == 0xFF2020);
 
@@ -429,14 +462,16 @@ private:
 };
 
 /// A shared desktop for tests: one solid frame, one cursor shape, and a sink
-/// that records the input it gets.
+/// that records the input it gets. With `dmabuf_only`, the frame comes as a
+/// dmabuf without pixels, which the session must map.
 class FakeDesktop final : public farland::app::Desktop {
 public:
     static constexpr std::uint32_t color = 0x3366CC;
 
+    /// Written on the session thread; read by the test after joining it.
     class Frames final : public farland::platform::FrameSource {
     public:
-        Frames() : pixels_(static_cast<std::size_t>(width) * height * 4)
+        explicit Frames(bool dmabuf_only) : pixels_(static_cast<std::size_t>(width) * height * 4), dmabuf_only_(dmabuf_only)
         {
             for (std::size_t i = 0; i < pixels_.size(); i += 4) {
                 pixels_[i] = std::byte{color & 0xFFU};
@@ -452,12 +487,33 @@ public:
                 return std::nullopt;
             }
             fresh_ = false;
-            return farland::platform::Frame{{pixels_, width, height, std::size_t{width} * 4}, {}, 1};
+            if (dmabuf_only_) {
+                farland::platform::Frame frame;
+                frame.sequence = 1;
+                frame.dmabuf = farland::platform::Dmabuf{.drm_format = 0x34325258,  // XRGB8888
+                                                         .width = width,
+                                                         .height = height,
+                                                         .plane_count = 1};
+                return frame;
+            }
+            return farland::platform::Frame{{pixels_, width, height, std::size_t{width} * 4}, {}, 1, std::nullopt};
         }
         [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> size() const override { return {width, height}; }
+        void set_access(farland::platform::FrameAccess a) override { access = a; }
+        [[nodiscard]] std::optional<farland::codec::ImageView> map_frame() override
+        {
+            ++maps;
+            return farland::codec::ImageView{pixels_, width, height, std::size_t{width} * 4};
+        }
+        void release_frame() override { ++releases; }
+
+        std::optional<farland::platform::FrameAccess> access;
+        int maps = 0;
+        int releases = 0;
 
     private:
         std::vector<std::byte> pixels_;
+        bool dmabuf_only_;
         bool fresh_ = true;
     };
 
@@ -502,7 +558,9 @@ public:
         std::atomic<int> events{0};
     };
 
-    [[nodiscard]] farland::platform::FrameSource& frames() override { return frames_; }
+    explicit FakeDesktop(bool dmabuf_only = false) : frames_(dmabuf_only) {}
+
+    [[nodiscard]] Frames& frames() override { return frames_; }
     [[nodiscard]] farland::platform::CursorSource* cursor() override { return &cursor_; }
     [[nodiscard]] farland::platform::InputSink& input() override { return sink; }
     [[nodiscard]] std::vector<int> dispatch_fds() const override { return {}; }
@@ -650,10 +708,13 @@ TEST_CASE("End to end with NLA through the privilege-separated network process")
 
 TEST_CASE("End to end with a shared desktop: its size, frames and cursor, input into it")
 {
+    // Frames as pixels, and as dmabufs the session maps for bitmap updates.
+    const bool dmabuf_only = GENERATE(false, true);
+    CAPTURE(dmabuf_only);
     std::array<int, 2> fds{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
     const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
-    FakeDesktop desktop;
+    FakeDesktop desktop(dmabuf_only);
     std::atomic<bool> stop{false};
     farland::app::SessionOptions options;
     options.frames_per_second = 60;
@@ -664,11 +725,13 @@ TEST_CASE("End to end with a shared desktop: its size, frames and cursor, input 
         TestClient c(fds[1]);
         REQUIRE_FALSE(negotiate(c, proto::protocol::ssl, nullptr).has_value());
         // The client asks for 640x480, but a shared desktop has the size it has.
-        CHECK(activate(c, proto::protocol::ssl, 640, 480) == std::pair<std::uint16_t, std::uint16_t>{width, height});
+        std::optional<client::AutoDetectResponder> autodetect;
+        CHECK(activate(c, proto::protocol::ssl, 640, 480, autodetect) ==
+              std::pair<std::uint16_t, std::uint16_t>{width, height});
 
         Canvas canvas;
         for (int i = 0; i < 400 && (canvas.tiles_seen.size() < 20 || canvas.other_updates == 0); ++i) {
-            canvas.apply(c.read_pdu());
+            canvas.apply(next_pdu(c, *autodetect));
         }
         CHECK(canvas.tiles_seen.size() == 20);
         CHECK(canvas.rgb(5, 5) == FakeDesktop::color);
@@ -690,4 +753,9 @@ TEST_CASE("End to end with a shared desktop: its size, frames and cursor, input 
     const std::vector<std::pair<std::uint32_t, bool>> expected_keys{{30, true}, {30, false}};  // KEY_A
     CHECK(desktop.sink.keys == expected_keys);
     CHECK(desktop.sink.motion == std::pair{100.0, 50.0});
+    // Bitmap updates need pixels: the one dmabuf frame was mapped, and the
+    // session leaves the desktop in CPU mode with its frame given back.
+    CHECK(desktop.frames().maps == (dmabuf_only ? 1 : 0));
+    CHECK(desktop.frames().access == farland::platform::FrameAccess::cpu);
+    CHECK(desktop.frames().releases == 1);
 }

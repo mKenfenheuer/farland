@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <farland/proto/autodetect.hpp>
 #include <farland/proto/gcc.hpp>
 #include <farland/proto/share.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -32,5 +35,45 @@ using Bytes = std::vector<std::byte>;
 /// Synchronize, Control Cooperate, Control Request and Font List, concatenated.
 [[nodiscard]] Bytes finalization(std::uint16_t user, std::uint32_t share_id);
 [[nodiscard]] Bytes fastpath_input(std::span<const proto::InputEvent> events);
+
+/// Asks for auto-detect and heartbeats as FreeRDP 3 does by default:
+/// RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT, RNS_UD_CS_SUPPORT_HEARTBEAT_PDU and
+/// a CS_MCS_MSGCHANNEL block.
+void request_autodetect(proto::gcc::ClientData& data);
+/// The message channel from the server's MCS Connect Response, if it offered one.
+[[nodiscard]] std::optional<std::uint16_t> message_channel_id(std::span<const std::byte> connect_response);
+
+/// The client half of auto-detect ([MS-RDPBCGR] 3.2.5.14): answers RTT
+/// probes, times bandwidth measurements over the PDUs between Start and
+/// Stop, and records Network Characteristics Results and heartbeats.
+class AutoDetectResponder {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    AutoDetectResponder(std::uint16_t user, std::uint16_t message_channel)
+        : user_(user), message_channel_(message_channel)
+    {
+    }
+
+    /// Looks at one server PDU (TPKT or fast-path) and returns the answer if
+    /// it is an auto-detect request that wants one.
+    [[nodiscard]] std::optional<Bytes> answer(std::span<const std::byte> pdu, Clock::time_point now = Clock::now());
+    [[nodiscard]] bool on_message_channel(std::span<const std::byte> pdu) const;
+
+    unsigned rtt_answers = 0;
+    unsigned connect_time_results = 0;
+    unsigned continuous_results = 0;
+    unsigned heartbeats = 0;
+    std::optional<proto::autodetect::NetworkCharacteristicsResult> result;
+
+private:
+    [[nodiscard]] Bytes response(const proto::autodetect::Response& response) const;
+
+    std::uint16_t user_;
+    std::uint16_t message_channel_;
+    bool measuring_ = false;
+    Clock::time_point measure_start_;
+    std::uint64_t measured_bytes_ = 0;
+};
 
 }  // namespace farland::test::client

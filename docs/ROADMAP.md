@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME with mstsc, Windows App and ZeroVDI; Plasma and the latency target are still to be tested.
+**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 is in progress.
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -47,7 +47,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - Fuzz targets exist for X.224, GCC, capability sets and fast-path input.
 - **Status: done, with these differences:**
   - `farland-server --fingerprint` prints the certificate fingerprint; `farlandctl` does not.
-  - The server does not send heartbeat PDUs yet.
+  - The server sends heartbeat PDUs since M5, only to clients that set the heartbeat flag.
 - **Tested:**
   - FreeRDP 3 (xfreerdp3 3.31) connects over TLS, shows the test pattern and delivers input.
   - The §4.1 regression tests pass.
@@ -140,7 +140,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **Exit:**
   - Full control of GNOME 48+ and Plasma 6.x desktops from mstsc and FreeRDP.
   - Glass-to-glass latency on a LAN is at most 50 ms at 1080p60 with AVC420.
-- **Status: implemented; works on GNOME with mstsc, Windows App, ZeroVDI and FreeRDP. Plasma, dmabuf and latency are not tested yet.**
+- **Status: implemented; works on GNOME with mstsc, Windows App, ZeroVDI and FreeRDP, and on Plasma with FreeRDP. The latency target is not measured yet.**
   - Done:
     - The backend interface (`FrameSource`, `CursorSource`, `InputSink`).
     - The portal client: RemoteDesktop and ScreenCast over sd-bus, restore tokens, and the Notify* fallback.
@@ -156,12 +156,13 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
       - mstsc, Windows App and ZeroVDI control the shared monitor with keyboard, mouse and cursor shapes; FreeRDP 3 shows it over RDPGFX 10.7 with Progressive.
       - The restore token skips the dialog on later starts.
       - `--virtual-monitor` gets a new 1920x1080 monitor from mutter and shares it.
+    - Plasma 6.6 on Kubuntu 26.04 (xdg-desktop-portal-kde), in a VM with a virtio GPU: FreeRDP 3 shows the desktop and controls it with keyboard and mouse through libei. KWin sends LINEAR dmabufs, which farland maps and reads; this is the first run of the dmabuf path.
   - Differences from the plan:
     - `--share` shares one monitor and serves one session at a time. A resized desktop is not followed yet; that comes with the disp channel (M6).
-    - The session reads each frame into CPU memory; zero-copy dmabuf to VA-API is M5.
+    - The session read each frame into CPU memory; since M5, AVC420 on VA-API takes the captured dmabufs directly.
     - Unicode input is not typed through libei, which has no text input.
     - A virtual monitor is always 1920x1080; it does not take the client's size yet.
-  - Not tested yet: Plasma, the dmabuf paths, AVC420 against a real client, input on the virtual monitor, and the latency exit criterion.
+  - Not tested yet: mstsc on Plasma, tiled (GPU-imported) dmabufs, AVC420 against a real client, input on the virtual monitor, and the latency exit criterion.
 
 ### M5: Codecs 2, quality and efficiency (~7 weeks)
 - **VA-API encoder:** dmabuf → VASurface zero-copy (Intel/AMD), with the colour conversion on the GPU. **NVENC** optional.
@@ -176,6 +177,58 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - Benchmarks for bitrate, CPU and latency are published per codec, together with a content corpus.
   - Text is sharp at low bandwidth (2 Mbit/s).
   - VA-API runs at 4K30 with less than 10% of one core.
+- **Status: in progress.**
+  - Done:
+    - Network auto-detect ([MS-RDPBCGR] 2.2.14): connect-time RTT and bandwidth measurement, continuous RTT probes and bandwidth measured on real frames, the MCS message channel and heartbeats. Only for clients that advertise it; `--autodetect full|continuous|off`.
+    - The quality ladder (`QualityController`, ZeroVDI's four tiers): queueing delay, slow frame acknowledgements, the client's queue depth and the measured bandwidth set frame rate, Progressive quantisation and H.264 bitrate, with hysteresis.
+    - Scroll detection on Progressive and planar surfaces:
+      - When at least 4 tiles changed, `detect_vertical_scroll` compares row hashes per 64-pixel column strip against the last frame and verifies the move byte by byte.
+      - A found move goes out as one SurfaceToSurface, and only the uncovered rows are encoded.
+      - H.264 surfaces leave motion to the encoder.
+    - The VA-API H.264 encoder (`--h264-encoder`, `--render-node`):
+      - Constrained baseline, main and high, CBR/VBR/CQP, and packed headers where the driver needs them (radeonsi).
+      - Zero-copy input from dmabufs (linear and tiled modifiers), with the colour conversion on the GPU; `ColorSpace` sets the matrix and range.
+      - Measured on an RX 6900 XT (Mesa 26 radeonsi): 4K30 from dmabufs costs 0.41 ms of CPU per frame, 1.2% of one core.
+    - Zero-copy from the screen capture to the H.264 encoder (AVC420 with an encoder that takes dmabufs):
+      - The session asks the capture for dmabufs (`FrameAccess`). The capture then reads nothing: it keeps the newest buffer dequeued and hands its descriptors to the session, which gives it back with the next frame. It holds at most two buffers, and only on streams with four or more, so the producer never runs dry.
+      - The AVC420 regions come from the capture's damage (`SPA_META_VideoDamage`, merged over skipped frames), since there are no pixels to diff; an IDR or an invalidation still lists the whole surface.
+      - Everything else keeps reading frames into CPU memory: Progressive, planar, AVC444 (its 4:4:4 split runs on the CPU), bitmap updates, shared memory and cropped streams. A buffer the encoder refuses is read for that one frame; after three in a row the session stays on the CPU path. `--no-zero-copy` turns it off.
+      - The capture offers the modifiers the encoder's GPU imports (EGL on the encoder's render node), and the encoder drops its cached imports when PipeWire renegotiates the buffers.
+      - Measured on GNOME 50 with the RX 6900 XT (a 1280x800 VM monitor with a full-screen test video): mutter hands out tiled dmabufs (modifier `0x200000020801b03`), which VA-API imports and encodes correctly. The whole server process costs 8.5 ms of CPU per frame at 15 fps, against 36.7 ms per frame when the same buffers are read into CPU memory (`--no-zero-copy`), which then keeps up with only 5 fps. How the 8.5 ms splits between the session, ZGFX, TLS and PipeWire is not measured yet.
+    - True AVC444 and AVC444v2 (`--gfx-codec avc444`):
+      - The full-chroma picture is split into the main and auxiliary views per [MS-RDPEGFX] 3.3.8.3, and both go through one H.264 encoder, as the spec requires.
+      - Main-view chroma is the 2x2 average, as FreeRDP sends it. A policy chooses LC 0/1/2 per frame and can hold chroma back for later.
+      - v2 is used only for widths that are a multiple of 32; above that, implementations differ on the auxiliary view's layout.
+      - Negotiation falls back to AVC420, then Progressive.
+      - FreeRDP 3.31 decodes the streams (worst RGB PSNR 31 dB on coloured text, against 18.5 dB for 4:2:0 on the same content).
+      - The AVC420 colour conversion was checked on the way: full-range BT.709 with FreeRDP's coefficients, as the spec requires.
+      - On the tiers "low" and "minimal" the quality ladder holds chroma back until the picture stops changing.
+    - The ClearCodec encoder and a hardened decoder ([MS-RDPEGFX] 2.2.4.1), used for text and UI tiles (below):
+      - Residual, bands with V-bar and short V-bar caches mirroring the client's, the RLEX subcodec, and the glyph cache.
+      - The encoder costs every strip in each layer and takes the cheapest. A column seen a second time goes into the V-bar cache, after which recurring text costs about 2 bytes per column.
+      - NSCodec is left out: photo-like content goes to Progressive or AVC.
+      - 4604 streams (all patterns, cache overflow and eviction) decode pixel-exact in FreeRDP 3.15 and in ZeroVDI's clear.js.
+    - Progressive completed:
+      - Refinement passes: a tile goes out first at the coarsest of four quality stages (TILE_FIRST), then TILE_UPGRADE passes within a byte budget refine it. At full quality it is bit-identical to a single-pass tile.
+      - The reduce-extrapolate DWT in the encoder; refinement requires it, because FreeRDP reads upgrades in that band layout.
+      - SIMD: hand-written SSE2, AVX2 and NEON colour conversion, and vectorised DWT, quantisation and RLGR, chosen at run time and checked bit for bit against the scalar code. A 1080p frame encodes 2 to 3.4 times faster (x86-64, `quant_default`: 46.8 ms before, 13.8 ms after; `bench-progressive`).
+      - FreeRDP 3.15's decoder with its generic C primitives gives identical pixels on every frame, first passes and upgrades alike. FreeRDP's own SSE and NEON code differs from its C code by at most 1.
+      - RLGR3 is not used: the Progressive stream cannot signal it, and FreeRDP always decodes RLGR1.
+    - The NVENC H.264 encoder (`--h264-encoder nvenc`; tried first where built, as it fails fast without an NVIDIA driver):
+      - The NVENC API 12.0 and CUDA are loaded at runtime from the driver (520 or newer), so building needs no NVIDIA SDK or CUDA toolkit. The API declarations are checked against NVIDIA's header.
+      - CUDA on driver 595 cannot import dmabufs. So the dmabuf goes through EGL and OpenGL into a texture registered with CUDA, and a small kernel converts it to NV12, bit-identical to the CPU conversion.
+      - Measured on an RTX 3090 (driver 595): 4K30 from tiled dmabufs costs 1.07 ms of CPU per frame (3.2% of one core) at 10 ms latency with the P4 preset. Through CPU memory it costs 16 ms (48%).
+    - Mixed mode on Progressive surfaces (`--no-clearcodec`, `--no-refine` switch it off):
+      - Every changed 64x64 tile is classified by counting its colours, stopping at the 49th. Tiles with few colours (text, UI) go through ClearCodec, one region per run of adjacent tiles in a row; the rest go through Progressive, coarse first.
+      - A frame's leftover bytes (16 KB per frame) refine the Progressive tiles that did not change. Frames keep coming while refinement is pending, and stop once everything is at full quality.
+      - Tiles that switch to ClearCodec, and areas moved by a scroll, drop their Progressive refinement, so no upgrade paints over them.
+  - Open:
+    - AVC444, ClearCodec and Progressive refinement against mstsc and Windows App.
+    - Video regions through H.264 on the same surface as ClearCodec and Progressive (only whole-surface AVC so far).
+    - The exit benchmarks: bitrate, CPU and latency per codec on a content corpus, and text at 2 Mbit/s.
+    - Rate control does not yet account for the two pictures per AVC444 frame.
+    - Zero-copy covers AVC420 only; AVC444 would need the 4:4:4 split on the GPU.
+  - Tested: FreeRDP 3 answers every auto-detect request. mstsc and Windows App are not tested with auto-detect yet, and no tier change has been seen on a real slow link (only in simulated traces).
 
 ### M6: Channels (~7 weeks)
 - **disp (MS-RDPEDISP):** dynamic resize and **multi-monitor**. Virtual monitors come from Mutter `RecordVirtual`, the KWin virtual output or the portal `VIRTUAL` source; otherwise letterboxing.

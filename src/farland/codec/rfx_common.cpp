@@ -7,12 +7,13 @@
 
 // RemoteFX primitives, [MS-RDPRFX] 3.1.8 and [MS-RDPEGFX] 3.1.8.1.
 //
-// Translated from FreeRDP 3 (Apache-2.0): libfreerdp/codec/rfx_dwt.c,
-// rfx_quantization.c, rfx_rlgr.c, rfx_differential.h, rfx_bitstream.h,
-// progressive.c (reduce-extrapolate IDWT, SRL/RAW upgrade reads) and
-// libfreerdp/primitives/prim_colors.c. Modified: rewritten over std::span
-// with bounds-checked indexing, wrapping casts instead of assertions, and a
-// position-based bit reader equivalent to winpr's wBitStream.
+// Translated from FreeRDP 3 (Apache-2.0): libfreerdp/codec/rfx_quantization.c,
+// rfx_rlgr.c, rfx_differential.h, rfx_bitstream.h, progressive.c (SRL/RAW
+// upgrade reads) and libfreerdp/primitives/prim_colors.c. Modified: rewritten
+// over std::span with bounds-checked indexing, wrapping casts instead of
+// assertions, and a position-based bit reader equivalent to winpr's
+// wBitStream. The encoder side of upgrade passes (SRL and RAW writing) is new;
+// FreeRDP has none. The encoder's hot paths are in rfx_kernels.cpp.
 
 #include <farland/base/assert.hpp>
 #include <farland/codec/rfx_common.hpp>
@@ -31,11 +32,6 @@ namespace {
 [[nodiscard]] constexpr std::int16_t to_i16(std::int32_t v) noexcept
 {
     return static_cast<std::int16_t>(v);  // modulo 2^16, as in a release FreeRDP build
-}
-
-[[nodiscard]] constexpr std::int16_t clamp_i16(std::int32_t v) noexcept
-{
-    return static_cast<std::int16_t>(std::clamp<std::int32_t>(v, INT16_MIN, INT16_MAX));
 }
 
 }  // namespace
@@ -76,30 +72,7 @@ void write_component_quant(Writer& w, const Quant& q)
 }
 
 // ---------------------------------------------------------------------------
-// Colour conversion
-
-void load_tile(const ImageView& image, std::uint32_t x0, std::uint32_t y0, Planes& out)
-{
-    FARLAND_ASSERT(x0 < image.width && y0 < image.height);
-    const std::size_t w = std::min<std::size_t>(tile_size, image.width - x0);
-    const std::size_t h = std::min<std::size_t>(tile_size, image.height - y0);
-    FARLAND_ASSERT(image.stride >= std::size_t{image.width} * 4);
-    for (std::size_t row = 0; row < tile_size; ++row) {
-        // Rows and columns past the edge repeat the last real one.
-        const std::size_t src_row = std::min(row, h - 1);
-        const auto line = image.data.subspan(((y0 + src_row) * image.stride) + (std::size_t{x0} * 4), w * 4);
-        for (std::size_t col = 0; col < tile_size; ++col) {
-            const auto pixel = line.subspan(std::min(col, w - 1) * 4, 4);
-            const auto c =
-                rgb_to_ycbcr(std::to_integer<std::int32_t>(pixel[2]), std::to_integer<std::int32_t>(pixel[1]),
-                             std::to_integer<std::int32_t>(pixel[0]));
-            const std::size_t i = (row * tile_size) + col;
-            out.y[i] = c.y;
-            out.cb[i] = c.cb;
-            out.cr[i] = c.cr;
-        }
-    }
-}
+// Colour conversion (load_tile is in rfx_kernels.cpp)
 
 void store_tile(const Planes& planes, std::span<std::byte> out)
 {
@@ -115,243 +88,8 @@ void store_tile(const Planes& planes, std::span<std::byte> out)
 }
 
 // ---------------------------------------------------------------------------
-// Classic DWT (FreeRDP rfx_dwt.c)
-
-namespace {
-
-/// One level of the forward transform on the block at `base`, whose input is
-/// a (2 * sw) x (2 * sw) image. Output bands HL, LH, HH, LL of sw x sw each.
-void dwt_encode_block(std::span<std::int16_t> buf, std::span<std::int16_t> dwt, std::size_t sw) noexcept
-{
-    const std::size_t total = sw * 2;
-    // Vertical: L and H halves into dwt.
-    for (std::size_t x = 0; x < total; ++x) {
-        for (std::size_t n = 0; n < sw; ++n) {
-            const std::size_t y = n * 2;
-            const std::size_t l = (n * total) + x;
-            const std::size_t h = l + (sw * total);
-            const std::size_t s = (y * total) + x;
-            const std::size_t next_even = n < sw - 1 ? s + (2 * total) : s;
-            dwt[h] = to_i16((buf[s + total] - ((buf[s] + buf[next_even]) >> 1)) >> 1);
-            dwt[l] = to_i16(buf[s] + (n == 0 ? dwt[h] : (dwt[h - total] + dwt[h]) >> 1));
-        }
-    }
-    // Horizontal: L gives HL and LL, H gives HH and LH.
-    const std::size_t band = sw * sw;
-    for (std::size_t y = 0; y < sw; ++y) {
-        const auto l_src = dwt.subspan(y * total, total);
-        const auto h_src = dwt.subspan((2 * band) + (y * total), total);
-        const auto hl = buf.subspan(y * sw, sw);
-        const auto lh = buf.subspan(band + (y * sw), sw);
-        const auto hh = buf.subspan((2 * band) + (y * sw), sw);
-        const auto ll = buf.subspan((3 * band) + (y * sw), sw);
-        for (std::size_t n = 0; n < sw; ++n) {
-            const std::size_t x = n * 2;
-            const std::size_t xn = n < sw - 1 ? x + 2 : x;
-            hl[n] = to_i16((l_src[x + 1] - ((l_src[x] + l_src[xn]) >> 1)) >> 1);
-            ll[n] = to_i16(l_src[x] + (n == 0 ? hl[n] : (hl[n - 1] + hl[n]) >> 1));
-        }
-        for (std::size_t n = 0; n < sw; ++n) {
-            const std::size_t x = n * 2;
-            const std::size_t xn = n < sw - 1 ? x + 2 : x;
-            hh[n] = to_i16((h_src[x + 1] - ((h_src[x] + h_src[xn]) >> 1)) >> 1);
-            lh[n] = to_i16(h_src[x] + (n == 0 ? hh[n] : (hh[n - 1] + hh[n]) >> 1));
-        }
-    }
-}
-
-void dwt_decode_block(std::span<std::int16_t> buf, std::span<std::int16_t> idwt, std::size_t sw) noexcept
-{
-    const std::size_t total = sw * 2;
-    const std::size_t band = sw * sw;
-    // Horizontal: LL + HL -> L, LH + HH -> H.
-    for (std::size_t y = 0; y < sw; ++y) {
-        const auto hl = buf.subspan(y * sw, sw);
-        const auto lh = buf.subspan(band + (y * sw), sw);
-        const auto hh = buf.subspan((2 * band) + (y * sw), sw);
-        const auto ll = buf.subspan((3 * band) + (y * sw), sw);
-        const auto l_dst = idwt.subspan(y * total, total);
-        const auto h_dst = idwt.subspan((2 * band) + (y * total), total);
-        // Even coefficients.
-        l_dst[0] = to_i16(ll[0] - ((hl[0] + hl[0] + 1) >> 1));
-        h_dst[0] = to_i16(lh[0] - ((hh[0] + hh[0] + 1) >> 1));
-        for (std::size_t n = 1; n < sw; ++n) {
-            l_dst[n * 2] = to_i16(ll[n] - ((hl[n - 1] + hl[n] + 1) >> 1));
-            h_dst[n * 2] = to_i16(lh[n] - ((hh[n - 1] + hh[n] + 1) >> 1));
-        }
-        // Odd coefficients.
-        std::size_t n = 0;
-        for (; n < sw - 1; ++n) {
-            const std::size_t x = n * 2;
-            l_dst[x + 1] = to_i16((hl[n] * 2) + ((l_dst[x] + l_dst[x + 2]) >> 1));
-            h_dst[x + 1] = to_i16((hh[n] * 2) + ((h_dst[x] + h_dst[x + 2]) >> 1));
-        }
-        const std::size_t x = n * 2;
-        l_dst[x + 1] = to_i16((hl[n] * 2) + l_dst[x]);
-        h_dst[x + 1] = to_i16((hh[n] * 2) + h_dst[x]);
-    }
-    // Vertical: L + H -> output.
-    for (std::size_t x = 0; x < total; ++x) {
-        std::size_t l = x;
-        std::size_t h = x + (sw * total);
-        std::size_t dst = x;
-        buf[dst] = to_i16(idwt[l] - ((idwt[h] * 2 + 1) >> 1));
-        for (std::size_t n = 1; n < sw; ++n) {
-            l += total;
-            h += total;
-            buf[dst + (2 * total)] = to_i16(idwt[l] - ((idwt[h - total] + idwt[h] + 1) >> 1));
-            buf[dst + total] = to_i16((idwt[h - total] * 2) + ((buf[dst] + buf[dst + (2 * total)]) >> 1));
-            dst += 2 * total;
-        }
-        buf[dst + total] = to_i16((idwt[h] * 2) + ((buf[dst] * 2) >> 1));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reduce-extrapolate IDWT (FreeRDP progressive.c progressive_rfx_idwt_x/y)
-
-/// Strided access into a span: element i of a line at `base` with `step`.
-struct Line {
-    std::span<std::int16_t> data;
-    std::size_t base = 0;
-    std::size_t step = 1;
-    [[nodiscard]] std::int16_t& operator[](std::size_t i) const { return data[base + (i * step)]; }
-};
-
-/// Inverse lifting on one line of `low` (low_count) and `high` (high_count)
-/// coefficients into `dst`.
-void idwt_line(const Line& low, const Line& high, const Line& dst, std::size_t low_count,
-               std::size_t high_count) noexcept
-{
-    std::int32_t h0 = high[0];
-    std::int32_t l0 = low[0];
-    std::int32_t x0 = clamp_i16(l0 - h0);
-    std::int32_t x2 = x0;
-    std::size_t li = 1;
-    std::size_t hi = 1;
-    std::size_t di = 0;
-    for (std::size_t j = 0; j + 1 < high_count; ++j) {
-        const std::int32_t h1 = high[hi++];
-        l0 = low[li++];
-        x2 = clamp_i16(l0 - ((h0 + h1) / 2));
-        const std::int32_t x1 = clamp_i16(((x0 + x2) / 2) + (2 * h0));
-        dst[di++] = static_cast<std::int16_t>(x0);
-        dst[di++] = static_cast<std::int16_t>(x1);
-        x0 = x2;
-        h0 = h1;
-    }
-    if (low_count <= high_count + 1) {
-        if (low_count <= high_count) {
-            dst[di++] = static_cast<std::int16_t>(x2);
-            dst[di] = clamp_i16(x2 + (2 * h0));
-        } else {
-            l0 = low[li];
-            x0 = clamp_i16(l0 - h0);
-            dst[di++] = static_cast<std::int16_t>(x2);
-            dst[di++] = clamp_i16(((x0 + x2) / 2) + (2 * h0));
-            dst[di] = static_cast<std::int16_t>(x0);
-        }
-    } else {
-        l0 = low[li++];
-        x0 = clamp_i16(l0 - (h0 / 2));
-        dst[di++] = static_cast<std::int16_t>(x2);
-        dst[di++] = clamp_i16(((x0 + x2) / 2) + (2 * h0));
-        dst[di++] = static_cast<std::int16_t>(x0);
-        l0 = low[li];
-        dst[di] = clamp_i16((x0 + l0) / 2);
-    }
-}
-
-[[nodiscard]] constexpr std::size_t band_l_count(std::size_t level) noexcept
-{
-    return (64U >> level) + 1;
-}
-
-[[nodiscard]] constexpr std::size_t band_h_count(std::size_t level) noexcept
-{
-    return level == 1 ? (64U >> 1U) - 1 : (64U + (1U << (level - 1))) >> level;
-}
-
-void dwt_decode_extrapolate_block(std::span<std::int16_t> buf, std::span<std::int16_t> temp, std::size_t level) noexcept
-{
-    const std::size_t nl = band_l_count(level);
-    const std::size_t nh = band_h_count(level);
-    const std::size_t step = nl + nh;
-    const std::size_t hl = 0;
-    const std::size_t lh = hl + (nh * nl);
-    const std::size_t hh = lh + (nl * nh);
-    const std::size_t ll = hh + (nh * nh);
-    const std::size_t l = 0;
-    const std::size_t h = nl * step;
-    // Horizontal (LL + HL -> L), nl rows.
-    for (std::size_t i = 0; i < nl; ++i) {
-        idwt_line({buf, ll + (i * nl), 1}, {buf, hl + (i * nh), 1}, {temp, l + (i * step), 1}, nl, nh);
-    }
-    // Horizontal (LH + HH -> H), nh rows.
-    for (std::size_t i = 0; i < nh; ++i) {
-        idwt_line({buf, lh + (i * nl), 1}, {buf, hh + (i * nh), 1}, {temp, h + (i * step), 1}, nl, nh);
-    }
-    // Vertical (L + H -> LL), one column at a time.
-    for (std::size_t i = 0; i < step; ++i) {
-        idwt_line({temp, l + i, step}, {temp, h + i, step}, {buf, i, step}, nl, nh);
-    }
-}
-
-}  // namespace
-
-void dwt_encode(Coefficients& data, Coefficients& scratch) noexcept
-{
-    const std::span<std::int16_t> buf(data);
-    dwt_encode_block(buf, scratch, 32);
-    dwt_encode_block(buf.subspan(3072), scratch, 16);
-    dwt_encode_block(buf.subspan(3840), scratch, 8);
-}
-
-void dwt_decode(Coefficients& data, Coefficients& scratch) noexcept
-{
-    const std::span<std::int16_t> buf(data);
-    dwt_decode_block(buf.subspan(3840), scratch, 8);
-    dwt_decode_block(buf.subspan(3072), scratch, 16);
-    dwt_decode_block(buf, scratch, 32);
-}
-
-void dwt_decode_extrapolate(Coefficients& data, Coefficients& scratch) noexcept
-{
-    const std::span<std::int16_t> buf(data);
-    dwt_decode_extrapolate_block(buf.subspan(3807), scratch, 3);
-    dwt_decode_extrapolate_block(buf.subspan(3007), scratch, 2);
-    dwt_decode_extrapolate_block(buf, scratch, 1);
-}
-
-// ---------------------------------------------------------------------------
-// Quantization (FreeRDP rfx_quantization.c, progressive.c)
-
-namespace {
-
-void quantize_block(std::span<std::int16_t> block, std::uint32_t factor) noexcept
-{
-    if (factor == 0) {
-        return;
-    }
-    const std::int32_t half = std::int32_t{1} << (factor - 1);
-    for (auto& v : block) {
-        v = to_i16((v + half) >> factor);
-    }
-}
-
-}  // namespace
-
-void quantize(Coefficients& data, const Quant& quant) noexcept
-{
-    const std::span<std::int16_t> buf(data);
-    for (std::size_t b = 0; b < band_count; ++b) {
-        FARLAND_ASSERT(quant.bands[b] >= 6 && quant.bands[b] <= 15);
-        const auto& band = standard_layout[b];
-        quantize_block(buf.subspan(band.offset, band.size), quant.bands[b] - 6U);
-    }
-    // The colour transform scaled everything by 32 (11.5 fixed point).
-    quantize_block(buf, 5);
-}
+// Dequantization and differential coding (FreeRDP rfx_quantization.c,
+// progressive.c, rfx_differential.h)
 
 bool dequantize(Coefficients& data, const Layout& layout, const Quant& shift) noexcept
 {
@@ -394,10 +132,17 @@ std::uint32_t BitReader::peek32() const noexcept
     const std::size_t byte = position_ / 8;
     const auto shift = static_cast<std::uint32_t>(position_ % 8);
     std::uint64_t window = 0;
-    for (std::size_t i = 0; i < 5; ++i) {
-        window <<= 8U;
-        if (byte < data_.size() && i < data_.size() - byte) {
-            window |= std::to_integer<std::uint64_t>(data_[byte + i]);
+    if (byte < data_.size() && data_.size() - byte >= 5) {
+        const auto b = data_.subspan(byte, 5);
+        window = (std::to_integer<std::uint64_t>(b[0]) << 32U) | (std::to_integer<std::uint64_t>(b[1]) << 24U) |
+                 (std::to_integer<std::uint64_t>(b[2]) << 16U) | (std::to_integer<std::uint64_t>(b[3]) << 8U) |
+                 std::to_integer<std::uint64_t>(b[4]);
+    } else {
+        for (std::size_t i = 0; i < 5; ++i) {
+            window <<= 8U;
+            if (byte < data_.size() && i < data_.size() - byte) {
+                window |= std::to_integer<std::uint64_t>(data_[byte + i]);
+            }
         }
     }
     return static_cast<std::uint32_t>(window >> (8U - shift));
@@ -448,7 +193,8 @@ void BitWriter::flush()
 }
 
 // ---------------------------------------------------------------------------
-// RLGR (FreeRDP rfx_rlgr.c, [MS-RDPRFX] 3.1.8.1.7.3)
+// RLGR decoding (FreeRDP rfx_rlgr.c, [MS-RDPRFX] 3.1.8.1.7.3; the encoder is
+// in rfx_kernels.cpp)
 
 namespace {
 
@@ -458,36 +204,6 @@ constexpr std::int32_t up_gr = 4;     // UP_GR: kp increase after a zero run in 
 constexpr std::int32_t dn_gr = 6;     // DN_GR: kp decrease after a nonzero symbol in RL mode
 constexpr std::int32_t uq_gr = 3;     // UQ_GR: kp increase after a zero symbol in GR mode
 constexpr std::int32_t dq_gr = 3;     // DQ_GR: kp decrease after a nonzero symbol in GR mode
-
-/// UpdateParam: adds `delta`, clamps to [0, KPMAX], returns param >> LSGR.
-std::uint32_t update_param(std::uint32_t& param, std::int32_t delta) noexcept
-{
-    const std::int64_t v = std::clamp<std::int64_t>(std::int64_t{param} + delta, 0, kp_max);
-    param = static_cast<std::uint32_t>(v);
-    return param >> lsgr;
-}
-
-/// Golomb-Rice code of a non-negative value (rfx_rlgr_code_gr).
-void code_gr(BitWriter& bs, std::uint32_t& krp, std::uint32_t val)
-{
-    const std::uint32_t kr = krp >> lsgr;
-    const std::uint32_t vk = val >> kr;
-    bs.put_repeated(true, vk);
-    bs.put(0, 1);
-    if (kr > 0) {
-        bs.put(val & ((1U << kr) - 1U), kr);
-    }
-    if (vk == 0) {
-        update_param(krp, -2);
-    } else if (vk > 1) {
-        update_param(krp, static_cast<std::int32_t>(std::min<std::uint32_t>(vk, kp_max)));
-    }
-}
-
-[[nodiscard]] constexpr std::uint32_t two_mag_sign(std::int32_t input) noexcept
-{
-    return input >= 0 ? static_cast<std::uint32_t>(2 * input) : static_cast<std::uint32_t>((-2 * input) - 1);
-}
 
 /// Counts consecutive bits equal to `bit` from the current position, at most
 /// the bits remaining, and consumes them (the lzcnt loops of rfx_rlgr_decode).
@@ -512,60 +228,6 @@ std::size_t count_run(BitReader& bs, bool bit) noexcept
 }
 
 }  // namespace
-
-void rlgr_encode(RlgrMode mode, std::span<const std::int16_t> data, std::vector<std::byte>& out)
-{
-    BitWriter bs(out);
-    std::uint32_t k = 1;
-    std::uint32_t kp = 1U << lsgr;
-    std::uint32_t krp = 1U << lsgr;
-    std::size_t idx = 0;
-    // GetNextInput: zeros once the input is exhausted.
-    const auto next = [&]() -> std::int32_t { return idx < data.size() ? data[idx++] : 0; };
-
-    while (idx < data.size()) {
-        if (k != 0) {
-            // Run-length mode: a run of zeros, then the value that ends it.
-            std::uint32_t zeros = 0;
-            std::int32_t input = next();
-            while (input == 0 && idx < data.size()) {
-                ++zeros;
-                input = next();
-            }
-            std::uint32_t runmax = 1U << k;
-            while (zeros >= runmax) {
-                bs.put(0, 1);
-                zeros -= runmax;
-                k = update_param(kp, up_gr);
-                runmax = 1U << k;
-            }
-            bs.put(1, 1);
-            bs.put(zeros, k);
-            const auto mag = static_cast<std::uint32_t>(input < 0 ? -input : input);
-            bs.put(input < 0 ? 1U : 0U, 1);
-            code_gr(bs, krp, mag > 0 ? mag - 1 : 0);
-            k = update_param(kp, -dn_gr);
-        } else if (mode == RlgrMode::rlgr1) {
-            // Golomb-Rice mode, RLGR1: one value as 2 * magnitude - sign.
-            const std::uint32_t two_ms = two_mag_sign(next());
-            code_gr(bs, krp, two_ms);
-            k = two_ms != 0 ? update_param(kp, -dq_gr) : update_param(kp, uq_gr);
-        } else {
-            // Golomb-Rice mode, RLGR3: the sum of two values, then the first.
-            const std::uint32_t two_ms1 = two_mag_sign(next());
-            const std::uint32_t two_ms2 = two_mag_sign(next());
-            const std::uint32_t sum = two_ms1 + two_ms2;
-            code_gr(bs, krp, sum);
-            bs.put(two_ms1, static_cast<std::uint32_t>(std::bit_width(sum)));
-            if (two_ms1 != 0 && two_ms2 != 0) {
-                k = update_param(kp, -2 * dq_gr);
-            } else if (two_ms1 == 0 && two_ms2 == 0) {
-                k = update_param(kp, 2 * uq_gr);
-            }
-        }
-    }
-    bs.flush();
-}
 
 Result<void> rlgr_decode(RlgrMode mode, std::span<const std::byte> src, std::span<std::int16_t> out) noexcept
 {
@@ -686,7 +348,7 @@ Result<void> rlgr_decode(RlgrMode mode, std::span<const std::byte> src, std::spa
 }
 
 // ---------------------------------------------------------------------------
-// Upgrade passes (FreeRDP progressive.c)
+// Upgrade passes, decoder side (FreeRDP progressive.c)
 
 std::int16_t srl_read(UpgradeState& state, std::uint32_t num_bits) noexcept
 {
@@ -763,6 +425,79 @@ void upgrade_band(UpgradeState& state, std::span<std::int16_t> current, std::spa
             sign[i] = input;
             add(i, input);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade passes, encoder side ([MS-RDPEGFX] 3.2.8.1.5.2 and 3.1.8.1.5): the
+// exact mirror of srl_read and upgrade_band.
+
+namespace {
+
+/// Zero runs of the SRL stream, as srl_read consumes them: a 0 bit for each
+/// full run of 2^k zeros (k = kp / 8, kp growing by 4), then a 1 bit and the
+/// rest in k bits.
+void srl_put_run(BitWriter& bits, std::uint32_t& kp, std::uint32_t zeros)
+{
+    std::uint32_t k = kp / 8;
+    while (zeros >= (1U << k)) {
+        bits.put(0, 1);
+        zeros -= 1U << k;
+        kp = std::min(kp + 4, kp_max);
+        k = kp / 8;
+    }
+    bits.put(1, 1);
+    bits.put(zeros, k);
+}
+
+}  // namespace
+
+void upgrade_encode_band(std::span<const std::int16_t> sb, std::uint32_t from, std::uint32_t to, BitWriter& srl_bits,
+                         BitWriter& raw_bits, std::uint32_t& kp, std::uint32_t& zeros)
+{
+    FARLAND_ASSERT(from > to && from - to < 16);
+    const std::uint32_t num_bits = from - to;
+    const std::uint32_t max = (1U << num_bits) - 1;
+    for (const std::int16_t v : sb) {
+        const auto magnitude = static_cast<std::uint32_t>(v < 0 ? -std::int32_t{v} : std::int32_t{v});
+        if ((magnitude >> from) != 0) {
+            // The decoder has a nonzero value, so it knows the sign: the next
+            // bits of the magnitude go out raw.
+            raw_bits.put((magnitude >> to) & max, num_bits);
+            continue;
+        }
+        const std::uint32_t q = magnitude >> to;  // at most `max`
+        if (q == 0) {
+            ++zeros;
+            continue;
+        }
+        srl_put_run(srl_bits, kp, zeros);
+        zeros = 0;
+        // Unary magnitude: sign, q - 1 zeros, and a 1 unless q is the largest.
+        srl_bits.put(v < 0 ? 1 : 0, 1);
+        kp = kp < 6 ? 0 : kp - 6;
+        if (num_bits > 1) {
+            srl_bits.put_repeated(false, q - 1);
+            if (q < max) {
+                srl_bits.put(1, 1);
+            }
+        }
+    }
+}
+
+void upgrade_encode_finish(BitWriter& srl_bits, std::vector<std::byte>& srl, std::uint32_t& kp, std::uint32_t& zeros)
+{
+    // Trailing zeros as full runs; the last may reach past the band's end,
+    // which the decoder never reads.
+    while (zeros > 0) {
+        const std::uint32_t run = 1U << (kp / 8);
+        srl_bits.put(0, 1);
+        zeros = zeros > run ? zeros - run : 0;
+        kp = std::min(kp + 4, kp_max);
+    }
+    srl_bits.flush();
+    if (!srl.empty()) {
+        srl.push_back(std::byte{0});
     }
 }
 

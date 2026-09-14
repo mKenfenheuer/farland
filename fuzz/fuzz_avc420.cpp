@@ -7,11 +7,15 @@
 //   2: an H.264 Annex B byte stream.
 // Every stream that parses must re-encode to a stream that parses to the same
 // values, and the H.264 bitstreams inside are split into NAL units as well.
+// AVC444 region rectangles that fit a 64x64 picture are also applied to one
+// the way a client combines the views (codec/yuv444.hpp), in both versions.
 
 #include <farland/base/assert.hpp>
 #include <farland/base/reader.hpp>
 #include <farland/codec/avc420.hpp>
 #include <farland/codec/h264_nal.hpp>
+#include <farland/codec/yuv.hpp>
+#include <farland/codec/yuv444.hpp>
 
 #include "fuzz.hpp"
 
@@ -57,6 +61,48 @@ void check_avc420(std::span<const std::byte> input)
     check_same(*stream, *again);
 }
 
+/// Combines two constant 64x64 views over the regions that fit, as a client
+/// would, and checks that the samples land where they belong.
+void combine_regions(const avc::Avc444Stream& stream)
+{
+    constexpr std::uint32_t side = 64;
+    Yuv420Frame main(side, side);
+    Yuv420Frame aux(side, side);
+    std::ranges::fill(main.y(), std::byte{1});
+    std::ranges::fill(main.u(), std::byte{2});
+    std::ranges::fill(main.v(), std::byte{3});
+    std::ranges::fill(aux.y(), std::byte{4});
+    std::ranges::fill(aux.u(), std::byte{5});
+    std::ranges::fill(aux.v(), std::byte{6});
+    const auto usable = [](const avc::Region& region) {
+        const auto& r = region.rect;
+        return r.right <= side && r.bottom <= side && r.left % 2 == 0 && r.top % 2 == 0;
+    };
+    for (const auto version : {Avc444Version::v1, Avc444Version::v2}) {
+        Yuv444Frame out(side, side);
+        const auto* luma = stream.layout == avc::Avc444Layout::chroma ? nullptr : &stream.first;
+        const auto* chroma = stream.layout == avc::Avc444Layout::luma_and_chroma ? &*stream.second
+                             : stream.layout == avc::Avc444Layout::chroma        ? &stream.first
+                                                                                 : nullptr;
+        if (luma != nullptr) {
+            for (const auto& region : luma->regions) {
+                if (usable(region)) {
+                    apply_main_view(main.view(), region.rect, out);
+                }
+            }
+        }
+        if (chroma != nullptr) {
+            for (const auto& region : chroma->regions) {
+                if (usable(region)) {
+                    apply_aux_view(aux.view(), version, region.rect, out);
+                }
+            }
+        }
+        const auto y = out.view().y;
+        FARLAND_ASSERT(std::ranges::all_of(y, [](std::byte b) { return b == std::byte{0} || b == std::byte{1}; }));
+    }
+}
+
 void check_avc444(std::span<const std::byte> input)
 {
     const auto stream = avc::decode_avc444(input);
@@ -79,6 +125,7 @@ void check_avc444(std::span<const std::byte> input)
     if (stream->second.has_value()) {
         check_same(*stream->second, *again->second);
     }
+    combine_regions(*stream);
 }
 
 }  // namespace

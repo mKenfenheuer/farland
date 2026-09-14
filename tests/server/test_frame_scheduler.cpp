@@ -103,6 +103,18 @@ TEST_CASE("Lost acknowledgements expire, and suspension stops the gating")
     CHECK(s.frames_in_flight() == 0);
 }
 
+TEST_CASE("The frame-rate cap follows the quality tier")
+{
+    FrameScheduler s(config(8, 50));  // 20 ms per frame
+    s.damage();
+    s.frame_sent(1, t0);
+    s.set_max_fps(10);  // 100 ms per frame
+    s.damage();
+    CHECK_FALSE(s.due(t0 + 50ms));
+    CHECK(s.wait(t0 + 50ms) == 50ms);
+    CHECK(s.due(t0 + 100ms));
+}
+
 TEST_CASE("Without acknowledgements only the frame rate limits")
 {
     auto c = config(1);

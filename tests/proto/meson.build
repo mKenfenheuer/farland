@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 unit_test_sources += files(
+  'test_autodetect.cpp',
   'test_capabilities.cpp',
   'test_framing.cpp',
   'test_gcc.cpp',

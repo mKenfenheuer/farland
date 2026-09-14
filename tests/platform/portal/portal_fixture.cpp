@@ -97,16 +97,48 @@ std::string mock_script()
         .string();
 }
 
-/// A connection to the private bus for inspecting the mock.
+/// A connection to the private bus for inspecting the mock; null if it
+/// cannot be made. No Catch2 assertions: helper threads get here, and Catch2
+/// is not thread-safe.
 platform::portal::detail::BusPtr connect(const std::string& address)
 {
     sd_bus* raw = nullptr;
-    REQUIRE(sd_bus_new(&raw) >= 0);
+    if (sd_bus_new(&raw) < 0) {
+        return nullptr;
+    }
     platform::portal::detail::BusPtr bus(raw);
-    REQUIRE(sd_bus_set_address(raw, address.c_str()) >= 0);
-    REQUIRE(sd_bus_set_bus_client(raw, 1) >= 0);
-    REQUIRE(sd_bus_start(raw) >= 0);
+    if (sd_bus_set_address(raw, address.c_str()) < 0 || sd_bus_set_bus_client(raw, 1) < 0 || sd_bus_start(raw) < 0) {
+        return nullptr;
+    }
     return bus;
+}
+
+/// The calls the mock saw; nullopt if it cannot be asked. No Catch2
+/// assertions either.
+std::optional<std::vector<std::string>> fetch_calls(const std::string& address)
+{
+    auto bus = connect(address);
+    if (!bus) {
+        return std::nullopt;
+    }
+    platform::portal::detail::BusError error;
+    sd_bus_message* raw = nullptr;
+    if (sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock", "org.farland.Mock",
+                           "Calls", error.get(), &raw, "") < 0) {
+        return std::nullopt;
+    }
+    platform::portal::detail::MessagePtr reply(raw);
+    char** strv = nullptr;
+    if (sd_bus_message_read_strv(reply.get(), &strv) < 0) {
+        return std::nullopt;
+    }
+    std::vector<std::string> result;
+    for (char** s = strv; s != nullptr && *s != nullptr; ++s) {
+        result.emplace_back(*s);
+        std::free(*s);  // NOLINT(cppcoreguidelines-no-malloc)
+    }
+    std::free(strv);  // NOLINT(cppcoreguidelines-no-malloc)
+    return result;
 }
 
 }  // namespace
@@ -158,23 +190,9 @@ MockPortal::~MockPortal()
 
 std::vector<std::string> MockPortal::calls() const
 {
-    auto bus = connect(address_);
-    platform::portal::detail::BusError error;
-    sd_bus_message* raw = nullptr;
-    const int r = sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock",
-                                     "org.farland.Mock", "Calls", error.get(), &raw, "");
-    platform::portal::detail::MessagePtr reply(raw);
-    INFO(error.message());
-    REQUIRE(r >= 0);
-    char** strv = nullptr;
-    REQUIRE(sd_bus_message_read_strv(reply.get(), &strv) >= 0);
-    std::vector<std::string> result;
-    for (char** s = strv; s != nullptr && *s != nullptr; ++s) {
-        result.emplace_back(*s);
-        std::free(*s);  // NOLINT(cppcoreguidelines-no-malloc)
-    }
-    std::free(strv);  // NOLINT(cppcoreguidelines-no-malloc)
-    return result;
+    auto seen = fetch_calls(address_);
+    REQUIRE(seen.has_value());
+    return std::move(*seen);
 }
 
 std::vector<std::string> MockPortal::wait_for_calls(std::size_t count, platform::portal::PortalSession* session) const
@@ -184,7 +202,7 @@ std::vector<std::string> MockPortal::wait_for_calls(std::size_t count, platform:
         if (session != nullptr) {
             session->process();
         }
-        auto seen = calls();
+        auto seen = fetch_calls(address_).value_or(std::vector<std::string>{});
         if (seen.size() >= count || std::chrono::steady_clock::now() > deadline) {
             return seen;
         }
@@ -192,12 +210,15 @@ std::vector<std::string> MockPortal::wait_for_calls(std::size_t count, platform:
     }
 }
 
-void MockPortal::close_sessions() const
+bool MockPortal::close_sessions() const
 {
     auto bus = connect(address_);
+    if (!bus) {
+        return false;
+    }
     platform::portal::detail::BusError error;
-    REQUIRE(sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock", "org.farland.Mock",
-                               "CloseSessions", error.get(), nullptr, "") >= 0);
+    return sd_bus_call_method(bus.get(), "org.freedesktop.portal.Desktop", "/org/farland/Mock", "org.farland.Mock",
+                              "CloseSessions", error.get(), nullptr, "") >= 0;
 }
 
 platform::portal::PortalOptions MockPortal::options() const

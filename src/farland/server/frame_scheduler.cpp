@@ -7,11 +7,25 @@
 
 namespace farland::server {
 
-FrameScheduler::FrameScheduler(Config config)
-    : config_(config), interval_(std::chrono::duration_cast<Clock::duration>(
-                           std::chrono::microseconds(1'000'000 / std::max(config.max_fps, 1U))))
+namespace {
+
+FrameScheduler::Clock::duration frame_interval(unsigned fps)
+{
+    return std::chrono::duration_cast<FrameScheduler::Clock::duration>(
+        std::chrono::microseconds(1'000'000 / std::max(fps, 1U)));
+}
+
+}  // namespace
+
+FrameScheduler::FrameScheduler(Config config) : config_(config), interval_(frame_interval(config.max_fps))
 {
     config_.max_frames_in_flight = std::max<std::size_t>(config_.max_frames_in_flight, 1);
+}
+
+void FrameScheduler::set_max_fps(unsigned fps) noexcept
+{
+    config_.max_fps = fps;
+    interval_ = frame_interval(fps);
 }
 
 void FrameScheduler::frame_sent(std::uint32_t frame_id, Clock::time_point now)

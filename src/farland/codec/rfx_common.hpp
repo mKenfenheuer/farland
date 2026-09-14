@@ -30,6 +30,12 @@
 /// codec is lossy and both ends must agree on every intermediate value.
 /// Where FreeRDP relies on unchecked casts, farland wraps modulo 2^16 (the
 /// behaviour of a release FreeRDP build) instead of asserting.
+///
+/// The encoder's hot paths (colour conversion, DWTs, quantization, RLGR
+/// encoding) run as kernels over the fixed-size tile arrays
+/// (rfx_kernels.cpp): loops the compiler vectorises, and hand-written SSE2,
+/// AVX2 and NEON colour conversion. They are chosen at run time (Isa) and
+/// every variant gives the same bits as the scalar one.
 namespace farland::codec::rfx {
 
 inline constexpr std::size_t tile_size = 64;
@@ -196,6 +202,15 @@ void store_tile(const Planes& planes, std::span<std::byte> out);
 void dwt_encode(Coefficients& data, Coefficients& scratch) noexcept;
 /// Inverse of dwt_encode ([MS-RDPRFX] 3.1.8.2.4, FreeRDP rfx_dwt_2d_decode).
 void dwt_decode(Coefficients& data, Coefficients& scratch) noexcept;
+/// Forward reduce-extrapolate DWT ([MS-RDPEGFX] 3.2.8.1.2.2): the first level
+/// extends each line of 64 by a 65th value extrapolated from the last two and
+/// gives 33 low and 31 high coefficients, the next levels 17 + 16 and 9 + 8.
+/// The result is in extrapolate_layout. FreeRDP has no forward transform;
+/// this one is the exact inverse of dwt_decode_extrapolate's lifting steps
+/// except for the rounding of the high bands (1/32 of a pixel level per
+/// step, at most a fifth of a level after three levels), and saturates
+/// instead of wrapping where extrapolated values leave int16.
+void dwt_encode_extrapolate(Coefficients& data, Coefficients& scratch) noexcept;
 /// Inverse reduce-extrapolate DWT ([MS-RDPEGFX] 3.3.8.2.2, FreeRDP
 /// rfx_dwt_2d_extrapolate_decode). Data is in extrapolate_layout.
 void dwt_decode_extrapolate(Coefficients& data, Coefficients& scratch) noexcept;
@@ -203,10 +218,10 @@ void dwt_decode_extrapolate(Coefficients& data, Coefficients& scratch) noexcept;
 // ---------------------------------------------------------------------------
 // Quantization ([MS-RDPRFX] 3.1.8.1.5 and 3.1.8.2.3).
 
-/// FreeRDP rfx_quantization_encode: per band a rounding right shift by
-/// (quant - 6), then a rounding shift by 5 that removes the 11.5 scaling of
-/// the colour transform. Asserts every factor in 6..15.
-void quantize(Coefficients& data, const Quant& quant) noexcept;
+/// FreeRDP rfx_quantization_encode: per band of `layout` a rounding right
+/// shift by (quant - 6), then a rounding shift by 5 that removes the 11.5
+/// scaling of the colour transform. Asserts every factor in 6..15.
+void quantize(Coefficients& data, const Quant& quant, const Layout& layout = standard_layout) noexcept;
 
 /// Left-shifts every band by `shift[band]` (FreeRDP lShiftC_16s_inplace,
 /// wrapping modulo 2^16). Returns false, leaving `data` partly shifted, if a
@@ -302,5 +317,36 @@ struct UpgradeState {
 /// otherwise, updating `sign`; the LL band reads raw bits only.
 void upgrade_band(UpgradeState& state, std::span<std::int16_t> current, std::span<std::int16_t> sign,
                   std::uint32_t shift, std::uint32_t num_bits, bool non_ll) noexcept;
+
+/// Appends the upgrade of one non-LL band from extra quantization `from` to
+/// `to` (from > to, from - to < 16) to `srl_bits` and `raw_bits`. `sb` holds
+/// the band's quantized coefficients at full quality: the decoder has
+/// trunc(sb / 2^from) * 2^from of each ([MS-RDPEGFX] 3.2.8.1.5.1) and gets
+/// the next from - to bits. `kp` is the SRL state, shared by the bands of a
+/// component and starting at 8; `zeros` the pending zero run.
+void upgrade_encode_band(std::span<const std::int16_t> sb, std::uint32_t from, std::uint32_t to, BitWriter& srl_bits,
+                         BitWriter& raw_bits, std::uint32_t& kp, std::uint32_t& zeros);
+/// Ends the SRL stream of a component: the pending zero run, then the
+/// padding and the extra zero byte of [MS-RDPEGFX] 3.1.8.1.5 (only when the
+/// stream has any bits).
+void upgrade_encode_finish(BitWriter& srl_bits, std::vector<std::byte>& srl, std::uint32_t& kp, std::uint32_t& zeros);
+
+// ---------------------------------------------------------------------------
+// Kernel selection.
+
+/// Instruction sets the kernels can use. `scalar` is plain C++ without
+/// explicit vector code (the compiler may still vectorise it for the
+/// baseline of the target: SSE2 on x86-64, NEON on aarch64).
+enum class Isa : std::uint8_t { scalar, sse2, avx2, neon };
+
+/// The instruction sets this CPU runs, `scalar` first and the best last.
+[[nodiscard]] std::span<const Isa> available_isas() noexcept;
+/// The instruction set the kernels use: the best available unless
+/// set_isa() chose another.
+[[nodiscard]] Isa active_isa() noexcept;
+/// Uses `isa` (asserted to be available) from now on, for tests and
+/// benchmarks. Affects every thread.
+void set_isa(Isa isa) noexcept;
+[[nodiscard]] const char* isa_name(Isa isa) noexcept;
 
 }  // namespace farland::codec::rfx

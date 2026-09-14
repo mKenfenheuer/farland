@@ -227,7 +227,7 @@ TEST_CASE("Portal session: Closed while the dialog is open")
     PortalSession session;
     std::thread closer([&] {
         static_cast<void>(mock->wait_for_calls(4));
-        mock->close_sessions();
+        static_cast<void>(mock->close_sessions());
     });
     CHECK(error_code(session.start(mock->options())) == PortalErrc::closed);
     closer.join();

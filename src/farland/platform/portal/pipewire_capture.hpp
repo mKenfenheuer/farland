@@ -45,6 +45,18 @@ enum class CaptureState : std::uint8_t {
 /// picks up the results through frames() and cursor(), which follow the
 /// threading model of backend.hpp.
 ///
+/// With FrameAccess::dmabuf (FrameSource::set_access), dmabuf frames are not
+/// read at all: the capture keeps the newest buffer dequeued and hands it out
+/// as Frame::dmabuf, with descriptors of its own. It keeps at most two
+/// dequeued, the one the session took last and the newest pending one (an
+/// older pending one goes back at once), and passes dmabufs on only when the
+/// stream has at least four buffers, so the producer never runs dry. The
+/// session's buffer goes back to the producer on its next take_frame() or
+/// release_frame(), or when PipeWire renegotiates the buffers (which bumps
+/// Dmabuf::generation). map_frame() reads a held frame on the session
+/// thread when the session needs its pixels after all. Shared-memory frames
+/// and cropped ones are always read.
+///
 /// When the stream closes, both wake fds stay readable (like a socket at end
 /// of file) and state() returns CaptureState::closed; the session should then
 /// stop polling them and end or restart the portal session.

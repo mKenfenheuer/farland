@@ -4,8 +4,10 @@
 # Every parser of network input gets a target here (CONTRIBUTING.md): the
 # source is fuzz_<name>.cpp and the seeds live in corpus/<name>/.
 fuzz_targets = {
+  'autodetect': farland_server_dep,
   'avc420': farland_codec_dep,
   'ber': farland_base_dep,
+  'clear': farland_codec_dep,
   'per': farland_base_dep,
   'credssp': farland_auth_dep,
   'drdynvc': farland_channels_dep,

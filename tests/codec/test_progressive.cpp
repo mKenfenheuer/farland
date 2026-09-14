@@ -857,3 +857,304 @@ TEST_CASE("Tiles of one frame are re-copied for later regions of the frame", "[c
     CHECK(psnr(img.view(), same_frame->image()) >= 40.0);
     CHECK(psnr(img.view(), new_frame->image()) >= 40.0);
 }
+
+// ---------------------------------------------------------------------------
+// Reduce-extrapolate and progressive refinement
+
+namespace {
+
+const progressive::EncoderOptions refine_options{
+    .quant = progressive::quant_highest, .reduce_extrapolate = true, .refine = true};
+
+/// Calls upgrade() with `budget` until no tile is pending, decoding every
+/// stream; returns the number of calls that produced streams.
+std::size_t refine_fully(progressive::Encoder& encoder, progressive::Decoder& decoder, std::uint32_t& frame_id,
+                         std::size_t budget, const ImageView* image = nullptr, std::vector<double>* quality = nullptr)
+{
+    std::size_t calls = 0;
+    while (encoder.pending_tiles() > 0) {
+        const auto streams = encoder.upgrade(budget);
+        REQUIRE(!streams.empty());
+        ++calls;
+        REQUIRE(calls < 10000);
+        std::size_t total = 0;
+        ++frame_id;
+        for (const auto& stream : streams) {
+            CHECK(stream.size() <= progressive::default_max_bytes);
+            total += stream.size();
+            const auto result = decoder.decode(stream, frame_id);
+            INFO((result ? std::string("ok") : result.error().message()));
+            REQUIRE(result.has_value());
+        }
+        CHECK(total <= budget);
+        if (image != nullptr && quality != nullptr) {
+            quality->push_back(psnr(*image, decoder.image()));
+        }
+    }
+    return calls;
+}
+
+std::vector<std::byte> single_pass_pixels(const ImageView& image, const progressive::EncoderOptions& options)
+{
+    progressive::Encoder encoder(image.width, image.height, options);
+    auto decoder = progressive::Decoder::create(image.width, image.height);
+    REQUIRE(decoder.has_value());
+    const std::array full{Rect{.x = 0, .y = 0, .width = image.width, .height = image.height}};
+    round_trip(encoder, *decoder, image, full, 1, options.max_bytes);
+    return pixels_of(*decoder);
+}
+
+}  // namespace
+
+TEST_CASE("Reduce-extrapolate streams round-trip", "[codec][progressive]")
+{
+    const Image img = natural_image(320, 200);
+    progressive::Encoder encoder(320, 200, {.quant = progressive::quant_highest, .reduce_extrapolate = true});
+    auto decoder = progressive::Decoder::create(320, 200);
+    REQUIRE(decoder.has_value());
+    const std::array full{Rect{.x = 0, .y = 0, .width = 320, .height = 200}};
+    const auto streams = round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    CHECK(streams[0][region_at + 11] == std::byte{1});  // RFX_DWT_REDUCE_EXTRAPOLATE
+    CHECK(streams[0][12 + 9] == std::byte{0});          // no RFX_SUBBAND_DIFFING
+    const double quality = psnr(img.view(), decoder->image());
+    INFO("PSNR " << quality << " dB");
+    CHECK(quality >= 40.0);
+}
+
+TEST_CASE("Refinement converges to the single-pass picture bit for bit", "[codec][progressive]")
+{
+    const Image img = natural_image(320, 200);
+    const auto target =
+        single_pass_pixels(img.view(), {.quant = progressive::quant_highest, .reduce_extrapolate = true});
+
+    progressive::Encoder encoder(320, 200, refine_options);
+    auto decoder = progressive::Decoder::create(320, 200);
+    REQUIRE(decoder.has_value());
+    const std::array full{Rect{.x = 0, .y = 0, .width = 320, .height = 200}};
+    const auto first = round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    // The first pass: RFX_SUBBAND_DIFFING, four quality tables, TILE_FIRST at
+    // quality stage 0.
+    CHECK(first[0][12 + 9] == std::byte{1});
+    CHECK(first[0][region_at + 10] == std::byte{4});
+    CHECK(encoder.pending_tiles() == 20);
+    CHECK(encoder.tile_stage(0, 0) == 0);
+    CHECK(encoder.tile_stage(4, 3) == 0);
+    std::vector<double> quality{psnr(img.view(), decoder->image())};
+    CHECK(quality[0] >= 25.0);
+    CHECK(pixels_of(*decoder) != target);
+
+    std::uint32_t frame_id = 1;
+    const auto view = img.view();
+    const std::size_t calls = refine_fully(encoder, *decoder, frame_id, std::size_t{1} << 20, &view, &quality);
+    CHECK(calls == 1);  // a large budget takes every tile to full quality at once
+    CHECK(encoder.tile_stage(0, 0) == progressive::full_quality_stage);
+    CHECK(pixels_of(*decoder) == target);
+    INFO("PSNR first pass " << quality.front() << " dB, final " << quality.back() << " dB");
+    CHECK(quality.back() > quality.front());
+    CHECK(quality.back() >= 40.0);
+    CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+}
+
+TEST_CASE("Upgrades stay within the budget and raise quality stage by stage", "[codec][progressive]")
+{
+    const Image img = natural_image(640, 360, 7);
+    const auto target =
+        single_pass_pixels(img.view(), {.quant = progressive::quant_highest, .reduce_extrapolate = true});
+    progressive::Encoder encoder(640, 360, refine_options);
+    auto decoder = progressive::Decoder::create(640, 360);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 640, .height = 360}};
+    const auto first = round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    std::size_t first_size = 0;
+    for (const auto& s : first) {
+        first_size += s.size();
+    }
+    std::vector<double> quality{psnr(img.view(), decoder->image())};
+    std::uint32_t frame_id = 1;
+    const auto view = img.view();
+    const std::size_t calls = refine_fully(encoder, *decoder, frame_id, 6000, &view, &quality);
+    INFO("first pass " << first_size << " bytes, " << calls << " upgrade calls");
+    CHECK(calls > 3);
+    for (std::size_t i = 1; i < quality.size(); ++i) {
+        CHECK(quality[i] >= quality[i - 1] - 0.05);
+    }
+    CHECK(pixels_of(*decoder) == target);
+}
+
+TEST_CASE("Upgrades can be limited to an area", "[codec][progressive]")
+{
+    const Image img = natural_image(256, 128);
+    progressive::Encoder encoder(256, 128, refine_options);
+    auto decoder = progressive::Decoder::create(256, 128);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 256, .height = 128}};
+    round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    REQUIRE(encoder.pending_tiles() == 8);
+    const std::array left{Rect{.x = 0, .y = 0, .width = 100, .height = 128}};
+    const std::array right{Rect{.x = 128, .y = 0, .width = 128, .height = 128}};
+    CHECK(encoder.pending(left));
+    for (const auto& s : encoder.upgrade(left, std::size_t{1} << 20)) {
+        REQUIRE(decoder->decode(s, 2).has_value());
+    }
+    // Tiles 0 and 1 of both rows are done, the others untouched.
+    CHECK(!encoder.pending(left));
+    CHECK(encoder.pending(right));
+    CHECK(encoder.pending_tiles() == 4);
+    CHECK(encoder.tile_stage(1, 1) == progressive::full_quality_stage);
+    CHECK(encoder.tile_stage(2, 0) == 0);
+    // Another codec paints the right half: its refinement is forgotten.
+    encoder.discard(right);
+    CHECK(encoder.pending_tiles() == 0);
+    CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+}
+
+TEST_CASE("A tile that changes again starts over with TILE_FIRST", "[codec][progressive]")
+{
+    Image img = natural_image(192, 128);
+    progressive::Encoder encoder(192, 128, refine_options);
+    auto decoder = progressive::Decoder::create(192, 128);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 192, .height = 128}};
+    round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    std::uint32_t frame_id = 1;
+    // Half way: every tile at stage 1 or 2.
+    for (const auto& s : encoder.upgrade(std::size_t{1} << 20)) {
+        REQUIRE(decoder->decode(s, ++frame_id).has_value());
+    }
+    REQUIRE(encoder.pending_tiles() == 0);
+
+    for (std::uint32_t y = 10; y < 40; ++y) {
+        for (std::uint32_t x = 50; x < 120; ++x) {
+            img.set(x, y, 250, static_cast<int>(x), 20);
+        }
+    }
+    const std::array damage{Rect{.x = 50, .y = 10, .width = 70, .height = 30}};
+    const auto streams = round_trip(encoder, *decoder, img.view(), damage, ++frame_id, progressive::default_max_bytes);
+    REQUIRE(streams.size() == 1);
+    CHECK(streams[0][region_at + 12] == std::byte{2});  // tiles (0, 0) and (1, 0)
+    CHECK(encoder.pending_tiles() == 2);
+    CHECK(encoder.tile_stage(1, 0) == 0);
+    CHECK(encoder.tile_stage(2, 0) == progressive::full_quality_stage);
+    refine_fully(encoder, *decoder, frame_id, 3000);
+    CHECK(pixels_of(*decoder) ==
+          single_pass_pixels(img.view(), {.quant = progressive::quant_highest, .reduce_extrapolate = true}));
+}
+
+TEST_CASE("Refinement copes with the smallest stream budget", "[codec][progressive]")
+{
+    constexpr std::uint32_t w = 200;
+    constexpr std::uint32_t h = 70;
+    Image img(w, h);
+    std::uint32_t state = 5;
+    for (auto& b : img.data) {
+        state = (state * 1664525U) + 1013904223U;
+        b = static_cast<std::byte>(state >> 24U);
+    }
+    for (const std::size_t max_bytes : {progressive::min_max_bytes, std::size_t{3000}}) {
+        progressive::Encoder encoder(
+            w, h,
+            {.quant = progressive::quant_highest, .max_bytes = max_bytes, .reduce_extrapolate = true, .refine = true});
+        auto decoder = progressive::Decoder::create(w, h);
+        const std::array full{Rect{.x = 0, .y = 0, .width = w, .height = h}};
+        round_trip(encoder, *decoder, img.view(), full, 1, max_bytes);
+        std::uint32_t frame_id = 1;
+        for (int calls = 0; encoder.pending_tiles() > 0; ++calls) {
+            REQUIRE(calls < 1000);
+            const auto streams = encoder.upgrade(max_bytes * 3);
+            ++frame_id;
+            for (const auto& s : streams) {
+                CHECK(s.size() <= max_bytes);
+                REQUIRE(decoder->decode(s, frame_id).has_value());
+            }
+            if (streams.empty()) {
+                break;  // nothing left that fits
+            }
+        }
+        INFO("max_bytes " << max_bytes);
+        CHECK(psnr(img.view(), decoder->image()) >= 10.0);
+    }
+}
+
+TEST_CASE("reset() drops pending refinement", "[codec][progressive]")
+{
+    const Image img = natural_image(128, 64);
+    progressive::Encoder encoder(128, 64, refine_options);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 128, .height = 64}};
+    CHECK(!encoder.encode(img.view(), full).empty());
+    CHECK(encoder.pending_tiles() == 2);
+    encoder.reset();
+    CHECK(encoder.pending_tiles() == 0);
+    CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+    // A flat picture needs no refinement at all.
+    const Image flat(128, 64);
+    CHECK(!encoder.encode(flat.view(), full).empty());
+    CHECK(encoder.pending_tiles() == 0);
+}
+
+TEST_CASE("Single-pass encoders ignore upgrade()", "[codec][progressive]")
+{
+    const Image img = natural_image(64, 64);
+    progressive::Encoder encoder(64, 64);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 64, .height = 64}};
+    CHECK(!encoder.encode(img.view(), full).empty());
+    CHECK(encoder.pending_tiles() == 0);
+    CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+    CHECK(encoder.tile_stage(0, 0) == progressive::full_quality_stage);
+}
+
+TEST_CASE("Refinement keeps BitPos within 15 for coarse quantization", "[codec][progressive]")
+{
+    // Base factors plus the stages' extra quantization would exceed 15 (a
+    // dequantization shift of 16 or more, which decoders reject); the extra
+    // quantization is capped per table instead.
+    const Image img = natural_image(200, 130, 3);
+    for (const std::uint8_t q : {std::uint8_t{12}, std::uint8_t{14}, std::uint8_t{15}}) {
+        INFO("quant " << int{q});
+        const progressive::EncoderOptions options{
+            .quant = rfx::uniform_quant(q), .max_bytes = progressive::min_max_bytes, .reduce_extrapolate = true};
+        progressive::EncoderOptions refined = options;
+        refined.refine = true;
+        progressive::Encoder encoder(200, 130, refined);
+        auto decoder = progressive::Decoder::create(200, 130);
+        const std::array full{Rect{.x = 0, .y = 0, .width = 200, .height = 130}};
+        round_trip(encoder, *decoder, img.view(), full, 1, options.max_bytes);
+        std::uint32_t frame_id = 1;
+        while (encoder.pending_tiles() > 0) {
+            const auto streams = encoder.upgrade(std::size_t{1} << 20);
+            REQUIRE(!streams.empty());
+            ++frame_id;
+            for (const auto& s : streams) {
+                CHECK(s.size() <= options.max_bytes);
+                const auto result = decoder->decode(s, frame_id);
+                INFO((result ? std::string("ok") : result.error().message()));
+                REQUIRE(result.has_value());
+            }
+        }
+        CHECK(pixels_of(*decoder) == single_pass_pixels(img.view(), options));
+    }
+}
+
+TEST_CASE("Tiles refine with the quantization they started with", "[codec][progressive]")
+{
+    const Image img = natural_image(192, 128, 5);
+    progressive::Encoder encoder(192, 128, refine_options);
+    auto decoder = progressive::Decoder::create(192, 128);
+    const std::array full{Rect{.x = 0, .y = 0, .width = 192, .height = 128}};
+    round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes);
+    encoder.set_quant(progressive::quant_default);
+    // A changed tile goes out with the new table, in the same streams as
+    // upgrades of tiles that keep the old one.
+    const std::array one{Rect{.x = 0, .y = 0, .width = 64, .height = 64}};
+    round_trip(encoder, *decoder, img.view(), one, 2, progressive::default_max_bytes);
+    std::uint32_t frame_id = 2;
+    refine_fully(encoder, *decoder, frame_id, std::size_t{1} << 20);
+    // Every tile but (0, 0) matches a single pass at quant_highest.
+    const auto target =
+        single_pass_pixels(img.view(), {.quant = progressive::quant_highest, .reduce_extrapolate = true});
+    const auto got = pixels_of(*decoder);
+    for (std::size_t y = 0; y < 128; ++y) {
+        const std::size_t from = y < 64 ? 64 : 0;
+        const std::size_t at = ((y * 192) + from) * 4;
+        CHECK(std::equal(got.begin() + static_cast<std::ptrdiff_t>(at),
+                         got.begin() + static_cast<std::ptrdiff_t>(y * 192 * 4 + 192 * 4),
+                         target.begin() + static_cast<std::ptrdiff_t>(at)));
+    }
+    CHECK(psnr(img.view(), decoder->image()) >= 34.0);
+}

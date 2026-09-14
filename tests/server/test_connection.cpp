@@ -5,6 +5,7 @@
 // scripted client built from farland's own client-side encoders.
 
 #include <farland/base/hexdump.hpp>
+#include <farland/proto/autodetect.hpp>
 #include <farland/proto/bitmap.hpp>
 #include <farland/proto/client_info.hpp>
 #include <farland/proto/fastpath.hpp>
@@ -17,8 +18,13 @@
 #include <farland/proto/x224.hpp>
 #include <farland/server/connection.hpp>
 
+#include "support/bytes.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <optional>
 #include <vector>
 
 namespace proto = farland::proto;
@@ -704,4 +710,313 @@ TEST_CASE("Pointer updates before activation are dropped")
     static_cast<void>(connect_until_demand_active(c));
     c.send_pointer(proto::pointer::Hidden{});
     CHECK(c.take_output().empty());
+}
+
+// Auto-detect and heartbeats on the message channel -------------------------------
+
+namespace {
+
+namespace ad = farland::proto::autodetect;
+using farland::server::AutoDetectMode;
+using namespace std::chrono_literals;
+
+constexpr std::uint16_t message_channel = 1006;
+const Connection::Clock::time_point t0 = Connection::Clock::time_point{} + 1h;
+constexpr std::uint16_t autodetect_flags = 0x0001 | gcc::cs_early_flags::support_netchar_autodetect;
+
+/// MCS connect, domain and channel joins, up to (not including) Client Info.
+void connect_channels(Connection& c, std::uint16_t early_flags, bool join_message_channel = true)
+{
+    c.tick(t0);
+    c.receive(connect_initial(client_data(proto::protocol::ssl, early_flags)));
+    c.receive(domain(mcs::ErectDomainRequest{}));
+    c.receive(domain(mcs::AttachUserRequest{}));
+    for (const std::uint16_t id : {user_id, mcs::io_channel_id, message_channel}) {
+        if (id != message_channel || join_message_channel) {
+            c.receive(domain(mcs::ChannelJoinRequest{user_id, id}));
+        }
+    }
+    static_cast<void>(c.take_output());
+}
+
+/// A PDU the server sent on the message channel, after its security header.
+struct MessagePdu {
+    std::uint16_t flags = 0;
+    Bytes payload;
+};
+
+std::optional<MessagePdu> message_pdu(const Bytes& tpkt)
+{
+    Bytes storage;
+    const auto pdu = domain_of(tpkt, storage);
+    const auto* send = std::get_if<mcs::SendDataIndication>(&pdu);
+    if (send == nullptr || send->channel_id != message_channel) {
+        return std::nullopt;
+    }
+    CHECK(send->initiator == mcs::server_channel_id);
+    Reader r(send->data);
+    MessagePdu out;
+    out.flags = proto::read_basic_security_header(r).value();
+    out.payload.assign(r.rest().begin(), r.rest().end());
+    return out;
+}
+
+/// The auto-detect request in a message channel PDU.
+ad::Request autodetect_request(const MessagePdu& pdu)
+{
+    CHECK(pdu.flags == proto::sec_flags::autodetect_req);
+    Reader r(pdu.payload);
+    auto request = ad::decode_request(r).value();
+    CHECK(r.empty());
+    return request;
+}
+
+Bytes autodetect_response(const ad::Response& response)
+{
+    Writer w;
+    proto::write_basic_security_header(w, proto::sec_flags::autodetect_rsp);
+    ad::encode(w, response);
+    return io(w.view(), message_channel);
+}
+
+/// The share ID from a Demand Active TPKT.
+std::uint32_t demand_share_id(const Bytes& tpkt)
+{
+    const auto payload = indication(tpkt);
+    Reader r(payload);
+    auto control = proto::read_share_control(r).value();
+    REQUIRE(control.type == proto::pdu_type::demand_active);
+    return proto::decode_demand_active(control.body).value().share_id;
+}
+
+/// Client Info through activation, when no connect-time detection runs.
+void activate_after_joins(Connection& c)
+{
+    c.receive(client_info());
+    const auto out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 2);  // license, Demand Active
+    const auto share_id = demand_share_id(out.tpkt[1]);
+    c.receive(confirm_active(share_id, true));
+    finalize(c, share_id);
+    static_cast<void>(c.take_output());
+    static_cast<void>(events(c));
+    REQUIRE(c.active());
+}
+
+}  // namespace
+
+TEST_CASE("[MS-RDPBCGR] 1.3.1.1: connect-time auto-detect runs between Client Info and licensing")
+{
+    Connection c({}, tls_negotiation());
+    connect_channels(c, autodetect_flags);
+    c.receive(client_info());
+    static_cast<void>(events(c));
+    CHECK(c.state() == State::connect_time_autodetect);
+    CHECK(c.session().autodetect);
+
+    // Only message channel PDUs: an RTT probe, then the bandwidth burst.
+    auto out = split(c.take_output());
+    std::vector<MessagePdu> pdus;
+    for (const auto& tpkt : out.tpkt) {
+        auto pdu = message_pdu(tpkt);
+        REQUIRE(pdu.has_value());
+        pdus.push_back(std::move(*pdu));
+    }
+    REQUIRE(pdus.size() >= 4);
+    const auto rtt = std::get<ad::RttRequest>(autodetect_request(pdus.front()));
+    CHECK(rtt.request_type == ad::request_type::rtt_connect_time);
+    const auto start = std::get<ad::BandwidthStart>(autodetect_request(pdus.at(1)));
+    CHECK(start.request_type == ad::request_type::bw_start_connect_time);
+    std::size_t payload_bytes = 0;
+    for (std::size_t i = 2; i + 1 < pdus.size(); ++i) {
+        const auto request = autodetect_request(pdus[i]);
+        payload_bytes += std::get<ad::BandwidthPayload>(request).payload.size();
+        CHECK(pdus[i].payload.size() + 12 < 16383);  // [MS-RDPBCGR] 2.2: Send Data stays below 16383 bytes
+    }
+    const auto stop_request = autodetect_request(pdus.back());
+    const auto& stop = std::get<ad::BandwidthStop>(stop_request);
+    CHECK(stop.request_type == ad::request_type::bw_stop_connect_time);
+    CHECK(payload_bytes + stop.payload.size() == 64 * 1024);
+
+    // The client answers the probe; licensing waits for the bandwidth results too.
+    c.tick(t0 + 25ms);
+    c.receive(autodetect_response(ad::RttResponse{rtt.sequence}));
+    CHECK(c.take_output().empty());
+    CHECK(c.state() == State::connect_time_autodetect);
+    c.tick(t0 + 60ms);
+    c.receive(autodetect_response(
+        ad::BandwidthResults{start.sequence, ad::response_type::bw_results_connect_time, 32, 64 * 1024}));
+
+    // Network Characteristics Result, license, Demand Active.
+    out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 3);
+    const auto result = message_pdu(out.tpkt[0]);
+    REQUIRE(result.has_value());
+    const auto netchar = std::get<ad::NetworkCharacteristicsResult>(autodetect_request(*result));
+    CHECK(netchar.base_rtt_ms == 25U);
+    CHECK(netchar.average_rtt_ms == 25);
+    CHECK(netchar.bandwidth_kbps == 16384U);  // 65536 bytes in 32 ms
+    {
+        const auto license = indication(out.tpkt[1]);
+        Reader r(license);
+        CHECK(proto::decode_license_valid_client(r).has_value());
+    }
+    CHECK(demand_share_id(out.tpkt[2]) == 0x000103ef);
+    CHECK(c.state() == State::wait_confirm_active);
+    CHECK(c.network().rtt == 25ms);
+    CHECK(c.network().bandwidth_kbps == 16384U);
+}
+
+TEST_CASE("Connect-time auto-detect gives up when the client does not answer")
+{
+    Connection c({}, tls_negotiation());
+    connect_channels(c, autodetect_flags);
+    c.receive(client_info());
+    static_cast<void>(c.take_output());
+    c.tick(t0 + 1s);
+    CHECK(c.take_output().empty());
+    c.tick(t0 + 2s);
+    const auto out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 2);  // license and Demand Active; nothing was measured
+    CHECK_FALSE(message_pdu(out.tpkt[0]).has_value());
+    CHECK(c.state() == State::wait_confirm_active);
+}
+
+TEST_CASE("Auto-detect needs the client's flag, a joined message channel and the server's consent")
+{
+    SECTION("the message channel was not joined")
+    {
+        Connection c({}, tls_negotiation());
+        connect_channels(c, autodetect_flags, false);
+        activate_after_joins(c);
+        CHECK_FALSE(c.session().autodetect);
+    }
+    SECTION("the client does not support it")
+    {
+        Connection c({}, tls_negotiation());
+        connect_channels(c, 0x0001);
+        activate_after_joins(c);
+        CHECK_FALSE(c.session().autodetect);
+    }
+    SECTION("the server has it off")
+    {
+        farland::server::ServerConfig config;
+        config.autodetect = AutoDetectMode::off;
+        Connection c(config, tls_negotiation());
+        connect_channels(c, autodetect_flags);
+        activate_after_joins(c);
+        CHECK_FALSE(c.session().autodetect);
+        c.tick(t0 + 5s);
+        CHECK(c.take_output().empty());
+    }
+    SECTION("skip-channel-join: the message channel counts as joined")
+    {
+        Connection c({}, tls_negotiation());
+        c.tick(t0);
+        c.receive(connect_initial(
+            client_data(proto::protocol::ssl, autodetect_flags | gcc::cs_early_flags::support_skip_channeljoin)));
+        c.receive(domain(mcs::ErectDomainRequest{}));
+        c.receive(domain(mcs::AttachUserRequest{}));
+        c.receive(client_info());
+        CHECK(c.state() == State::connect_time_autodetect);
+    }
+}
+
+TEST_CASE("Continuous auto-detect: RTT probes once active, bandwidth measured around large output")
+{
+    farland::server::ServerConfig config;
+    config.autodetect = AutoDetectMode::continuous;
+    Connection c(config, tls_negotiation());
+    connect_channels(c, autodetect_flags);
+    activate_after_joins(c);  // no connect-time detection
+    REQUIRE(c.session().autodetect);
+
+    c.tick(t0 + 1s);
+    auto out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 1);
+    const auto probe = std::get<ad::RttRequest>(autodetect_request(message_pdu(out.tpkt[0]).value()));
+    CHECK(probe.request_type == ad::request_type::rtt_continuous);
+    c.tick(t0 + 1s + 15ms);
+    c.receive(autodetect_response(ad::RttResponse{probe.sequence}));
+    CHECK(c.network().rtt == 15ms);
+    CHECK(c.state() == State::active);
+    c.tick(t0 + 1s + 500ms);
+    CHECK(c.take_output().empty());  // the next probe is due a second after this one
+
+    // A large burst goes out between a Bandwidth Measure Start and Stop.
+    const std::vector<std::byte> update(40'000, std::byte{0x01});
+    c.send_bitmap_update(update);
+    const auto raw = c.take_output();
+    out = split(raw);
+    REQUIRE(out.tpkt.size() == 2);
+    CHECK_FALSE(out.fastpath.empty());
+    CHECK(std::equal(out.tpkt[0].begin(), out.tpkt[0].end(), raw.begin()));
+    CHECK(std::equal(out.tpkt[1].rbegin(), out.tpkt[1].rend(), raw.rbegin()));
+    const auto start = std::get<ad::BandwidthStart>(autodetect_request(message_pdu(out.tpkt[0]).value()));
+    CHECK(start.request_type == ad::request_type::bw_start_continuous);
+    const auto stop_request = autodetect_request(message_pdu(out.tpkt[1]).value());
+    CHECK(std::get<ad::BandwidthStop>(stop_request).sequence == start.sequence);
+    c.receive(
+        autodetect_response(ad::BandwidthResults{start.sequence, ad::response_type::bw_results_continuous, 4, 40'000}));
+    CHECK(c.network().bandwidth_kbps == 80'000U);
+
+    // Right after, and for small output, no measurement.
+    c.send_bitmap_update(update);
+    CHECK(split(c.take_output()).tpkt.empty());
+}
+
+TEST_CASE("[MS-RDPBCGR] 2.2.16.1: a Heartbeat PDU after a quiet period")
+{
+    farland::server::ServerConfig config;
+    config.heartbeat_period = 5s;
+    Connection c(config, tls_negotiation());
+    connect_channels(c, 0x0001 | gcc::cs_early_flags::support_heartbeat_pdu);
+    activate_after_joins(c);
+    REQUIRE(c.session().heartbeat);
+    CHECK_FALSE(c.session().autodetect);
+
+    c.tick(t0 + 4s);
+    CHECK(c.take_output().empty());
+    c.tick(t0 + 5s);
+    const auto out = split(c.take_output());
+    REQUIRE(out.tpkt.size() == 1);
+    const auto pdu = message_pdu(out.tpkt[0]).value();
+    CHECK(pdu.flags == proto::sec_flags::heartbeat);
+    Reader r(pdu.payload);
+    CHECK(ad::decode_heartbeat(r).value() == ad::Heartbeat{5, 3, 5});
+    c.tick(t0 + 6s);
+    CHECK(c.take_output().empty());
+
+    // Other output resets the period.
+    const std::array update{std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+    c.tick(t0 + 9s);
+    c.send_bitmap_update(update);
+    static_cast<void>(c.take_output());
+    c.tick(t0 + 12s);
+    CHECK(c.take_output().empty());
+    c.tick(t0 + 14s);
+    CHECK_FALSE(c.take_output().empty());
+}
+
+TEST_CASE("Auto-detect responses farland cannot read, and other message channel PDUs, are dropped")
+{
+    Connection c({}, tls_negotiation());
+    connect_channels(c, autodetect_flags);
+    c.receive(client_info());
+    static_cast<void>(c.take_output());
+
+    Writer unknown;
+    proto::write_basic_security_header(unknown, proto::sec_flags::autodetect_rsp);
+    unknown.bytes(farland::test::hex("06 01 01 00 77 00"));
+    c.receive(io(unknown.view(), message_channel));
+    Writer transport;
+    proto::write_basic_security_header(transport, proto::sec_flags::transport_rsp);
+    transport.bytes(farland::test::hex("01 00 00 00 04 40 00 80"));
+    c.receive(io(transport.view(), message_channel));
+    CHECK(c.state() == State::connect_time_autodetect);
+
+    // A message channel PDU too short for its security header is an error.
+    const std::array junk{std::byte{0x00}};
+    c.receive(io(junk, message_channel));
+    CHECK(c.state() == State::closed);
 }

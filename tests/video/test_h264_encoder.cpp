@@ -5,6 +5,7 @@
 // (CI has neither OpenH264 nor x264); the decode checks also need ffmpeg and
 // ffprobe. Environment:
 //   FARLAND_OPENH264_LIBRARY  OpenH264 to load instead of the default names
+//   FARLAND_VAAPI_DEVICE      DRM render node for VA-API (and NVENC) instead of the first that works
 //   FARLAND_FFMPEG, FARLAND_FFPROBE  tools to use instead of the ones in PATH
 // The latency benchmark is hidden: farland-unit-tests "[benchmark]".
 
@@ -13,8 +14,12 @@
 #include <farland/codec/h264_nal.hpp>
 #include <farland/codec/image.hpp>
 #include <farland/codec/yuv.hpp>
+#include <farland/codec/yuv444.hpp>
 #include <farland/server/test_pattern.hpp>
+#include <farland/video/avc444_encoder.hpp>
 #include <farland/video/h264_encoder.hpp>
+
+#include "h264_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -39,13 +44,12 @@
 #include <unistd.h>
 #include <vector>
 
-extern char** environ;  // NOLINT(readability-redundant-declaration)
-
 namespace video = farland::video;
 namespace codec = farland::codec;
 namespace avc = farland::codec::avc;
 namespace h264 = farland::codec::h264;
 using farland::Errc;
+using namespace farland::test;  // NOLINT(google-build-using-namespace)
 
 namespace {
 
@@ -53,15 +57,10 @@ constexpr std::uint32_t surface_width = 318;  // Odd sizes: coded as 320x240.
 constexpr std::uint32_t surface_height = 238;
 constexpr int frame_count = 12;
 
-std::string env_or(const char* name, const std::string& fallback)
-{
-    const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? std::string(value) : fallback;
-}
-
 video::BackendOptions backend_options()
 {
-    return {.openh264_library = env_or("FARLAND_OPENH264_LIBRARY", "")};
+    return {.openh264_library = env_or("FARLAND_OPENH264_LIBRARY", ""),
+            .render_node = env_or("FARLAND_VAAPI_DEVICE", "")};
 }
 
 video::EncoderConfig small_config()
@@ -73,100 +72,6 @@ video::EncoderConfig small_config()
     config.rate.quality = 23;
     return config;
 }
-
-/// Runs a program found in PATH, with stdout and stderr redirected to files.
-/// Returns its exit status, or -1 if it could not run.
-int run(const std::vector<std::string>& args, const std::string& out = "/dev/null",
-        const std::string& err = "/dev/null")
-{
-    std::vector<char*> argv;
-    for (const auto& arg : args) {
-        argv.push_back(const_cast<char*>(arg.c_str()));
-    }
-    argv.push_back(nullptr);
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    pid_t pid = 0;
-    const int spawned = posix_spawnp(&pid, argv.front(), &actions, nullptr, argv.data(), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (spawned != 0) {
-        return -1;
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) != pid) {
-        return -1;
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-bool have_tool(const std::string& tool)
-{
-    return run({tool, "-version"}) == 0;
-}
-
-class TempDir {
-public:
-    TempDir()
-    {
-        static std::atomic<int> counter{0};
-        path_ = std::filesystem::temp_directory_path() /
-                ("farland-h264-" + std::to_string(getpid()) + "-" + std::to_string(counter++));
-        std::filesystem::create_directories(path_);
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-    ~TempDir()
-    {
-        std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
-    }
-    [[nodiscard]] std::string file(const char* name) const { return (path_ / name).string(); }
-
-private:
-    std::filesystem::path path_;
-};
-
-void write_file(const std::string& path, std::span<const std::byte> bytes)
-{
-    std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-}
-
-std::vector<std::byte> read_file(const std::string& path)
-{
-    std::ifstream in(path, std::ios::binary);
-    const std::vector<char> chars{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    std::vector<std::byte> bytes(chars.size());
-    std::ranges::transform(chars, bytes.begin(), [](char c) { return static_cast<std::byte>(c); });
-    return bytes;
-}
-
-/// Accumulates squared errors for a PSNR over 8-bit samples.
-struct Psnr {
-    double sum = 0;
-    std::size_t count = 0;
-
-    void add(std::span<const std::byte> a, std::span<const std::byte> b, std::size_t skip_every = 0)
-    {
-        REQUIRE(a.size() == b.size());
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (skip_every != 0 && i % skip_every == skip_every - 1) {
-                continue;  // X byte of BGRX
-            }
-            const double d = std::to_integer<int>(a[i]) - std::to_integer<int>(b[i]);
-            sum += d * d;
-            ++count;
-        }
-    }
-    [[nodiscard]] double db() const
-    {
-        const double mse = sum / static_cast<double>(count);
-        return mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
-    }
-};
 
 std::unique_ptr<video::H264Encoder> open_or_skip(video::Backend backend, const video::EncoderConfig& config)
 {
@@ -384,7 +289,209 @@ void check_reconfiguration(video::Backend backend)
     CHECK_FALSE(encode(5).idr);
 }
 
+/// Coloured one-pixel strokes on coloured paper over the lower half of a
+/// BGRX picture: the content 4:2:0 smears.
+void paint_coloured_text(std::vector<std::byte>& bgrx, std::uint32_t width, std::uint32_t height, std::uint32_t phase)
+{
+    struct Bgr {
+        std::uint8_t b, g, r;
+    };
+    const Bgr inks[] = {{40, 40, 255}, {120, 10, 10}, {250, 0, 250}, {255, 170, 0}};
+    const Bgr papers[] = {{80, 235, 250}, {200, 60, 30}, {255, 255, 255}};
+    for (std::uint32_t y = height / 2; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            // Only the left quarter changes from frame to frame, as when typing.
+            const std::uint32_t cx = (x + (x < width / 4 ? phase : 0)) % 6;
+            const std::uint32_t cy = y % 8;
+            const bool stroke = (cx == 1 && cy < 7) || (cy == 3 && cx < 5) || (cx == 4 && cy == 6);
+            const Bgr c = stroke ? inks[(y / 16) % 4] : papers[((x / 40) + (y / 16)) % 3];
+            const std::size_t at = ((std::size_t{y} * width) + x) * 4;
+            bgrx[at] = std::byte{c.b};
+            bgrx[at + 1] = std::byte{c.g};
+            bgrx[at + 2] = std::byte{c.r};
+        }
+    }
+}
+
+/// AVC444 through a real encoder: the main and auxiliary pictures form one
+/// H.264 stream, which one decoder (ffmpeg) decodes as a client's would; the
+/// client model (codec::apply_main_view/apply_aux_view per region, FreeRDP's
+/// reverse filter) then rebuilds the 4:4:4 picture.
+///
+/// With FARLAND_AVC444_DUMP set to a directory, the bitmap streams and the
+/// source pictures are written there, for decoding with FreeRDP's avc444_decompress
+/// as an independent oracle.
+void check_avc444(video::Backend backend, codec::Avc444Version version)
+{
+    const bool v2 = version == codec::Avc444Version::v2;
+    const std::uint32_t width = v2 ? 320 : surface_width;  // v2 only at multiples of 32 (codec/yuv444.hpp)
+    const std::uint32_t height = surface_height;
+    auto config = small_config();
+    config.width = avc::coded_size(width);
+    config.height = avc::coded_size(height);
+    config.reference_frames = 2;
+    video::Avc444Encoder encoder(open_or_skip(backend, config), static_cast<std::uint16_t>(width),
+                                 static_cast<std::uint16_t>(height), version);
+
+    farland::server::TestPattern pattern(width, height);
+    const avc::Rect16 whole{0, 0, static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height)};
+    std::vector<std::vector<std::byte>> sources;
+    std::vector<std::vector<std::byte>> messages;
+    std::vector<codec::Yuv420Frame> inputs;  // the pictures given to the encoder, in stream order
+    codec::Yuv444Frame scratch(config.width, config.height);
+    std::vector<std::byte> stream;
+    std::size_t main_bytes = 0;
+    std::size_t aux_bytes = 0;
+    std::size_t pictures = 0;
+    for (int i = 0; i < frame_count; ++i) {
+        const auto rendered = pattern.render(static_cast<std::uint64_t>(i) * 3);
+        std::vector<std::byte> pixels(std::size_t{width} * height * 4);
+        for (std::uint32_t y = 0; y < height; ++y) {
+            std::ranges::copy(rendered.data.subspan(y * rendered.stride, std::size_t{width} * 4),
+                              pixels.begin() + static_cast<std::ptrdiff_t>(std::size_t{y} * width * 4));
+        }
+        paint_coloured_text(pixels, width, height, static_cast<std::uint32_t>(i));
+        const codec::ImageView view{.data = pixels, .width = width, .height = height, .stride = std::size_t{width} * 4};
+        auto encoded = encoder.encode(view, std::span(&whole, 1));
+        REQUIRE(encoded.has_value());
+        REQUIRE(encoded->has_value());
+        const auto& frame = **encoded;
+        CHECK(frame.layout == avc::Avc444Layout::luma_and_chroma);  // coloured content everywhere
+        CHECK(frame.idr == (i == 0));
+        const auto parsed = avc::decode_avc444(frame.bitmap_stream);
+        REQUIRE(parsed.has_value());
+        codec::Yuv420Frame main_view(config.width, config.height);
+        codec::Yuv420Frame aux_view(config.width, config.height);
+        codec::bgrx_to_avc444(view, version, scratch, main_view, aux_view);
+        inputs.push_back(std::move(main_view));
+        if (parsed->second.has_value()) {
+            inputs.push_back(std::move(aux_view));
+        }
+        stream.insert(stream.end(), parsed->first.bitstream.begin(), parsed->first.bitstream.end());
+        main_bytes += parsed->first.bitstream.size();
+        ++pictures;
+        if (parsed->second.has_value()) {
+            stream.insert(stream.end(), parsed->second->bitstream.begin(), parsed->second->bitstream.end());
+            aux_bytes += parsed->second->bitstream.size();
+            ++pictures;
+        }
+        messages.push_back(frame.bitmap_stream);
+        sources.push_back(std::move(pixels));
+    }
+
+    if (const char* dump = std::getenv("FARLAND_AVC444_DUMP"); dump != nullptr && *dump != '\0') {
+        const std::filesystem::path dir =
+            std::filesystem::path(dump) / (std::string(video::to_string(backend)) + (v2 ? "-v2" : "-v1"));
+        std::filesystem::create_directories(dir);
+        std::ofstream meta(dir / "meta.txt");
+        meta << (v2 ? 15 : 14) << ' ' << width << ' ' << height << ' ' << messages.size() << '\n';
+        for (std::size_t i = 0; i < messages.size(); ++i) {
+            write_file((dir / ("frame-" + std::to_string(i) + ".bin")).string(), messages[i]);
+            write_file((dir / ("source-" + std::to_string(i) + ".bgrx")).string(), sources[i]);
+        }
+    }
+
+    const std::string ffmpeg = env_or("FARLAND_FFMPEG", "ffmpeg");
+    if (!have_tool(ffmpeg)) {
+        SKIP("ffmpeg not found: encoded, but not decoded");
+    }
+    const TempDir dir;
+    const auto h264_path = dir.file("avc444.h264");
+    const auto yuv_path = dir.file("avc444.yuv");
+    write_file(h264_path, stream);
+    REQUIRE(run({ffmpeg, "-v", "error", "-f", "h264", "-i", h264_path, "-f", "rawvideo", "-y", yuv_path}) == 0);
+    const auto decoded = read_file(yuv_path);
+    const std::size_t luma = std::size_t{config.width} * config.height;
+    const std::size_t picture_size = luma * 3 / 2;
+    REQUIRE(decoded.size() == picture_size * pictures);  // one picture per access unit, in order
+
+    std::size_t next = 0;
+    const auto picture = [&] {
+        REQUIRE(next < pictures);
+        const auto bytes = std::span(decoded).subspan(next++ * picture_size, picture_size);
+        return codec::Yuv420View{
+            .y = bytes.first(luma),
+            .u = bytes.subspan(luma, luma / 4),
+            .v = bytes.subspan(luma + (luma / 4), luma / 4),
+            .width = config.width,
+            .height = config.height,
+            .y_stride = config.width,
+            .uv_stride = config.width / 2,
+        };
+    };
+    // Coding loss of each view: decoded picture against encoder input.
+    double worst_view = 99;
+    for (std::size_t k = 0; k < pictures; ++k) {
+        const auto bytes = std::span(decoded).subspan(k * picture_size, picture_size);
+        const auto input = inputs.at(k).view();
+        Psnr p;
+        p.add(input.y, bytes.first(luma));
+        p.add(input.u, bytes.subspan(luma, luma / 4));
+        p.add(input.v, bytes.subspan(luma + (luma / 4), luma / 4));
+        worst_view = std::min(worst_view, p.db());
+    }
+    codec::Yuv444Frame client(config.width, config.height);
+    double worst_freerdp = 99;
+    double worst_reverse = 99;
+    double best_420 = 0;
+    std::vector<std::byte> shown(std::size_t{width} * height * 4);
+    codec::Yuv420Frame i420(config.width, config.height);
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const auto parsed = avc::decode_avc444(messages[i]).value();
+        if (parsed.layout != avc::Avc444Layout::chroma) {
+            const auto main = picture();
+            for (const auto& region : parsed.first.regions) {
+                codec::apply_main_view(main, region.rect, client);
+            }
+        }
+        const auto* chroma = parsed.layout == avc::Avc444Layout::luma_and_chroma ? &*parsed.second
+                             : parsed.layout == avc::Avc444Layout::chroma        ? &parsed.first
+                                                                                 : nullptr;
+        if (chroma != nullptr) {
+            const auto aux = picture();
+            for (const auto& region : chroma->regions) {
+                codec::apply_aux_view(aux, version, region.rect, client);
+            }
+        }
+        for (const auto filter : {codec::ChromaFilter::freerdp, codec::ChromaFilter::reverse}) {
+            codec::yuv444_to_bgrx(client.view(), width, height, filter, shown);
+            Psnr p;
+            p.add(sources[i], shown, 4);
+            (filter == codec::ChromaFilter::freerdp ? worst_freerdp : worst_reverse) =
+                std::min(filter == codec::ChromaFilter::freerdp ? worst_freerdp : worst_reverse, p.db());
+        }
+        // What 4:2:0 could show at best: the source through I420, uncoded.
+        const codec::ImageView source{
+            .data = sources[i], .width = width, .height = height, .stride = std::size_t{width} * 4};
+        codec::bgrx_to_yuv420(source, i420);
+        codec::yuv420_to_bgrx(i420.view(), width, height, shown);
+        Psnr p420;
+        p420.add(sources[i], shown, 4);
+        best_420 = std::max(best_420, p420.db());
+    }
+    CHECK(next == pictures);
+    std::cout << video::to_string(backend) << (v2 ? " AVC444v2" : " AVC444") << ": views coded at >= " << worst_view
+              << " dB (YUV); worst PSNR " << worst_freerdp << " dB (FreeRDP filter), " << worst_reverse
+              << " dB (always reversed); uncoded 4:2:0 at best " << best_420 << " dB; " << main_bytes / messages.size()
+              << " + " << aux_bytes / messages.size() << " bytes/frame (main + auxiliary)\n";
+    CHECK(worst_view >= 35.0);
+    CHECK(worst_freerdp >= 30.0);
+    CHECK(worst_freerdp > best_420 + 3.0);
+}
+
 }  // namespace
+
+TEST_CASE("OpenH264 encodes AVC444 that one decoder turns back into 4:4:4")
+{
+    check_avc444(video::Backend::openh264, codec::Avc444Version::v1);
+    check_avc444(video::Backend::openh264, codec::Avc444Version::v2);
+}
+
+TEST_CASE("x264 encodes AVC444 that one decoder turns back into 4:4:4")
+{
+    check_avc444(video::Backend::x264, codec::Avc444Version::v1);
+    check_avc444(video::Backend::x264, codec::Avc444Version::v2);
+}
 
 TEST_CASE("H.264 encoder configurations are validated")
 {
@@ -418,11 +525,18 @@ TEST_CASE("H.264 encoder configurations are validated")
 TEST_CASE("H.264 backends have names")
 {
     REQUIRE_FALSE(video::compiled_backends().empty());
+#if defined(FARLAND_HAVE_NVENC)
+    CHECK(video::compiled_backends().front() == video::Backend::nvenc);
+#elif defined(FARLAND_HAVE_VAAPI)
+    CHECK(video::compiled_backends().front() == video::Backend::vaapi);
+#else
     CHECK(video::compiled_backends().front() == video::Backend::openh264);
-    for (const auto backend : {video::Backend::openh264, video::Backend::x264}) {
+#endif
+    for (const auto backend :
+         {video::Backend::openh264, video::Backend::x264, video::Backend::vaapi, video::Backend::nvenc}) {
         CHECK(video::parse_backend(video::to_string(backend)) == backend);
     }
-    CHECK_FALSE(video::parse_backend("vaapi").has_value());
+    CHECK_FALSE(video::parse_backend("qsv").has_value());
 }
 
 TEST_CASE("A missing OpenH264 library is a clean error")
@@ -475,6 +589,26 @@ TEST_CASE("OpenH264 encodes decodable AVC420 access units")
 TEST_CASE("x264 encodes decodable AVC420 access units")
 {
     check_backend(video::Backend::x264);
+}
+
+TEST_CASE("VA-API encodes decodable AVC420 access units")
+{
+    check_backend(video::Backend::vaapi);
+}
+
+TEST_CASE("VA-API changes rate control and size")
+{
+    check_reconfiguration(video::Backend::vaapi);
+}
+
+TEST_CASE("NVENC encodes decodable AVC420 access units")
+{
+    check_backend(video::Backend::nvenc);
+}
+
+TEST_CASE("NVENC changes rate control and size")
+{
+    check_reconfiguration(video::Backend::nvenc);
 }
 
 TEST_CASE("OpenH264 changes rate control and size")

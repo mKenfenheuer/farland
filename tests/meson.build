@@ -42,6 +42,9 @@ test(
   'unit',
   unit_tests,
   suite: 'unit',
+  # The codec round trips take over 30 s unoptimised (debug and sanitizer
+  # builds on small CI machines).
+  timeout: 300,
   env: {'FARLAND_SERVER': farland_server_exe.full_path()},
   depends: farland_server_exe,
 )

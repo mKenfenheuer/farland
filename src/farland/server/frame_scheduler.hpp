@@ -47,6 +47,8 @@ public:
     /// The client asked the server to stop waiting for acknowledgements
     /// (queueDepth SUSPEND_FRAME_ACKNOWLEDGEMENT), or to resume.
     void set_acknowledgements_suspended(bool suspended) noexcept;
+    /// Changes the frame-rate cap (a new quality tier).
+    void set_max_fps(unsigned fps) noexcept;
 
     /// A frame should be encoded and sent now.
     [[nodiscard]] bool due(Clock::time_point now);

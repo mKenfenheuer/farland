@@ -7,6 +7,12 @@
 #if defined(FARLAND_VIDEO_HAVE_X264)
 #include <farland/video/x264_encoder.hpp>
 #endif
+#if defined(FARLAND_HAVE_VAAPI)
+#include <farland/video/vaapi_encoder.hpp>
+#endif
+#if defined(FARLAND_HAVE_NVENC)
+#include <farland/video/nvenc_encoder.hpp>
+#endif
 
 #include <array>
 #include <memory>
@@ -20,11 +26,21 @@ namespace {
 
 constexpr std::string_view component = "video.h264";
 
-#if defined(FARLAND_VIDEO_HAVE_X264)
-constexpr std::array compiled{Backend::openh264, Backend::x264};
-#else
-constexpr std::array compiled{Backend::openh264};
+// GPU encoders first: they take the work off the CPU and fail fast (no
+// driver, no render node) where there is no such GPU. NVENC before VA-API,
+// so that NVIDIA's VA-API driver (decode only) is never asked to encode.
+constexpr auto compiled = std::to_array<Backend>({
+#if defined(FARLAND_HAVE_NVENC)
+    Backend::nvenc,
 #endif
+#if defined(FARLAND_HAVE_VAAPI)
+    Backend::vaapi,
+#endif
+    Backend::openh264,
+#if defined(FARLAND_VIDEO_HAVE_X264)
+    Backend::x264,
+#endif
+});
 
 }  // namespace
 
@@ -35,13 +51,17 @@ std::string_view to_string(Backend backend) noexcept
         return "openh264";
     case Backend::x264:
         return "x264";
+    case Backend::vaapi:
+        return "vaapi";
+    case Backend::nvenc:
+        return "nvenc";
     }
     return "unknown";
 }
 
 std::optional<Backend> parse_backend(std::string_view name) noexcept
 {
-    for (const Backend backend : {Backend::openh264, Backend::x264}) {
+    for (const Backend backend : {Backend::openh264, Backend::x264, Backend::vaapi, Backend::nvenc}) {
         if (name == to_string(backend)) {
             return backend;
         }
@@ -89,7 +109,15 @@ Result<void> validate(const EncoderConfig& config)
     if (config.threads == 0 || config.threads > max_threads) {
         return fail(Errc::invalid_value, "H.264 encoder threads must be 1..16");
     }
+    if (config.reference_frames == 0 || config.reference_frames > max_reference_frames) {
+        return fail(Errc::invalid_value, "H.264 reference frames must be 1..4");
+    }
     return validate(config.rate);
+}
+
+Result<EncodedFrame> H264Encoder::encode_dmabuf(const DmabufFrame& /*frame*/, const FrameOptions& /*options*/)
+{
+    return fail(Errc::unsupported, "this H.264 encoder takes no dmabufs");
 }
 
 Result<std::unique_ptr<H264Encoder>> create_encoder(Backend backend, const EncoderConfig& config,
@@ -104,6 +132,18 @@ Result<std::unique_ptr<H264Encoder>> create_encoder(Backend backend, const Encod
         return x264::create(config);
 #else
         return fail(Errc::unsupported, "farland was built without x264 (-Dx264=enabled)");
+#endif
+    case Backend::vaapi:
+#if defined(FARLAND_HAVE_VAAPI)
+        return vaapi::create(config, options);
+#else
+        return fail(Errc::unsupported, "farland was built without VA-API (-Dvaapi, libva >= 2.14)");
+#endif
+    case Backend::nvenc:
+#if defined(FARLAND_HAVE_NVENC)
+        return nvenc::create(config, options);
+#else
+        return fail(Errc::unsupported, "farland was built without NVENC (-Dnvenc, Linux)");
 #endif
     }
     return fail(Errc::unsupported, "unknown H.264 encoder backend");

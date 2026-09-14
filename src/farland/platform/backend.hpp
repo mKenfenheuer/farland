@@ -5,6 +5,7 @@
 
 #include <farland/codec/image.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -33,13 +34,62 @@ struct Rect {
     friend bool operator==(const Rect&, const Rect&) = default;
 };
 
-/// One captured frame in CPU memory, BGRX as codec::ImageView describes.
-/// `image` stays valid until the next take_frame() on the same source.
+/// One plane of a dmabuf, as PipeWire's spa_data describes it.
+struct DmabufPlane {
+    int fd = -1;
+    std::uint32_t offset = 0;
+    std::uint32_t pitch = 0;
+
+    friend bool operator==(const DmabufPlane&, const DmabufPlane&) = default;
+};
+
+/// A captured frame in GPU memory (docs/PLAN.md §3.3), for encoders that
+/// read it without a copy. The descriptors belong to the source.
+struct Dmabuf {
+    /// A DRM fourcc (drm_fourcc.h) of packed 32-bit RGB.
+    std::uint32_t drm_format = 0;
+    /// The DRM format modifier of all planes.
+    std::uint64_t modifier = 0;
+    /// The whole buffer, which is the whole frame.
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    /// Planes in use, 1..4 (compressed layouts add metadata planes).
+    std::uint32_t plane_count = 0;
+    std::array<DmabufPlane, 4> planes{};
+    /// Changes when the source replaced its buffers (PipeWire renegotiated
+    /// them). Consumers that cache imports by buffer drop them then, since
+    /// the kernel may reuse the old buffers' identities.
+    std::uint64_t generation = 0;
+
+    friend bool operator==(const Dmabuf&, const Dmabuf&) = default;
+};
+
+/// One captured frame: BGRX in CPU memory as codec::ImageView describes,
+/// or a dmabuf, or both.
+///
+/// Lifetime: `image` and `dmabuf` stay valid until the next take_frame() or
+/// release_frame() on the same source. While the consumer holds a frame
+/// with a dmabuf, the producer cannot reuse that buffer, so a consumer holds
+/// one frame at a time and takes the next as soon as it is pending.
 struct Frame {
+    /// Empty (no data) for a frame that came only as a dmabuf; map_frame()
+    /// reads it then.
     codec::ImageView image;
     /// What changed since the previous frame taken; empty means everything.
     std::vector<Rect> damage;
     std::uint64_t sequence = 0;
+    /// The frame in GPU memory; only with FrameAccess::dmabuf.
+    std::optional<Dmabuf> dmabuf;
+};
+
+/// What the consumer of a FrameSource needs.
+enum class FrameAccess : std::uint8_t {
+    /// Every frame with its pixels in CPU memory.
+    cpu,
+    /// Frames the source has in GPU memory come as Frame::dmabuf without
+    /// CPU pixels (map_frame() reads one when needed); others still come
+    /// with pixels.
+    dmabuf,
 };
 
 class FrameSource {
@@ -59,6 +109,19 @@ public:
     [[nodiscard]] virtual std::optional<Frame> take_frame() = 0;
     /// The desktop size in pixels; 0 x 0 before the first frame.
     [[nodiscard]] virtual std::pair<std::uint32_t, std::uint32_t> size() const = 0;
+
+    /// Says what the consumer needs, from the next frame the source makes
+    /// on. A frame made before may still come as a dmabuf after switching to
+    /// `cpu`. Sources without dmabufs ignore it.
+    virtual void set_access(FrameAccess access) { static_cast<void>(access); }
+    /// The pixels of the frame taken last: its image, or its dmabuf read and
+    /// converted now. nullopt if there is none, it cannot be read, or it was
+    /// released. Valid as long as the frame. Sources whose frames always
+    /// have an image need not implement it.
+    [[nodiscard]] virtual std::optional<codec::ImageView> map_frame() { return std::nullopt; }
+    /// Gives the frame taken last back to the source before the next
+    /// take_frame(); its image and dmabuf must not be used afterwards.
+    virtual void release_frame() {}
 };
 
 /// A cursor shape: straight-alpha BGRA, top-down, stride width * 4.

@@ -122,7 +122,7 @@ void apply_rate(x264_param_t& p, const RateControl& rate)
     p.b_vfr_input = 0;
 
     p.i_bframe = 0;
-    p.i_frame_reference = 1;
+    p.i_frame_reference = static_cast<int>(config.reference_frames);
     p.i_keyint_max = config.keyint == 0 ? X264_KEYINT_MAX_INFINITE : static_cast<int>(config.keyint);
     p.i_scenecut_threshold = 0;
     p.b_intra_refresh = 0;

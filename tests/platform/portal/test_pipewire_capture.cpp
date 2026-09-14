@@ -5,8 +5,8 @@
 // producer stream that plays the compositor. Skipped where no `pipewire`
 // binary is installed (or FARLAND_PIPEWIRE does not point to one).
 //
-// Only shared memory is covered: dmabufs need a GPU (or /dev/udmabuf), which
-// the CI containers do not have.
+// Dmabufs come from /dev/udmabuf (LINEAR, over a memfd); those tests skip
+// where it cannot be opened, as in the CI containers.
 
 #include <farland/platform/portal/pipewire_capture.hpp>
 #include <farland/platform/portal/pipewire_util.hpp>
@@ -19,23 +19,28 @@
 #include <spa/param/video/format-utils.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <linux/udmabuf.h>
 #include <memory>
 #include <optional>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 extern char** environ;
@@ -298,6 +303,78 @@ struct FrameSpec {
 
 constexpr std::uint32_t cursor_max = 64;
 
+/// A LINEAR dmabuf made by /dev/udmabuf from a memfd, standing in for a
+/// compositor's buffer.
+class Udmabuf {
+public:
+    static bool available()
+    {
+        const int fd = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            return false;
+        }
+        ::close(fd);
+        return true;
+    }
+
+    /// nullptr on failure (it runs on PipeWire's thread, where REQUIRE cannot).
+    static std::unique_ptr<Udmabuf> create(std::size_t size)
+    {
+        const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        auto buffer = std::unique_ptr<Udmabuf>(new Udmabuf);
+        buffer->size_ = (size + page - 1) / page * page;
+        buffer->memfd_ = ::memfd_create("farland-test", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+        if (buffer->memfd_ < 0 || ::ftruncate(buffer->memfd_, static_cast<off_t>(buffer->size_)) != 0 ||
+            ::fcntl(buffer->memfd_, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+            return nullptr;
+        }
+        const int device = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (device < 0) {
+            return nullptr;
+        }
+        udmabuf_create request{};
+        request.memfd = static_cast<std::uint32_t>(buffer->memfd_);
+        request.flags = UDMABUF_FLAGS_CLOEXEC;
+        request.size = buffer->size_;
+        buffer->fd_ = ::ioctl(device, UDMABUF_CREATE, &request);
+        ::close(device);
+        void* map = ::mmap(nullptr, buffer->size_, PROT_READ | PROT_WRITE, MAP_SHARED, buffer->memfd_, 0);
+        if (buffer->fd_ < 0 || map == MAP_FAILED) {
+            return nullptr;
+        }
+        buffer->map_ = map;
+        return buffer;
+    }
+
+    Udmabuf(const Udmabuf&) = delete;
+    Udmabuf& operator=(const Udmabuf&) = delete;
+    Udmabuf(Udmabuf&&) = delete;
+    Udmabuf& operator=(Udmabuf&&) = delete;
+    ~Udmabuf()
+    {
+        if (map_ != nullptr) {
+            ::munmap(map_, size_);
+        }
+        for (const int fd : {fd_, memfd_}) {
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    }
+
+    [[nodiscard]] int fd() const { return fd_; }
+    [[nodiscard]] std::size_t size() const { return size_; }
+    [[nodiscard]] void* data() const { return map_; }
+
+private:
+    Udmabuf() = default;
+
+    int memfd_ = -1;
+    int fd_ = -1;
+    void* map_ = nullptr;
+    std::size_t size_ = 0;
+};
+
 class Producer {
 public:
     struct Options {
@@ -307,6 +384,11 @@ public:
         bool damage_meta = true;
         bool crop_meta = true;
         bool cursor_meta = true;
+        /// LINEAR dmabufs from /dev/udmabuf (allocated by the producer, as
+        /// compositors do) instead of shared memory.
+        bool dmabuf = false;
+        /// Exactly this many buffers with `dmabuf`.
+        std::int32_t buffers = 4;
     };
 
     Producer(int fd, const Options& options) : options_(options)
@@ -328,14 +410,17 @@ public:
             e.version = PW_VERSION_STREAM_EVENTS;
             e.state_changed = &Producer::on_state_changed;
             e.param_changed = &Producer::on_param_changed;
+            e.add_buffer = &Producer::on_add_buffer;
+            e.remove_buffer = &Producer::on_remove_buffer;
             e.process = &Producer::on_process;
             return e;
         }();
         pw_stream_add_listener(stream_, &listener_, &events, this);
         pw::PodBuilder b;
         const spa_pod* format = build_format(b);
+        const auto memory = options_.dmabuf ? PW_STREAM_FLAG_ALLOC_BUFFERS : PW_STREAM_FLAG_MAP_BUFFERS;
         pw_stream_connect(stream_, PW_DIRECTION_OUTPUT, PW_ID_ANY,
-                          static_cast<pw_stream_flags>(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS), &format, 1);
+                          static_cast<pw_stream_flags>(PW_STREAM_FLAG_DRIVER | memory), &format, 1);
     }
 
     Producer(const Producer&) = delete;
@@ -412,6 +497,8 @@ public:
     }
 
     [[nodiscard]] std::size_t stride() const { return (std::size_t{options_.width} * 4) + 16; }
+    /// A dmabuf could not be allocated.
+    [[nodiscard]] bool allocation_failed() const { return allocation_failed_.load(); }
 
     /// Produces one buffer and runs graph cycles until `delivered()` says the
     /// consumer handled it. One buffer at a time: a cycle that starts before
@@ -444,6 +531,10 @@ private:
         b.id(SPA_MEDIA_SUBTYPE_raw);
         b.prop(SPA_FORMAT_VIDEO_format);
         b.id(to_spa_format(options_.layout));
+        if (options_.dmabuf) {
+            b.prop(SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+            b.long_(static_cast<std::int64_t>(drm_format_mod_linear));
+        }
         b.prop(SPA_FORMAT_VIDEO_size);
         b.rectangle(options_.width, options_.height);
         b.prop(SPA_FORMAT_VIDEO_framerate);
@@ -475,7 +566,12 @@ private:
         spa_pod_frame f{};
         spa_pod_frame c{};
         b.push_object(&f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
-        b.int_range(SPA_PARAM_BUFFERS_buffers, 4, 2, 8);
+        if (self.options_.dmabuf) {
+            const std::int32_t n = self.options_.buffers;
+            b.int_range(SPA_PARAM_BUFFERS_buffers, n, n, n);
+        } else {
+            b.int_range(SPA_PARAM_BUFFERS_buffers, 4, 2, 8);
+        }
         b.prop(SPA_PARAM_BUFFERS_blocks);
         b.int_(1);
         b.prop(SPA_PARAM_BUFFERS_size);
@@ -484,7 +580,7 @@ private:
         b.int_(stride);
         b.prop(SPA_PARAM_BUFFERS_dataType);
         b.push_choice(&c, SPA_CHOICE_Flags);
-        b.int_(1 << SPA_DATA_MemFd);
+        b.int_(1 << (self.options_.dmabuf ? SPA_DATA_DmaBuf : SPA_DATA_MemFd));
         static_cast<void>(b.pop(&c));
         params.push_back(b.pop(&f));
         params.push_back(b.meta(SPA_META_Header, sizeof(spa_meta_header)));
@@ -501,6 +597,34 @@ private:
         }
         pw_stream_update_params(self.stream_, params.data(), static_cast<std::uint32_t>(params.size()));
         pw_thread_loop_signal(self.loop_, false);
+    }
+
+    /// With `dmabuf`, the producer allocates the memory (ALLOC_BUFFERS), as
+    /// mutter and KWin do.
+    static void on_add_buffer(void* data, pw_buffer* buffer)
+    {
+        auto& self = *static_cast<Producer*>(data);
+        if (!self.options_.dmabuf || !self.format_ || buffer->buffer->n_datas == 0) {
+            return;
+        }
+        auto dmabuf = Udmabuf::create(self.stride() * self.format_->size.height);
+        if (dmabuf == nullptr) {
+            self.allocation_failed_ = true;
+            return;
+        }
+        spa_data& plane = buffer->buffer->datas[0];
+        plane.type = SPA_DATA_DmaBuf;
+        plane.flags = SPA_DATA_FLAG_READWRITE | SPA_DATA_FLAG_MAPPABLE;
+        plane.fd = dmabuf->fd();
+        plane.mapoffset = 0;
+        plane.maxsize = static_cast<std::uint32_t>(dmabuf->size());
+        plane.data = dmabuf->data();
+        self.dmabufs_[buffer] = std::move(dmabuf);
+    }
+
+    static void on_remove_buffer(void* data, pw_buffer* buffer)
+    {
+        static_cast<Producer*>(data)->dmabufs_.erase(buffer);
     }
 
     static void on_process(void* data)
@@ -613,6 +737,8 @@ private:
     const FrameSpec* pending_ = nullptr;
     bool sent_ = false;
     std::uint64_t seq_ = 0;
+    std::unordered_map<pw_buffer*, std::unique_ptr<Udmabuf>> dmabufs_;
+    std::atomic<bool> allocation_failed_{false};
 };
 
 // --- Fixture --------------------------------------------------------------------
@@ -650,7 +776,18 @@ Pipeline make_pipeline(const Producer::Options& options)
     p.producer->link_to(capture_node);
     p.producer->wait_streaming();
     REQUIRE(wait_until([&] { return p.capture->state() == CaptureState::streaming; }));
+    REQUIRE_FALSE(p.producer->allocation_failed());
     return p;
+}
+
+/// make_pipeline with a producer of udmabufs; skips without /dev/udmabuf.
+Pipeline make_dmabuf_pipeline(Producer::Options options)
+{
+    if (!Udmabuf::available()) {
+        SKIP("cannot open /dev/udmabuf");
+    }
+    options.dmabuf = true;
+    return make_pipeline(options);
 }
 
 /// Sends one buffer and waits until the capture has handled it.
@@ -694,6 +831,34 @@ void check_pixels(const Frame& f, std::uint32_t frame, const Rect& view)
             }
         }
     }
+    CHECK(mismatches == 0);
+}
+
+/// The BGRX dmabuf the capture passed on holds pattern(frame): mapped here,
+/// through the capture's own descriptor, as an encoder would import it.
+void check_dmabuf(const Dmabuf& dmabuf, std::uint32_t frame, std::size_t stride)
+{
+    REQUIRE(dmabuf.plane_count == 1);
+    const DmabufPlane& plane = dmabuf.planes[0];
+    REQUIRE(plane.fd >= 0);
+    CHECK(plane.pitch == stride);
+    const off_t size = ::lseek(plane.fd, 0, SEEK_END);
+    REQUIRE(size > 0);
+    void* map = ::mmap(nullptr, static_cast<std::size_t>(size), PROT_READ, MAP_SHARED, plane.fd, 0);
+    REQUIRE(map != MAP_FAILED);
+    const std::span memory(static_cast<const std::byte*>(map), static_cast<std::size_t>(size));
+    REQUIRE(memory.size() >= plane.offset + (stride * dmabuf.height));
+    std::size_t mismatches = 0;
+    for (std::uint32_t y = 0; y < dmabuf.height; ++y) {
+        for (std::uint32_t x = 0; x < dmabuf.width; ++x) {
+            const auto expected = pattern(x, y, frame);
+            const auto px = memory.subspan(plane.offset + (y * stride) + (x * 4), 4);
+            if (px[0] != std::byte{expected.b} || px[1] != std::byte{expected.g} || px[2] != std::byte{expected.r}) {
+                ++mismatches;
+            }
+        }
+    }
+    ::munmap(map, static_cast<std::size_t>(size));
     CHECK(mismatches == 0);
 }
 
@@ -930,4 +1095,132 @@ TEST_CASE("PipeWire capture fails on a dead remote", "[portal][pipewire]")
     const auto capture = PipeWireCapture::create(fds[0], 42);
     ::close(fds[0]);
     CHECK_FALSE(capture.has_value());
+}
+
+TEST_CASE("PipeWire capture passes dmabufs on without reading them and gives each buffer back", "[portal][pipewire]")
+{
+    auto p = make_dmabuf_pipeline({});
+    p.capture->frames().set_access(FrameAccess::dmabuf);
+    // Twelve frames through four buffers: each must go back to the producer
+    // once the next is taken, or the producer runs dry and deliver() fails.
+    for (std::uint32_t i = 1; i <= 12; ++i) {
+        CAPTURE(i);
+        const Rect damage{static_cast<std::int32_t>(i), 1, 2, 2};
+        deliver(p, {.frame = i, .damage = std::vector<Rect>{damage}});
+        const auto frame = next_frame(*p.capture);
+        REQUIRE(frame.has_value());
+        CHECK(frame->image.data.empty());
+        REQUIRE(frame->dmabuf.has_value());
+        CHECK(frame->dmabuf->drm_format == drm_fourcc(PixelLayout::bgrx));
+        CHECK(frame->dmabuf->modifier == drm_format_mod_linear);
+        CHECK((frame->dmabuf->width == 64 && frame->dmabuf->height == 48));
+        check_dmabuf(*frame->dmabuf, i, p.producer->stride());
+        if (i == 1) {
+            CHECK(frame->damage.empty());  // The first frame is all new.
+        } else {
+            CHECK(frame->damage == std::vector<Rect>{damage});
+        }
+    }
+}
+
+TEST_CASE("PipeWire capture keeps the producer going while the session holds a dmabuf", "[portal][pipewire]")
+{
+    auto p = make_dmabuf_pipeline({});
+    p.capture->frames().set_access(FrameAccess::dmabuf);
+    deliver(p, {.frame = 1});
+    const auto held = next_frame(*p.capture);
+    REQUIRE((held.has_value() && held->dmabuf.has_value()));
+
+    // Nobody takes the next frames: the newest waits, older ones go straight
+    // back, and their damage is merged.
+    std::vector<Rect> damage;
+    for (std::uint32_t i = 2; i <= 12; ++i) {
+        damage.push_back({static_cast<std::int32_t>(i * 4), 0, 2, 2});
+        deliver(p, {.frame = i, .damage = std::vector<Rect>{damage.back()}});
+    }
+    // The held buffer was never given back, so nothing was drawn into it.
+    check_dmabuf(*held->dmabuf, 1, p.producer->stride());
+
+    const auto latest = p.capture->frames().take_frame();
+    REQUIRE((latest.has_value() && latest->dmabuf.has_value()));
+    check_dmabuf(*latest->dmabuf, 12, p.producer->stride());
+    CHECK(latest->damage == damage);
+    CHECK(latest->sequence == 12);
+    CHECK(latest->dmabuf->generation == held->dmabuf->generation);
+}
+
+TEST_CASE("PipeWire capture reads a held dmabuf on demand and in CPU mode", "[portal][pipewire]")
+{
+    auto p = make_dmabuf_pipeline({});
+    auto& frames = p.capture->frames();
+    frames.set_access(FrameAccess::dmabuf);
+    deliver(p, {.frame = 1});
+    REQUIRE(next_frame(*p.capture).value().dmabuf.has_value());
+
+    // An encoder refused it: the session wants this one frame's pixels.
+    const auto pixels = frames.map_frame();
+    REQUIRE(pixels.has_value());
+    check_pixels(Frame{.image = *pixels}, 1, {0, 0, 64, 48});
+    frames.release_frame();
+    CHECK_FALSE(frames.map_frame().has_value());
+
+    // Back to CPU frames: read from the dmabuf (LINEAR, mmapped).
+    frames.set_access(FrameAccess::cpu);
+    deliver(p, {.frame = 2});
+    auto frame = next_frame(*p.capture);
+    REQUIRE(frame.has_value());
+    CHECK_FALSE(frame->dmabuf.has_value());
+    check_pixels(*frame, 2, {0, 0, 64, 48});
+
+    // A cropped frame is read too: encoders take whole buffers.
+    frames.set_access(FrameAccess::dmabuf);
+    const Rect crop{8, 4, 32, 24};
+    deliver(p, {.frame = 3, .crop = crop});
+    frame = next_frame(*p.capture);
+    REQUIRE(frame.has_value());
+    CHECK_FALSE(frame->dmabuf.has_value());
+    check_pixels(*frame, 3, crop);
+    CHECK(frame->damage.empty());  // A new view: everything.
+}
+
+TEST_CASE("PipeWire capture reads dmabufs when the stream has too few buffers to hold one", "[portal][pipewire]")
+{
+    auto p = make_dmabuf_pipeline({.buffers = 3});
+    p.capture->frames().set_access(FrameAccess::dmabuf);
+    for (std::uint32_t i = 1; i <= 4; ++i) {
+        deliver(p, {.frame = i});
+        const auto frame = next_frame(*p.capture);
+        REQUIRE(frame.has_value());
+        CHECK_FALSE(frame->dmabuf.has_value());
+        check_pixels(*frame, i, {0, 0, 64, 48});
+    }
+}
+
+TEST_CASE("PipeWire capture marks dmabufs of renegotiated buffers with a new generation", "[portal][pipewire]")
+{
+    auto p = make_dmabuf_pipeline({});
+    p.capture->frames().set_access(FrameAccess::dmabuf);
+    deliver(p, {.frame = 1});
+    const auto before = next_frame(*p.capture);
+    REQUIRE((before.has_value() && before->dmabuf.has_value()));
+
+    p.producer->resize(80, 60);
+    deliver(p, {.frame = 2});
+    const auto after = next_frame(*p.capture);
+    REQUIRE((after.has_value() && after->dmabuf.has_value()));
+    CHECK((after->dmabuf->width == 80 && after->dmabuf->height == 60));
+    CHECK(after->dmabuf->generation != before->dmabuf->generation);
+    CHECK(after->damage.empty());
+    check_dmabuf(*after->dmabuf, 2, p.producer->stride());
+}
+
+TEST_CASE("PipeWire capture reads shared memory whatever the consumer asks for", "[portal][pipewire]")
+{
+    auto p = make_pipeline({});
+    p.capture->frames().set_access(FrameAccess::dmabuf);
+    deliver(p, {.frame = 1});
+    const auto frame = next_frame(*p.capture);
+    REQUIRE(frame.has_value());
+    CHECK_FALSE(frame->dmabuf.has_value());
+    check_pixels(*frame, 1, {0, 0, 64, 48});
 }

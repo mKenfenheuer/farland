@@ -256,7 +256,7 @@ void OpenH264Encoder::fill(abi::SEncParamExt& p) const
     p.iTemporalLayerNum = 1;
     p.iSpatialLayerNum = 1;
     p.uiIntraPeriod = config_.keyint;
-    p.iNumRefFrame = 1;
+    p.iNumRefFrame = static_cast<int>(config_.reference_frames);
     p.eSpsPpsIdStrategy = abi::constant_id;
     p.bPrefixNalAddingCtrl = false;
     p.bEnableSSEI = false;
@@ -266,7 +266,17 @@ void OpenH264Encoder::fill(abi::SEncParamExt& p) const
     // OpenH264 holds a bitrate only by dropping pictures; at a fixed QP every
     // picture produces an access unit.
     p.bEnableFrameSkip = rc_.mode == abi::rc_bitrate_mode;
-    p.bEnableLongTermReference = false;
+    // Screen content always runs scene-change detection, and without long-term
+    // references every scene change is an IDR. AVC444 alternates two views,
+    // which looks like a scene change at every picture; scene LTRs let each
+    // view predict from its own last picture instead (video::Avc444Encoder).
+    // OpenH264 takes LTRs for screen content only on a lossless link, which
+    // RDP over TCP is (param_svc.h ParamTranscode).
+    p.bEnableLongTermReference = config_.reference_frames > 1;
+    if (p.bEnableLongTermReference) {
+        p.iLTRRefNum = static_cast<int>(config_.reference_frames);
+        p.bIsLosslessLink = true;
+    }
     p.iMultipleThreadIdc = static_cast<unsigned short>(config_.threads);
     p.bEnableDenoise = false;
     // Not supported for screen content; OpenH264 would switch them off with a warning.

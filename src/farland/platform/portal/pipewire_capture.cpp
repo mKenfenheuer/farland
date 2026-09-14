@@ -45,6 +45,10 @@ constexpr std::int32_t damage_regions_default = 16;
 constexpr std::int32_t damage_regions_max = 64;
 /// How long create() waits for the PipeWire daemon to answer.
 constexpr int connect_timeout_seconds = 5;
+/// Dmabufs are passed on only when the stream has at least this many
+/// buffers: the capture keeps up to two dequeued (the one the session holds
+/// and the newest pending), and the producer needs the rest to go on.
+constexpr std::size_t min_buffers_to_hold = 4;
 
 constexpr std::int32_t cursor_meta_size(std::uint32_t width, std::uint32_t height)
 {
@@ -182,6 +186,17 @@ struct FormatOffer {
     std::vector<std::uint64_t> modifiers;
 };
 
+/// A dmabuf frame the capture keeps dequeued instead of reading it, with its
+/// own duplicates of the descriptors: those stay valid even when PipeWire
+/// removes the buffer meanwhile.
+struct HeldBuffer {
+    /// To requeue; null when there is none or PipeWire removed it.
+    pw_buffer* buffer = nullptr;
+    Dmabuf dmabuf;
+    std::array<UniqueFd, 4> fds;
+    Rect view;
+};
+
 }  // namespace
 
 std::string_view to_string(CaptureState state) noexcept
@@ -212,6 +227,13 @@ struct PipeWireCapture::Impl {
             const std::lock_guard lock(impl_.mutex);
             return impl_.size;
         }
+        void set_access(FrameAccess wanted) override
+        {
+            const std::lock_guard lock(impl_.mutex);
+            impl_.wanted_access = wanted;
+        }
+        [[nodiscard]] std::optional<codec::ImageView> map_frame() override { return impl_.map_frame(); }
+        void release_frame() override { impl_.release_frame(); }
 
     private:
         Impl& impl_;
@@ -249,6 +271,8 @@ struct PipeWireCapture::Impl {
     pw_registry* registry = nullptr;
     pw_stream* stream = nullptr;
     spa_source* renegotiate_event = nullptr;
+    /// Requeues the buffers in `returned`; signalled by the session thread.
+    spa_source* release_event = nullptr;
     spa_hook core_listener{};
     spa_hook registry_listener{};
     spa_hook stream_listener{};
@@ -273,14 +297,27 @@ struct PipeWireCapture::Impl {
     std::optional<std::pair<std::int32_t, std::int32_t>> cursor_position;
     bool warned_bad_frame = false;
     bool warned_bad_cursor = false;
+    bool warned_few_buffers = false;
+    bool logged_held = false;
 
-    // Shared between the loop thread and the session thread.
+    // Shared between the loop thread and the session thread. Lock order: the
+    // loop lock (held in every callback) before `mutex`.
     mutable std::mutex mutex;
+    FrameAccess wanted_access = FrameAccess::cpu;
     std::vector<std::byte> pending;
     std::uint32_t pending_width = 0;
     std::uint32_t pending_height = 0;
     std::uint64_t pending_sequence = 0;
     bool frame_pending = false;
+    /// The pending frame is `pending_held`, not the pixels in `pending`.
+    bool pending_is_dmabuf = false;
+    HeldBuffer pending_held;
+    /// The frame the session took last, while it is a dmabuf.
+    HeldBuffer front_held;
+    /// Buffers the session gave back, for the loop thread to requeue.
+    std::vector<pw_buffer*> returned;
+    /// Bumped whenever PipeWire removes a buffer (Dmabuf::generation).
+    std::uint64_t buffer_generation = 0;
     DamageAccumulator pending_damage;
     CursorUpdate pending_cursor;
     bool cursor_pending = false;
@@ -292,6 +329,10 @@ struct PipeWireCapture::Impl {
     std::vector<std::byte> front;
     std::uint32_t front_width = 0;
     std::uint32_t front_height = 0;
+    /// `front` holds the pixels of the frame taken last.
+    bool front_has_pixels = false;
+    /// The frame taken last is `front_held` and was not released.
+    bool front_is_dmabuf = false;
 
     // --- Setup -------------------------------------------------------------
 
@@ -486,13 +527,42 @@ struct PipeWireCapture::Impl {
         self.slots[buffer] = std::make_unique<BufferSlot>();
     }
 
+    /// Also for buffers the capture holds: PipeWire takes them back when it
+    /// renegotiates, and they must not be requeued afterwards.
     static void on_remove_buffer(void* data, pw_buffer* buffer)
     {
         auto& self = *static_cast<Impl*>(data);
+        {
+            const std::lock_guard lock(self.mutex);
+            ++self.buffer_generation;
+            if (self.pending_held.buffer == buffer) {
+                self.pending_held.buffer = nullptr;
+            }
+            if (self.front_held.buffer == buffer) {
+                self.front_held.buffer = nullptr;
+            }
+            std::erase(self.returned, buffer);
+        }
         self.slots.erase(buffer);
     }
 
     static void on_process(void* data) { static_cast<Impl*>(data)->process(); }
+
+    static void on_release(void* data, std::uint64_t /*count*/)
+    {
+        auto& self = *static_cast<Impl*>(data);
+        std::vector<pw_buffer*> buffers;
+        {
+            const std::lock_guard lock(self.mutex);
+            buffers.swap(self.returned);
+        }
+        if (self.stream == nullptr) {
+            return;
+        }
+        for (pw_buffer* buffer : buffers) {
+            pw_stream_queue_buffer(self.stream, buffer);
+        }
+    }
 
     static void on_renegotiate(void* data, std::uint64_t /*count*/)
     {
@@ -535,6 +605,8 @@ struct PipeWireCapture::Impl {
         const bool uses_dmabuf = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
         format = info;
         layout = *negotiated;
+        warned_few_buffers = false;
+        logged_held = false;
         if (uses_dmabuf) {
             log::info(log_component, "format: {}x{}, spa format {}, dmabuf modifier {:#x}", info.size.width,
                       info.size.height, static_cast<std::uint32_t>(info.format), info.modifier);
@@ -631,8 +703,17 @@ struct PipeWireCapture::Impl {
             latest_view = view;
         }
         if (latest != nullptr) {
-            publish_frame(latest, latest_view, damage, view_changed);
-            pw_stream_queue_buffer(stream, latest);
+            DamageAccumulator view_damage = damage_in_view(damage, latest_view, view_changed);
+            bool held = false;
+            if (!view_damage.empty()) {  // else only pixels outside the crop changed
+                held = hold_frame(latest, latest_view, view_damage);
+                if (!held) {
+                    publish_frame(latest, latest_view, view_damage);
+                }
+            }
+            if (!held) {
+                pw_stream_queue_buffer(stream, latest);
+            }
         }
         buffers_received.fetch_add(handled, std::memory_order_release);
     }
@@ -673,7 +754,9 @@ struct PipeWireCapture::Impl {
         return intersect(rect, bounds).value_or(bounds);
     }
 
-    void publish_frame(pw_buffer* buffer, const Rect& view, DamageAccumulator& damage, bool view_changed)
+    /// The damage in the coordinates of `view`: everything when the view
+    /// changed.
+    DamageAccumulator damage_in_view(DamageAccumulator& damage, const Rect& view, bool view_changed) const
     {
         DamageAccumulator view_damage;
         if (damage.full() || view_changed || published_view != view) {
@@ -685,9 +768,32 @@ struct PipeWireCapture::Impl {
                 }
             }
         }
-        if (view_damage.empty()) {
-            return;  // Only pixels outside the crop changed.
+        return view_damage;
+    }
+
+    /// Makes the pending frame, with `mutex` held: merges its damage, and
+    /// gives back a dmabuf that was pending (returned for requeueing).
+    [[nodiscard]] pw_buffer* set_pending_locked(std::uint32_t width, std::uint32_t height,
+                                                DamageAccumulator& view_damage)
+    {
+        pw_buffer* superseded = std::exchange(pending_held.buffer, nullptr);
+        pending_width = width;
+        pending_height = height;
+        pending_sequence = frames_received;
+        if (view_damage.full()) {
+            pending_damage.add_full();
+        } else {
+            for (const Rect& rect : view_damage.take()) {
+                pending_damage.add(rect);
+            }
         }
+        frame_pending = true;
+        size = {width, height};
+        return superseded;
+    }
+
+    void publish_frame(pw_buffer* buffer, const Rect& view, DamageAccumulator& view_damage)
+    {
         const auto width = static_cast<std::uint32_t>(view.width);
         const auto height = static_cast<std::uint32_t>(view.height);
         work.resize(std::size_t{width} * height * 4U);
@@ -695,23 +801,95 @@ struct PipeWireCapture::Impl {
             return;
         }
         published_view = view;
+        pw_buffer* superseded = nullptr;
         {
             const std::lock_guard lock(mutex);
             std::swap(pending, work);
-            pending_width = width;
-            pending_height = height;
-            pending_sequence = frames_received;
-            if (view_damage.full()) {
-                pending_damage.add_full();
-            } else {
-                for (const Rect& rect : view_damage.take()) {
-                    pending_damage.add(rect);
-                }
-            }
-            frame_pending = true;
-            size = {width, height};
+            superseded = set_pending_locked(width, height, view_damage);
+            pending_held = HeldBuffer{};
+            pending_is_dmabuf = false;
+        }
+        if (superseded != nullptr) {
+            pw_stream_queue_buffer(stream, superseded);
         }
         wake(frame_wake);
+    }
+
+    /// With FrameAccess::dmabuf: keeps a dmabuf buffer dequeued as the
+    /// pending frame, without reading it. False when the frame is to be read
+    /// instead: shared memory, a crop (encoders take whole buffers), too few
+    /// buffers, or a consumer that wants pixels.
+    bool hold_frame(pw_buffer* buffer, const Rect& view, DamageAccumulator& view_damage)
+    {
+        {
+            const std::lock_guard lock(mutex);
+            if (wanted_access != FrameAccess::dmabuf) {
+                return false;
+            }
+        }
+        const auto planes = planes_of(buffer->buffer);
+        if (!format || (format->flags & SPA_VIDEO_FLAG_MODIFIER) == 0 || planes.empty() ||
+            planes[0].type != SPA_DATA_DmaBuf) {
+            return false;
+        }
+        const std::uint32_t width = format->size.width;
+        const std::uint32_t height = format->size.height;
+        if (view != Rect{0, 0, clamp_to_int32(width), clamp_to_int32(height)}) {
+            return false;
+        }
+        if (slots.size() < min_buffers_to_hold) {
+            if (!warned_few_buffers) {
+                warned_few_buffers = true;
+                log::warn(log_component, "the stream has only {} buffers; reading dmabufs instead of passing them on",
+                          slots.size());
+            }
+            return false;
+        }
+        HeldBuffer held;
+        held.buffer = buffer;
+        held.view = view;
+        held.dmabuf.drm_format = drm_fourcc(layout);
+        held.dmabuf.modifier = format->modifier;
+        held.dmabuf.width = width;
+        held.dmabuf.height = height;
+        for (const spa_data& data : planes) {
+            if (data.type != SPA_DATA_DmaBuf || held.dmabuf.plane_count == held.fds.size() || data.chunk == nullptr) {
+                break;
+            }
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+            const int fd = ::fcntl(static_cast<int>(data.fd), F_DUPFD_CLOEXEC, 3);
+            if (fd < 0) {
+                return false;
+            }
+            const std::uint32_t plane = held.dmabuf.plane_count++;
+            held.fds.at(plane) = UniqueFd(fd);
+            const std::uint32_t pitch = data.chunk->stride > 0 ? static_cast<std::uint32_t>(data.chunk->stride)
+                                        : plane == 0            ? width * 4U
+                                                                : 0U;
+            held.dmabuf.planes.at(plane) = DmabufPlane{fd, data.chunk->offset, pitch};
+        }
+        if (held.dmabuf.plane_count == 0) {
+            return false;
+        }
+        if (!logged_held) {
+            logged_held = true;
+            log::info(log_component, "passing dmabufs on without reading them (modifier {:#x}, {} buffers)",
+                      format->modifier, slots.size());
+        }
+        published_view = view;
+        pw_buffer* superseded = nullptr;
+        {
+            const std::lock_guard lock(mutex);
+            held.dmabuf.generation = buffer_generation;
+            superseded = set_pending_locked(width, height, view_damage);
+            pending_held = std::move(held);  // the old descriptors close with `held`
+            pending_is_dmabuf = true;
+        }
+        if (superseded != nullptr) {
+            pw_stream_queue_buffer(stream, superseded);
+        }
+        wake(frame_wake);
+        return true;
     }
 
     /// Converts the `view` part of the buffer's pixels to BGRX in `out`.
@@ -928,29 +1106,108 @@ struct PipeWireCapture::Impl {
 
     std::optional<Frame> take_frame()
     {
-        const std::lock_guard lock(mutex);
-        if (!frame_pending) {
+        Frame frame;
+        bool returned_buffer = false;
+        {
+            const std::lock_guard lock(mutex);
+            if (!frame_pending) {
+                return std::nullopt;
+            }
+            returned_buffer = return_front_locked();
+            std::vector<Rect> damage = pending_damage.take();
+            if (pending_width != front_width || pending_height != front_height) {
+                damage.clear();  // The size changed: everything.
+            }
+            front_width = pending_width;
+            front_height = pending_height;
+            frame_pending = false;
+            if (state != CaptureState::closed) {
+                drain(frame_wake);
+            }
+            if (pending_is_dmabuf) {
+                front_held = std::exchange(pending_held, HeldBuffer{});
+                pending_is_dmabuf = false;
+                front_is_dmabuf = true;
+                front_has_pixels = false;
+                frame.dmabuf = front_held.dmabuf;
+            } else {
+                std::swap(front, pending);
+                front_has_pixels = true;
+                frame.image = front_image();
+            }
+            frame.damage = std::move(damage);
+            frame.sequence = pending_sequence;
+        }
+        if (returned_buffer) {
+            pw::loop_signal_event(pw_thread_loop_get_loop(loop), release_event);
+        }
+        return frame;
+    }
+
+    [[nodiscard]] codec::ImageView front_image() const
+    {
+        return {std::span<const std::byte>(front).first(std::size_t{front_width} * front_height * 4U), front_width,
+                front_height, std::size_t{front_width} * 4U};
+    }
+
+    /// Gives the session's dmabuf frame back, with `mutex` held. True if a
+    /// buffer now waits in `returned` for the loop thread.
+    bool return_front_locked()
+    {
+        if (!front_is_dmabuf) {
+            return false;
+        }
+        front_is_dmabuf = false;
+        pw_buffer* buffer = std::exchange(front_held.buffer, nullptr);
+        front_held = HeldBuffer{};
+        if (buffer == nullptr) {
+            return false;  // PipeWire removed it meanwhile
+        }
+        returned.push_back(buffer);
+        return true;
+    }
+
+    void release_frame()
+    {
+        bool returned_buffer = false;
+        {
+            const std::lock_guard lock(mutex);
+            returned_buffer = return_front_locked();
+            front_has_pixels = false;
+        }
+        if (returned_buffer) {
+            pw::loop_signal_event(pw_thread_loop_get_loop(loop), release_event);
+        }
+    }
+
+    /// Reads the dmabuf the session holds into `front`, with the loop locked:
+    /// PipeWire cannot remove the buffer meanwhile, and the mappings are the
+    /// loop thread's.
+    std::optional<codec::ImageView> map_frame()
+    {
+        if (front_has_pixels) {
+            return front_image();
+        }
+        if (!front_is_dmabuf) {
             return std::nullopt;
         }
-        std::swap(front, pending);
-        std::vector<Rect> damage = pending_damage.take();
-        if (pending_width != front_width || pending_height != front_height) {
-            damage.clear();  // The size changed: everything.
+        const pw::LoopLock loop_lock(loop);
+        pw_buffer* buffer = nullptr;
+        Rect view;
+        {
+            const std::lock_guard lock(mutex);
+            buffer = front_held.buffer;
+            view = front_held.view;
         }
-        front_width = pending_width;
-        front_height = pending_height;
-        frame_pending = false;
-        if (state != CaptureState::closed) {
-            drain(frame_wake);
+        if (buffer == nullptr) {
+            return std::nullopt;  // PipeWire took it back
         }
-        Frame frame;
-        frame.image.data = std::span<const std::byte>(front).first(std::size_t{front_width} * front_height * 4U);
-        frame.image.width = front_width;
-        frame.image.height = front_height;
-        frame.image.stride = std::size_t{front_width} * 4U;
-        frame.damage = std::move(damage);
-        frame.sequence = pending_sequence;
-        return frame;
+        front.resize(std::size_t{front_width} * front_height * 4U);
+        if (!read_pixels(buffer, view, front)) {
+            return std::nullopt;
+        }
+        front_has_pixels = true;
+        return front_image();
     }
 
     std::optional<CursorUpdate> take_cursor()
@@ -1035,6 +1292,10 @@ PipeWireCapture::Impl::~Impl()
                 pw::loop_destroy_source(pw_thread_loop_get_loop(loop), renegotiate_event);
                 renegotiate_event = nullptr;
             }
+            if (release_event != nullptr) {
+                pw::loop_destroy_source(pw_thread_loop_get_loop(loop), release_event);
+                release_event = nullptr;
+            }
         }
         pw_thread_loop_stop(loop);
     }
@@ -1103,6 +1364,23 @@ Result<std::unique_ptr<PipeWireCapture>> PipeWireCapture::create(int pipewire_fd
     }
     pw::registry_add_listener(impl->registry, &impl->registry_listener, &registry_events(), impl.get());
 
+    // One round trip, so that a dead remote fails here and not later. It
+    // comes before the stream: libpipewire leaks the stream's exported node
+    // when the core dies while pw_stream_connect exports it.
+    impl->sync_seq = pw::core_sync(impl->core, PW_ID_CORE, 0);
+    const auto is_closed = [&impl] {
+        const std::lock_guard state_lock(impl->mutex);
+        return impl->state == CaptureState::closed;
+    };
+    while (!impl->sync_done) {
+        if (is_closed()) {
+            return fail(Errc::io, "the PipeWire connection failed");
+        }
+        if (pw_thread_loop_timed_wait(impl->loop, connect_timeout_seconds) != 0) {
+            return fail(Errc::io, "PipeWire did not answer");
+        }
+    }
+
     const std::array<spa_dict_item, 4> items{{
         {PW_KEY_MEDIA_TYPE, "Video"},
         {PW_KEY_MEDIA_CATEGORY, "Capture"},
@@ -1117,6 +1395,7 @@ Result<std::unique_ptr<PipeWireCapture>> PipeWireCapture::create(int pipewire_fd
     pw_stream_add_listener(impl->stream, &impl->stream_listener, &stream_events(), impl.get());
     impl->renegotiate_event =
         pw::loop_add_event(pw_thread_loop_get_loop(impl->loop), &Impl::on_renegotiate, impl.get());
+    impl->release_event = pw::loop_add_event(pw_thread_loop_get_loop(impl->loop), &Impl::on_release, impl.get());
 
     pw::PodBuilder b;
     auto params = impl->build_formats(b);
@@ -1132,21 +1411,6 @@ Result<std::unique_ptr<PipeWireCapture>> PipeWireCapture::create(int pipewire_fd
     if (pw_stream_connect(impl->stream, PW_DIRECTION_INPUT, node_id, flags, params.data(),
                           static_cast<std::uint32_t>(params.size())) < 0) {
         return fail(Errc::io, "cannot connect the PipeWire stream");
-    }
-
-    // One round trip, so that a dead remote fails here and not later.
-    impl->sync_seq = pw::core_sync(impl->core, PW_ID_CORE, 0);
-    const auto is_closed = [&impl] {
-        const std::lock_guard state_lock(impl->mutex);
-        return impl->state == CaptureState::closed;
-    };
-    while (!impl->sync_done) {
-        if (is_closed()) {
-            return fail(Errc::io, "the PipeWire connection failed");
-        }
-        if (pw_thread_loop_timed_wait(impl->loop, connect_timeout_seconds) != 0) {
-            return fail(Errc::io, "PipeWire did not answer");
-        }
     }
     return std::unique_ptr<PipeWireCapture>(new PipeWireCapture(std::move(impl)));
 }

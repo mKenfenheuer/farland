@@ -15,15 +15,20 @@ Useful configurations:
 | Sanitizers | `CC=clang CXX=clang++ meson setup build-asan --buildtype=debug -Dhardening=false -Db_sanitize=address,undefined -Db_lundef=false` |
 | Fuzzing | `CC=clang CXX=clang++ meson setup build-fuzz -Dfuzzing=true -Dhardening=false -Db_sanitize=address,undefined -Db_lundef=false`, then `./build-fuzz/fuzz/fuzz-ber fuzz/corpus/ber` |
 | Warnings as errors (as in CI) | add `-Dwerror=true` |
+| Benchmarks (not run by `meson test`) | `meson setup build-rel --buildtype=release`, then `meson compile -C build-rel bench-progressive && ./build-rel/benchmarks/bench-progressive` |
 
 On macOS, use Apple clang for the sanitizer builds (ASan, UBSan and TSan all work). Apple clang has no libFuzzer, though, so fuzz with Homebrew LLVM (`CC=$(brew --prefix llvm)/bin/clang`) and `-Db_sanitize=undefined` only: Homebrew LLVM 20's AddressSanitizer runtime deadlocks at startup on macOS 26, inside `AsanInitInternal`. ASan fuzzing therefore only works on Linux. farland itself targets Linux, and macOS is only for working on the platform-independent libraries.
 
 Tests that need an H.264 encoder are skipped unless one is available. To run them, set `FARLAND_OPENH264_LIBRARY` to a libopenh264 (Cisco's prebuilt binaries from ciscobinary.openh264.org work) or configure with `-Dx264=enabled`. `FARLAND_FFMPEG` and `FARLAND_FFPROBE` point the H.264 quality tests at ffmpeg.
 
+The VA-API backend is built when `libva-dev` (libva and libva-drm >= 2.14) is installed (`-Dvaapi=enabled` insists on it). Its tests need a GPU with a VA-API driver (`mesa-va-drivers` or `intel-media-va-driver`) and access to its render node, and skip otherwise; `FARLAND_VAAPI_DEVICE=/dev/dri/renderD129` picks the node on machines with several GPUs. `build/tests/video/farland-vaapi-bench` measures CPU time and latency of 4K encoding from dmabufs (`--cpu` adds the CPU conversion path).
+
+The NVENC backend (`-Dnvenc`, on by default on Linux) needs nothing to build: libnvidia-encode, libcuda and libEGL come with the NVIDIA driver (520 or newer) and are loaded at runtime. Its tests skip without an NVIDIA GPU; the dmabuf tests also need `libgbm-dev` and `libegl-dev` and access to the GPU's render node (group `render`, or a desktop session on the seat). `FARLAND_VAAPI_DEVICE` picks the render node on machines with several GPUs. `build/tests/video/farland-nvenc-bench` measures CPU time and latency of 4K encoding from dmabufs (`--cpu` adds the CPU conversion path, `--preset 1..7` and `--low-latency` change the NVENC tuning).
+
 The portal backend (Linux only) needs `libsystemd-dev`, `libei-dev` and `libpipewire-0.3-dev`, with `libgbm-dev` and `libegl-dev` optional for tiled dmabufs. Its tests skip what they cannot run:
 - the portal session tests need `dbus-daemon`, `python3-dbus` and `python3-gi`, and run `tests/platform/portal/mock_portal.py` on a private bus;
 - the libei tests need `libeis-dev`;
-- the capture tests need the `pipewire` daemon, which they start privately.
+- the capture tests need the `pipewire` daemon, which they start privately; the ones that pass dmabufs on also need read-write access to `/dev/udmabuf` (logind grants it to the user at the seat on Ubuntu), and skip without it.
 
 `build/tests/platform/portal/farland-portal-probe` tries a real portal session on a desktop.
 

@@ -8,6 +8,9 @@
 #include <farland/auth/ntlm.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/log.hpp>
+#ifdef FARLAND_HAVE_VAAPI
+#include <farland/video/vaapi_encoder.hpp>
+#endif
 
 #include "nla.hpp"
 #ifdef FARLAND_HAVE_PORTAL
@@ -108,8 +111,19 @@ void usage()
                  "  --hostname NAME       certificate host name (default: this host's name)\n"
                  "  --fps N               frame rate of the test pattern (default 30)\n"
                  "  --codec planar|raw    bitmap codec for 32 bpp sessions (default planar)\n"
-                 "  --gfx-codec CODEC     progressive, planar or avc420 for GFX clients (default progressive)\n"
-                 "  --openh264 FILE       OpenH264 library for avc420 (default: libopenh264.so.8 and older)\n"
+                 "  --gfx-codec CODEC     progressive, planar, avc420 or avc444 for GFX clients (default progressive)\n"
+                 "  --openh264 FILE       OpenH264 library for avc420/avc444 (default: libopenh264.so.8 and older)\n"
+                 "  --h264-encoder NAME   auto, nvenc, vaapi, openh264 or x264 for avc420/avc444 (default auto:\n"
+                 "                        NVENC on NVIDIA, VA-API where another GPU encodes H.264, else OpenH264)\n"
+                 "  --render-node PATH    DRM render node for NVENC and VA-API (default: the first that works)\n"
+                 "  --no-zero-copy        with --share: read every frame into CPU memory, even where the H.264\n"
+                 "                        encoder takes the captured dmabufs directly (for comparisons and\n"
+                 "                        driver problems)\n"
+                 "  --no-clearcodec       Progressive surfaces: no ClearCodec for text and UI tiles\n"
+                 "  --no-refine           Progressive surfaces: every tile at full quality at once, no\n"
+                 "                        refinement passes\n"
+                 "  --autodetect MODE     network auto-detect for clients that support it: full (default;\n"
+                 "                        also measures before licensing), continuous (only once connected) or off\n"
                  "  --max-sessions N      concurrent connections (default 4)\n"
                  "  --share               share the running Wayland desktop (xdg-desktop-portal, PipeWire, libei)\n"
                  "                        instead of the test pattern; one session at a time\n"
@@ -159,11 +173,41 @@ bool parse_options(std::span<char*> args, Options& options)
                 options.session.gfx_codec = farland::server::TileCodec::planar;
             } else if (codec == "avc420" || codec == "h264") {
                 options.session.gfx_codec = farland::server::TileCodec::avc420;
+            } else if (codec == "avc444") {
+                options.session.gfx_codec = farland::server::TileCodec::avc444;
             } else {
-                throw std::runtime_error("--gfx-codec must be progressive, planar or avc420");
+                throw std::runtime_error("--gfx-codec must be progressive, planar, avc420 or avc444");
             }
         } else if (arg == "--openh264") {
             options.session.openh264_library = value();
+        } else if (arg == "--h264-encoder") {
+            const auto name = value();
+            if (name == "auto") {
+                options.session.h264_backend.reset();
+            } else if (const auto backend = farland::video::parse_backend(name)) {
+                options.session.h264_backend = *backend;
+            } else {
+                throw std::runtime_error("--h264-encoder must be auto, nvenc, vaapi, openh264 or x264");
+            }
+        } else if (arg == "--render-node") {
+            options.session.render_node = value();
+        } else if (arg == "--no-zero-copy") {
+            options.session.zero_copy = false;
+        } else if (arg == "--no-clearcodec") {
+            options.session.clearcodec = false;
+        } else if (arg == "--no-refine") {
+            options.session.refine = false;
+        } else if (arg == "--autodetect") {
+            const auto mode = value();
+            if (mode == "full") {
+                options.session.autodetect = farland::server::AutoDetectMode::full;
+            } else if (mode == "continuous") {
+                options.session.autodetect = farland::server::AutoDetectMode::continuous;
+            } else if (mode == "off") {
+                options.session.autodetect = farland::server::AutoDetectMode::off;
+            } else {
+                throw std::runtime_error("--autodetect must be full, continuous or off");
+            }
         } else if (arg == "--max-sessions") {
             options.max_sessions = std::stoi(value());
         } else if (arg == "--allow-tls-only") {
@@ -341,10 +385,23 @@ int main(int argc, char** argv)
     // Declared before the listener and the session threads, destroyed after them.
     std::unique_ptr<app::Desktop> desktop;
     if (options.share) {
+        // The capture offers the dmabuf layouts of the encoder's GPU, so it
+        // needs the encoder's render node.
+        std::string render_node = options.session.render_node;
+#ifdef FARLAND_HAVE_VAAPI
+        const auto backend = options.session.h264_backend;
+        if (render_node.empty() && options.session.gfx_codec == farland::server::TileCodec::avc420 &&
+            (!backend || *backend == farland::video::Backend::vaapi)) {
+            if (const auto device = farland::video::vaapi::probe()) {
+                render_node = device->render_node;
+            }
+        }
+#endif
         auto shared = app::start_portal_desktop(app::PortalDesktopOptions{
             .virtual_monitor = options.virtual_monitor,
             .restore_token_file = std::nullopt,
             .timeout = std::chrono::seconds(300),
+            .render_node = render_node,
         });
         if (!shared) {
             std::cerr << "farland-server: cannot share the desktop: " << shared.error().message() << "\n";

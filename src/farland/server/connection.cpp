@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <farland/base/log.hpp>
+#include <farland/proto/autodetect.hpp>
 #include <farland/proto/client_info.hpp>
 #include <farland/proto/fastpath.hpp>
 #include <farland/proto/framing.hpp>
@@ -11,6 +12,8 @@
 #include <farland/server/connection.hpp>
 
 #include <algorithm>
+#include <format>
+#include <string>
 #include <utility>
 
 namespace farland::server {
@@ -28,6 +31,14 @@ constexpr std::uint32_t channel_chunk_length = 1600;
 constexpr std::size_t slow_path_update_limit = 0x3FFF - 64;  // MCS PER length minus headers
 /// Pointer cache slots the server advertises; FreeRDP's server offers 25 too.
 constexpr std::uint16_t pointer_cache_slots = 25;
+/// Missed heartbeats before the client warns, and then before it reconnects.
+constexpr std::uint8_t heartbeat_warning_count = 3;
+constexpr std::uint8_t heartbeat_reconnect_count = 5;
+
+std::uint32_t milliseconds(std::chrono::steady_clock::duration d)
+{
+    return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+}
 
 /// The color depth to run the session at, from the client's CS_CORE.
 std::uint16_t choose_bits_per_pixel(const gcc::ClientCoreData& core, std::uint16_t max_bpp)
@@ -97,6 +108,8 @@ std::string_view to_string(State state) noexcept
         return "wait-attach-user";
     case State::wait_channel_joins:
         return "wait-channel-joins";
+    case State::connect_time_autodetect:
+        return "connect-time-autodetect";
     case State::wait_confirm_active:
         return "wait-confirm-active";
     case State::finalizing:
@@ -128,7 +141,8 @@ bool Session::supports_gfx() const
            static_channel_id("drdynvc").has_value();
 }
 
-Connection::Connection(ServerConfig config, Negotiation negotiation) : config_(std::move(config))
+Connection::Connection(ServerConfig config, Negotiation negotiation)
+    : config_(std::move(config)), autodetect_(config_.autodetect_config)
 {
     session_.negotiation = std::move(negotiation);
 }
@@ -170,7 +184,50 @@ std::vector<std::byte> Connection::take_output()
 {
     auto bytes = std::move(output_).take();
     output_ = Writer{};
-    return bytes;
+    if (bytes.empty()) {
+        return bytes;
+    }
+    last_output_ = now_;
+    // Continuous bandwidth measurement over real traffic: the client times
+    // the bytes between Start and Stop ([MS-RDPBCGR] 2.2.14.2.2). The output
+    // has not reached the wire yet, so the Start can still go in front.
+    if (state_ != State::active || !session_.autodetect || config_.autodetect == AutoDetectMode::off ||
+        !autodetect_.bandwidth_measurement_due(now_, bytes.size())) {
+        return bytes;
+    }
+    Writer framed(bytes.size() + 64);
+    send_autodetect(framed, autodetect_.start_bandwidth_measurement(now_));
+    framed.bytes(bytes);
+    send_autodetect(framed, autodetect_.stop_bandwidth_measurement());
+    return std::move(framed).take();
+}
+
+void Connection::tick(Clock::time_point now)
+{
+    now_ = now;
+    if (state_ == State::connect_time_autodetect && autodetect_.connect_time_complete(now_)) {
+        finish_connect_time_autodetect();
+        return;
+    }
+    if (state_ != State::active) {
+        return;
+    }
+    if (session_.autodetect) {
+        if (const auto probe = autodetect_.poll_rtt_request(now_)) {
+            send_autodetect(output_, *probe);
+            last_output_ = now_;
+        }
+    }
+    // [MS-RDPBCGR] 2.2.16.1: only when nothing else went out for a period.
+    if (session_.heartbeat && config_.heartbeat_period.count() > 0 && now_ - last_output_ >= config_.heartbeat_period) {
+        const proto::autodetect::Heartbeat heartbeat{
+            static_cast<std::uint8_t>(std::min<std::int64_t>(config_.heartbeat_period.count(), 0xFF)),
+            heartbeat_warning_count, heartbeat_reconnect_count};
+        Writer payload;
+        proto::autodetect::encode(payload, heartbeat);
+        write_message_channel(output_, proto::sec_flags::heartbeat, payload.view());
+        last_output_ = now_;
+    }
 }
 
 std::optional<Event> Connection::poll_event()
@@ -324,8 +381,7 @@ Result<void> Connection::on_domain_pdu(Reader& data)
         return on_io_data(payload);
     }
     if (session_.message_channel_id && send->channel_id == *session_.message_channel_id) {
-        log::debug(log_component, "ignoring {} bytes on the message channel", send->data.size());
-        return {};
+        return on_message_channel(payload);
     }
     const bool known = std::ranges::any_of(session_.static_channels,
                                            [id = send->channel_id](const auto& c) { return c.second == id; });
@@ -370,12 +426,78 @@ Result<void> Connection::on_client_info(Reader& data)
               info.flags);
     events_.emplace_back(event::ClientInfo{info.domain, info.user_name, std::move(info.password), info.flags});
 
+    // Auto-detect and heartbeats need the client's support and the message
+    // channel ([MS-RDPBCGR] 2.2.14.3, 2.2.16.1); the joins are over by now.
+    const auto& core = session_.client_data.core;
+    const bool channel = message_channel_joined();
+    session_.autodetect = channel && config_.autodetect != AutoDetectMode::off &&
+                          core.has_early_flag(gcc::cs_early_flags::support_netchar_autodetect);
+    session_.heartbeat = channel && core.has_early_flag(gcc::cs_early_flags::support_heartbeat_pdu);
+    if (session_.autodetect && config_.autodetect == AutoDetectMode::full) {
+        // [MS-RDPBCGR] 1.3.1.1 phase 6: connect-time detection comes before
+        // licensing. The answers, or the timeout in tick(), end it.
+        state_ = State::connect_time_autodetect;
+        for (const auto& request : autodetect_.start_connect_time(now_)) {
+            send_autodetect(output_, request);
+        }
+        return {};
+    }
+    start_licensing();
+    return {};
+}
+
+bool Connection::message_channel_joined() const
+{
+    if (!session_.message_channel_id) {
+        return false;
+    }
+    // With skip-channel-join every channel counts as joined ([MS-RDPBCGR] 3.3.5.3.8).
+    return session_.client_data.core.has_early_flag(gcc::cs_early_flags::support_skip_channeljoin) ||
+           std::ranges::find(joined_channels_, *session_.message_channel_id) != joined_channels_.end();
+}
+
+void Connection::start_licensing()
+{
     // Licensing is over at once ([MS-RDPBCGR] 2.2.1.12), then capabilities.
     Writer license;
     proto::encode_license_valid_client(license);
     send_io(license.view());
     session_.share_id = 0x00010000U | session_.user_channel_id;
     send_demand_active();
+}
+
+void Connection::finish_connect_time_autodetect()
+{
+    const auto& estimate = autodetect_.estimate();
+    log::info(log_component, "connect-time auto-detect: RTT {}, bandwidth {}",
+              estimate.rtt ? std::format("{} ms", milliseconds(*estimate.rtt)) : std::string("unknown"),
+              estimate.bandwidth_kbps ? std::format("{} kbit/s", *estimate.bandwidth_kbps) : std::string("unknown"));
+    // [MS-RDPBCGR] 2.2.14.1.5: tell the client what was measured.
+    if (const auto result = autodetect_.network_characteristics_result()) {
+        send_autodetect(output_, *result);
+    }
+    start_licensing();
+}
+
+Result<void> Connection::on_message_channel(Reader& data)
+{
+    FARLAND_TRY(const std::uint16_t flags, proto::read_basic_security_header(data));
+    if ((flags & proto::sec_flags::autodetect_rsp) == 0) {
+        // Initiate Multitransport Responses and the like: farland offers no multitransport.
+        log::debug(log_component, "ignoring a message channel PDU with security flags 0x{:x}", flags);
+        return {};
+    }
+    // Auto-detect is optional: a response farland cannot read is dropped,
+    // not a reason to end the session.
+    auto response = proto::autodetect::decode_response(data);
+    if (!response) {
+        log::warn(log_component, "ignoring an auto-detect response: {}", response.error().message());
+        return {};
+    }
+    autodetect_.on_response(*response, now_);
+    if (state_ == State::connect_time_autodetect && autodetect_.connect_time_complete(now_)) {
+        finish_connect_time_autodetect();
+    }
     return {};
 }
 
@@ -601,6 +723,24 @@ void Connection::send_io(std::span<const std::byte> payload)
     const std::size_t tpkt = proto::begin_data_tpdu(output_);
     mcs::encode(output_, mcs::SendDataIndication{mcs::server_channel_id, mcs::io_channel_id, payload});
     proto::end_tpkt(output_, tpkt);
+}
+
+void Connection::write_message_channel(Writer& out, std::uint16_t flags, std::span<const std::byte> payload) const
+{
+    FARLAND_ASSERT(session_.message_channel_id.has_value());
+    Writer data(payload.size() + 4);
+    proto::write_basic_security_header(data, flags);
+    data.bytes(payload);
+    const std::size_t tpkt = proto::begin_data_tpdu(out);
+    mcs::encode(out, mcs::SendDataIndication{mcs::server_channel_id, *session_.message_channel_id, data.view()});
+    proto::end_tpkt(out, tpkt);
+}
+
+void Connection::send_autodetect(Writer& out, const proto::autodetect::Request& request) const
+{
+    Writer payload;
+    proto::autodetect::encode(payload, request);
+    write_message_channel(out, proto::sec_flags::autodetect_req, payload.view());
 }
 
 void Connection::send_channel_data(std::uint16_t channel_id, std::span<const std::byte> chunk)
