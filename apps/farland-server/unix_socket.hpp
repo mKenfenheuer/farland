@@ -34,8 +34,9 @@ struct ReceivedMessage {
 /// Sends one framed message (`frame` starts with its length prefix) with
 /// `fd` attached, or none for -1. The kernel duplicates the descriptor; the
 /// caller still owns `fd`. Retries after EINTR, finishes partial writes and
-/// waits on a non-blocking socket. Never raises SIGPIPE.
-[[nodiscard]] Result<void> send_message(int socket, std::span<const std::byte> frame, int fd = -1);
+/// waits on a non-blocking socket, up to `timeout_ms` in all (negative: no
+/// limit). Never raises SIGPIPE.
+[[nodiscard]] Result<void> send_message(int socket, std::span<const std::byte> frame, int fd = -1, int timeout_ms = -1);
 
 /// Receives exactly one framed message whose body (after the prefix) is at
 /// most `max_body` bytes, and the descriptor sent with it. nullopt: the peer

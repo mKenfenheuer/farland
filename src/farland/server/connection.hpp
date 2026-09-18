@@ -7,10 +7,12 @@
 #include <farland/base/writer.hpp>
 #include <farland/proto/bitmap.hpp>
 #include <farland/proto/capabilities.hpp>
+#include <farland/proto/client_info.hpp>
 #include <farland/proto/framing.hpp>
 #include <farland/proto/gcc.hpp>
 #include <farland/proto/input.hpp>
 #include <farland/proto/pointer.hpp>
+#include <farland/proto/save_session_info.hpp>
 #include <farland/proto/share.hpp>
 #include <farland/server/autodetect.hpp>
 #include <farland/server/preauth.hpp>
@@ -144,6 +146,9 @@ struct ClientInfo {
     std::string user_name;
     SecretString password;
     std::uint32_t flags = 0;
+    /// ARC_CS_PRIVATE_PACKET from the extended info: the client returns to
+    /// the session whose cookie it got ([MS-RDPBCGR] 5.5, auth/auto_reconnect.hpp).
+    std::optional<proto::AutoReconnectCookie> auto_reconnect_cookie;
 };
 /// The connection is active (again, after `reactivate`); `session()` is complete.
 struct Activated {
@@ -217,6 +222,10 @@ public:
     /// [MS-RDPBCGR] 2.2.6.1) on a channel the client asked for. Allowed from
     /// the capability exchange on; ignored once the connection is closed.
     void send_channel_data(std::uint16_t channel_id, std::span<const std::byte> chunk);
+    /// Sends a Save Session Info PDU with the extended logon information
+    /// ([MS-RDPBCGR] 2.2.10.1), such as a new auto-reconnect cookie (5.5).
+    /// Active only.
+    void send_save_session_info(const proto::LogonInfoExtended& info);
     /// Deactivate All followed by a new Demand Active with another desktop size.
     void reactivate(std::uint16_t width, std::uint16_t height);
     /// Orderly server-side disconnect: Set Error Info (when the client supports

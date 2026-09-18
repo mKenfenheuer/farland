@@ -112,6 +112,7 @@ openssl_dep = dependency('openssl', version: '>= 3.0')
 
 subdir('src')
 subdir('apps')
+subdir('data')
 
 catch2_dep = dependency(
   'catch2-with-main',

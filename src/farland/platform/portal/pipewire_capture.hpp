@@ -8,8 +8,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 /// The video half of the portal backend (docs/PLAN.md §3.3): consumes one
 /// ScreenCast PipeWire stream and turns it into BGRX frames and cursor updates.
@@ -29,6 +31,9 @@ struct PipeWireCaptureOptions {
     bool cursor_premultiplied = true;
     /// node.name of the capture stream, for pw-dump and logs.
     std::string stream_name = "farland-capture";
+    /// Asks for this size from the first negotiation on, as request_size()
+    /// does later (a virtual monitor then starts at it).
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> size;
 };
 
 enum class CaptureState : std::uint8_t {

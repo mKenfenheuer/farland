@@ -252,6 +252,10 @@ private:
             r.text = std::format("{} discrete {} {}", r.device, eis_event_scroll_get_discrete_dx(event),
                                  eis_event_scroll_get_discrete_dy(event));
             break;
+        case EIS_EVENT_SCROLL_DELTA:
+            r.text = std::format("{} scroll {:.2f} {:.2f}", r.device, eis_event_scroll_get_dx(event),
+                                 eis_event_scroll_get_dy(event));
+            break;
         default:
             r.text = std::format("{} {}", r.device, eis_event_type_to_string(type));
             break;
@@ -501,8 +505,8 @@ TEST_CASE("EiInput sends relative motion, buttons and wheel steps")
     CHECK(texts(events, "pointer") == std::vector<std::string>{"pointer motion 5.00 -3.00", "pointer button 272 down",
                                                                "pointer button 272 up", "pointer frame"});
     CHECK(texts(events, "absolute") == std::vector<std::string>{"absolute abs 10.00 10.00", "absolute button 273 down",
-                                                                "absolute button 273 up", "absolute discrete 0 120",
-                                                                "absolute discrete -240 0", "absolute frame"});
+                                                                "absolute button 273 up", "absolute scroll 0.00 30.00",
+                                                                "absolute scroll -60.00 0.00", "absolute frame"});
     CHECK(texts(events, "keyboard").empty());
 }
 

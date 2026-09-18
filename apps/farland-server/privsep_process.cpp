@@ -88,6 +88,17 @@ std::optional<std::vector<std::byte>> read_frame(int fd, std::vector<std::byte>&
     }
 }
 
+/// Logs an abnormal end of network process `pid`.
+void report_exit(pid_t pid, int status)
+{
+    if (WIFSIGNALED(status)) {
+        log::warn(log_component, "network process {} died of signal {}{}", pid, WTERMSIG(status),
+                  WTERMSIG(status) == SIGSYS ? " (a system call the sandbox forbids)" : "");
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        log::warn(log_component, "network process {} exited with status {}", pid, WEXITSTATUS(status));
+    }
+}
+
 /// Waits for the network process to exit, killing it if it lingers.
 class ChildProcess {
 public:
@@ -117,14 +128,8 @@ public:
 private:
     void report(int status, bool reaped) const
     {
-        if (!reaped) {
-            return;
-        }
-        if (WIFSIGNALED(status)) {
-            log::warn(log_component, "network process {} died of signal {}{}", pid_, WTERMSIG(status),
-                      WTERMSIG(status) == SIGSYS ? " (a system call the sandbox forbids)" : "");
-        } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-            log::warn(log_component, "network process {} exited with status {}", pid_, WEXITSTATUS(status));
+        if (reaped) {
+            report_exit(pid_, status);
         }
     }
 
@@ -229,10 +234,11 @@ std::optional<server::Negotiation> await_authentication(int control, const std::
 
 }  // namespace
 
-void run_monitored_session(int client_fd, const std::string& peer, const ChildLaunch& launch,
-                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop)
+std::optional<AuthenticatedClient> authenticate_monitored(int client_fd, const std::string& peer,
+                                                          const ChildLaunch& launch, auth::NtlmVerifier& verifier,
+                                                          const SessionOptions& options, const std::atomic<bool>& stop,
+                                                          Clock::time_point started)
 {
-    const auto started = Clock::now();
     std::array<int, 2> control{-1, -1};
     std::array<int, 2> plain{-1, -1};
     if (!make_socket_pair(control) || !make_socket_pair(plain)) {
@@ -241,7 +247,7 @@ void run_monitored_session(int client_fd, const std::string& peer, const ChildLa
                 ::close(fd);
             }
         }
-        return;
+        return std::nullopt;
     }
     const pid_t pid = spawn_child(launch, peer, {client_fd, control[1], plain[1]});
     ::close(client_fd);
@@ -250,18 +256,42 @@ void run_monitored_session(int client_fd, const std::string& peer, const ChildLa
     if (pid < 0) {
         ::close(control[0]);
         ::close(plain[0]);
-        return;
+        return std::nullopt;
     }
-    const ChildProcess child(pid);
     log::debug(log_component, "{}: network process {}", peer, pid);
 
     auto negotiation = await_authentication(control[0], peer, verifier, options, stop, started);
     ::close(control[0]);
     if (!negotiation) {
         ::close(plain[0]);
+        const ChildProcess child(pid);
+        return std::nullopt;
+    }
+    return AuthenticatedClient{std::move(*negotiation), UniqueFd(plain[0]), pid};
+}
+
+void wait_network_process(pid_t pid)
+{
+    int status = 0;
+    pid_t done = -1;
+    do {
+        done = ::waitpid(pid, &status, 0);
+    } while (done < 0 && errno == EINTR);
+    if (done == pid) {
+        report_exit(pid, status);
+    }
+}
+
+void run_monitored_session(int client_fd, const std::string& peer, const ChildLaunch& launch,
+                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop)
+{
+    const auto started = Clock::now();
+    auto client = authenticate_monitored(client_fd, peer, launch, verifier, options, stop, started);
+    if (!client) {
         return;
     }
-    PlainTransport transport(plain[0], std::move(*negotiation));
+    const ChildProcess child(client->network_process);  // reaped after the transport closed the stream
+    PlainTransport transport(client->plain.release(), std::move(client->negotiation));
     run_session(transport, peer, options, stop, started);
 }
 

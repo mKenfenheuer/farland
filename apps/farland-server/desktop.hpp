@@ -45,7 +45,8 @@ public:
     [[nodiscard]] virtual bool closed() const = 0;
 
     /// The screens, at least one, ordered left to right as the compositor
-    /// arranges them. The count stays the same while the desktop is open.
+    /// arranges them. The count stays the same while the desktop is open,
+    /// unless screens_follow_monitors().
     [[nodiscard]] virtual std::size_t screen_count() const { return 1; }
     /// Frames of screen `index` (< screen_count()); screen 0 is frames().
     [[nodiscard]] virtual platform::FrameSource& screen_frames(std::size_t index)
@@ -64,6 +65,13 @@ public:
     /// monitors). Otherwise they keep theirs and the session scales and
     /// centres them on the client's monitors.
     [[nodiscard]] virtual bool resizable() const { return false; }
+    /// True when the desktop adds and removes screens (virtual monitors) to
+    /// have one per client monitor. request_screen_sizes() then gets a size
+    /// for every client monitor, and screen_count() may change, but only
+    /// during request_screen_sizes() and dispatch(): screens keep their
+    /// index, new ones come last (once they have a frame), and removed ones
+    /// are the last.
+    [[nodiscard]] virtual bool screens_follow_monitors() const { return false; }
     /// The size of the client monitor each screen shows on, in screen order.
     /// A resizable desktop resizes its screens to match; the new size shows
     /// in the frames once the compositor followed.
@@ -81,6 +89,16 @@ public:
         static_cast<void>(targets);
         return false;
     }
+    /// Whether the desktop is worth keeping while no client holds it. A
+    /// desktop that shows a session on a local seat is not: it is given back
+    /// whole, so that the seat has its session as it was, and the next
+    /// connection takes it again.
+    [[nodiscard]] virtual bool keep_when_released() const { return true; }
+    /// Whether a client holds the desktop now. A desktop attached to a
+    /// session on a local seat takes the session from the seat while a
+    /// client holds it, and gives it back when none does, so that the screen
+    /// at the machine never keeps showing what a client took away.
+    virtual void set_held(bool held) { static_cast<void>(held); }
     /// The desktop's clipboard; null when the backend has none or was not
     /// granted access.
     [[nodiscard]] virtual platform::Clipboard* clipboard() { return nullptr; }

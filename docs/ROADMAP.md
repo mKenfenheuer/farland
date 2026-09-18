@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 is in progress.
+**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 is in progress. M7's multi-session daemon works (S0, S1).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -24,7 +24,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - Fuzz harness scaffolding (libFuzzer plus a corpus directory layout), and a transcript-replay test harness.
 - Spec index: map the MS-* documents to sections, and follow the convention of citing `[MS-RDPBCGR] 2.2.1.3.2` style references in code.
 - **Exit:** CI green on all build variants; the first fuzz target (BER/PER) runs nightly.
-- **Status: done.** The CI workflow has all the build variants and a nightly fuzz job, but it has not run on GitHub yet because nothing has been pushed. The same builds pass locally: Apple clang and Homebrew LLVM on macOS (including ASan+UBSan and TSan), and GCC 15 on Ubuntu 26.04.
+- **Status: done, with one difference.** GitHub CI is deliberately one job (a release build, one test run and one run of the release binary), to keep runner minutes down. The other build variants run locally and on the test machines: Apple clang and Homebrew LLVM on macOS (ASan+UBSan and TSan), GCC 13 to 16 and Clang 19 to 21 on Linux, clang-tidy, the fuzz targets and the compositor tests.
 
 ### M1: Connection core, TLS only (~5 weeks): done
 - **X.224:** full `RDP_NEG_REQ`/`RSP`/`FAILURE` handling, skipping the cookie and routing token, and correct `RSP` flags (`EXTENDED_CLIENT_DATA_SUPPORTED`, `DYNVC_GFX_PROTOCOL_SUPPORTED`).
@@ -294,7 +294,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 ### M7: Sessions, headless, deployment (~7 weeks)
 Multi-session with headless desktops behind one port (decided 2026-09-14).
 - **System daemon (`farlandd`)**, root, one system unit:
-  - Owns the port, reads `/etc/farland/farland.toml` (`[server]`, `[auth]`, `[session]`, `[policy]`) and the credential store, runs PAM, and keeps the session registry.
+  - Owns the port, reads `/etc/farland/farland.toml` (`[server]`, `[auth]`, `[session]`, `[policy]`, `[graphics]`, `[network]`, `[audio]`, `[clipboard]`) and the credential store, runs PAM, and keeps the session registry.
   - Spawns the network processes as farland-server does: X.224, TLS and NLA stay sandboxed behind privsep.
   - A D-Bus control API (`org.farland.Farland1`) with polkit, used by `farlandctl sessions|terminate|passwd`.
 - **Hand-over by descriptor passing:**
@@ -303,17 +303,19 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
   - Server Redirection with **RDSTLS** stays an option for spreading sessions over several hosts later.
 - **`farland-agent`**, one per session, a user unit inside the user's logind session: owns the desktop backend, runs the session loop for each connection, and keeps the desktop between connections. It gets no sandbox of its own before M8.
 - **Headless sessions** per user:
-  - **GNOME through GDM:** `RemoteDisplayFactory.CreateRemoteDisplay` with a preauthenticated user creates a headless systemd session. The Mutter backend drives it without a portal dialog: RemoteDesktop, ScreenCast `RecordVirtual` and EIS input.
+  - **GNOME through GDM:** `RemoteDisplayFactory.CreateUserDisplay` creates a headless session logged in through gdm-autologin (GDM 50.0 has no preauthenticated user for `CreateRemoteDisplay`). The Mutter backend drives it without a portal dialog: RemoteDesktop, ScreenCast `RecordVirtual` and EIS input.
   - **Plasma, sway, labwc and cage through farland's own PAM and logind session** (`pam_systemd` marks it remote): `kwin_wayland --virtual`, wlroots compositors on the headless backend, and cage with one kiosk application.
   - The desktop starts at the client's size and monitors, and disp resizes it later. The keymap comes from CS_CORE `keyboardLayout`.
+  - **Status of the GNOME backend: implemented, tried with FreeRDP on GNOME 50.1.** `start_gnome_headless()` (apps/farland-server/gnome_headless.hpp, `src/farland/platform/mutter/`) drives Mutter's RemoteDesktop and ScreenCast D-Bus API: one virtual monitor per client monitor (`RecordVirtual`, is-platform, sized through PipeWire format negotiation), added and removed as the client's monitors change (`Desktop::screens_follow_monitors()`), input through `ConnectToEIS`, `SetKeymap` from the layout (with libxkbcommon), and Mutter's clipboard for cliprdr. It attaches to the session it runs in or launches a bare `gnome-shell --headless --no-x11` on a private session bus (`farland-server --headless gnome`). A connection attaching to a session takes it over: the session's monitors become exactly the client's (ours primary) and the seat's own monitors go off, while the session stays active on its seat, which GNOME needs to draw it at all — attaching activates it through logind (`Session.Activate`, then `Seat.SwitchTo`), and a logind watch ends the connection when something else takes the seat. Disconnecting puts the seat's monitors back. Detaching puts the seat's monitors back beside ours and lets ours go with the session: switching the seat on and ours off in one configuration makes Mutter 50.1 fall over its cursor plane (SIGSEGV after `maybe_update_cursor_plane: assertion 'crtc_state_impl' failed`), which took the user's session with it. Still to do: the GDM route through farlandd (S2), dmabuf capture on a GPU host, and placing the virtual monitors as the client arranges its monitors (Mutter puts new ones to the right).
 - **Authentication:**
   - Default: **self-enrolment.** `farlandctl passwd` asks farlandd over D-Bus. Polkit (`auth_self`) and a PAM password check confirm the user, and farlandd stores the NT hash with the local account (`user:domain:NT hash[:local account]`).
   - Delegated login with PAM (PLAN §3.5) is dropped: NTLM needs the NT hash before a password could ever reach PAM.
   - Kerberos: the SPNEGO/GSSAPI acceptor with a keytab (moved here from M2), with the principal mapped to a local user.
 - **Session broker:**
-  - The NLA identity picks the user's one session (`max_sessions_per_user = 1`). A second connection takes over and ends the first with ERRINFO_DISCONNECTED_BY_OTHERCONNECTION.
+  - The NLA identity picks the user's one session (`max_sessions_per_user = 1`). A second connection takes over and ends the first with ERRINFO_DISCONNECTED_BY_OTHERCONNECTION, after `[policy] takeover` asked whoever is using it.
   - The agent sends a fresh **auto-reconnect cookie** (Save Session Info) on every connection and checks a returning one; NLA stays authoritative.
-  - A user already logged in on a local seat: `on_local_session = refuse | attach` (default refuse).
+  - A user already logged in on a local seat: `on_local_session = separate | attach | replace | refuse` (default separate). `attach` takes that session over (it stays active on its seat, whose monitors go off for the connection); `separate` leaves it alone and starts a second, bare headless shell for the same user (GDM refuses a second session, so no gnome-session); `replace` ends it through logind and starts a headless one through GDM.
+  - **Takeover consent** (`takeover = ask | always | never`, default ask): farlandd holds the new connection and sends the session's agent a ConsentRequest; the agent asks over `org.freedesktop.Notifications` ("Hand over your session?", the connecting user, the client's address and name, and a countdown in the default button) and answers. `takeover_timeout` (30 s) and `takeover_on_timeout` (allow) decide when nobody answers or no notification service does. A session no client holds is resumed without asking.
   - Policies: `disconnected_timeout`, `idle_timeout`, `max_sessions`. Logging out ends the compositor, then the agent, then the GDM display or PAM session.
 - **Operations:**
   - systemd units, the PAM file, D-Bus and polkit policies, and the KWin desktop file.
@@ -321,13 +323,73 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
   - Packaging as deb, rpm and an AUR recipe; a container image for the test backend.
 - **Phases:**
   - S0: the broker protocol with descriptor passing, Save Session Info and the ARC verifier, the TOML config, and the local-account column.
-  - S1: farlandd and the agent through farland's own PAM, with the test pattern. Two users; reconnecting resumes. Tested in a CI container with `pam_permit` and on the test hosts.
-  - S2: GNOME through GDM with the Mutter backend and disp resize.
-  - S3: Plasma, starting with a spike on headless KWin under systemd boot.
+  - S1 (done): farlandd and the agent through farland's own PAM, with the test pattern. Two users; reconnecting resumes. Tested with `--no-pam` in the unit tests and as root on the GNOME test host (not in a CI container with `pam_permit`).
+  - S2: GNOME through GDM (`CreateUserDisplay`; farlandd's side is done) with the Mutter backend and disp resize.
+  - S3: Plasma. The backend is in (`start_plasma_headless`, `farland-server --headless plasma [--attach]`, tried on Plasma 6.6 with FreeRDP): KWin's virtual backend with `plasma_session` on a private D-Bus bus (Plasma's systemd boot shares the user's systemd instance with a local session, and the user's bus has its unique names taken), `zkde_screencast_unstable_v1` capture with a desktop file for `X-KDE-Wayland-Interfaces`, resizing through custom modes of `kde_output_management_v2`, EIS input, an ext-data-control clipboard. One screen per desktop so far; farlandd starting it per user is open.
   - S4: wlroots and cage, with headless sway in CI.
   - S5: policies, the D-Bus API and polkit, `farlandctl` commands, metrics, units and packaging; then Kerberos.
   - S6 (optional): Server Redirection and RDSTLS for several hosts.
+- **Status of the wlroots backend (S4): implemented for one user; the multi-session launch (PAM, logind, the agent) is S1's.**
+  - Done:
+    - `start_wlroots_headless()` (`apps/farland-server/wlroots_headless.hpp`) and `farland-server --headless sway|labwc|cage`: the compositor starts on the headless backend (`WLR_BACKENDS=headless`, `WLR_LIBINPUT_NO_DEVICES=1`, pixman unless a render node is given) in its own process group, with its Wayland socket found through `/proc`, and stops with the desktop; `--headless-attach` uses the session's compositor instead.
+    - A Wayland client layer (`platform/wlroots/wayland/`: connection and dispatch in farland's poll loop, shared-memory buffers, the data-control clipboard) and protocol glue from wayland-scanner, taken from the installed wayland-protocols where it has them, with MIT-licensed copies of the wlroots protocols and stand-ins for older releases.
+    - Capture: ext-image-copy-capture-v1 on an output source, damage-driven with up to three buffers and damage hints for each, and the cursor from a pointer cursor session (wlroots' headless outputs take "hardware" cursors, so the frames come without it); wlr-screencopy with the cursor drawn in where the compositor lacks it (cage 0.2).
+    - Input: zwp_virtual_keyboard_v1 with a keymap compiled with xkbcommon from the client's layout, modifier state kept by farland, and Unicode typed through the layout's key and modifiers or a spare key the keymap gets on demand (keycodes up to 255 first, for Xwayland); zwlr_virtual_pointer_v1 with absolute motion mapped through the letterboxed screen places onto the compositor's layout, buttons and wheel notches. No virtual touch protocol exists, so touch drives the pointer.
+    - Clipboard through ext-data-control-v1, or zwlr-data-control-unstable-v1.
+    - Sizes through wlr-output-management custom modes; the desktop is resizable and follows display control.
+  - Differences from the plan:
+    - One screen per desktop: `HeadlessOptions` names one monitor size, and a desktop's screen count must not change while it is open, so further client monitors stay black. `WLR_HEADLESS_OUTPUTS` starts more outputs (the launcher supports it) once the options carry the client's monitors.
+    - No dmabuf capture yet: frames come in shared memory, so AVC420 reads them from CPU memory.
+  - Tested: unit tests for the keymap (layouts, modifiers, spare keys), pointer mapping, damage, cursor pixels and the launch setup; compositor tests against headless sway 1.11, labwc 0.9.3 and cage 0.2.1 (frames, resizing, cursor positions, key bindings with modifiers, a typed €, a clipboard round trip). Live on Ubuntu 26.04 with FreeRDP 3.31: sway's terminal opened and typed into, resized to the client's window, the clipboard in both directions; labwc's menu at the pointer; cage running foot.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
+- **Status (2026-09-17): S0 and S1 done; the GNOME route of S2 and self-enrolment from S5 work; the Debian package from S5 builds in CI (`packaging/make-deb.sh`) and installs the service.**
+  - Done:
+    - `farlandd` (`apps/farlandd/`):
+      - The port, the TLS identity and the credential store.
+      - Per client, the sandboxed network process of farland-server (TLS and NLA). The NLA identity is mapped to a local account (the store's account column, else the user name).
+      - `[policy]`: one session per account, `max_sessions`, `on_local_session` (logind: a graphical session on a seat).
+      - Takeover by a second connection (ERRINFO_DISCONNECTED_BY_OTHERCONNECTION), `idle_timeout` and `disconnected_timeout`, in a registry without I/O (`registry.hpp`, tested with a fake clock).
+      - `[policy] takeover`: the consent prompt. farlandd holds the connection while the session's agent asks the person using it (broker ConsentRequest, ConsentCancel and ConsentReply; `farlandd/consent.hpp` and `farland-agent/prompt.hpp`, the bookkeeping without I/O or a clock of its own). A held session is one with a client on it, or an attached local session. Cancelling refuses the new connection with ERRINFO_SERVER_DENIED_CONNECTION; a holder who disconnects meanwhile takes the question down and the takeover goes ahead.
+      - Refused clients get their Set Error Info from a sandboxed process that runs the connection until it can be sent.
+      - `farlandd --no-pam` runs every session as the calling user, for development and CI.
+    - Session launch (`launcher.hpp`, `logind.hpp`):
+      - Plasma, sway, labwc, cage and the test pattern: farlandd starts itself as a session helper. The helper runs PAM (`farland`: account, setcred, open_session with type wayland, class user, the desktop and PAM_RHOST, so pam_systemd registers a remote session), runs the agent as the user, and closes the session after it.
+      - GNOME: GDM's `CreateUserDisplay` (what `gnome-headless-session@.service` does), then the agent as a transient unit in the user's service manager (sd-bus to `user@.host`) with the token in its environment, attached to that session's Mutter. `DestroyUserDisplay` ends it.
+      - `on_local_session = "attach"` starts the agent the same way in the user's local session.
+    - `farland-agent` (`apps/farland-agent/`):
+      - Greets farlandd with its token; farlandd checks the token and the peer's uid.
+      - Takes each connection's plaintext socket and reads the MCS Connect Initial to start the desktop at the client's size, through `start_headless_desktop` (`headless.hpp`: one factory per backend, stubs for the missing ones) or the test pattern desktop.
+      - Runs the existing session loop per connection and keeps the desktop between connections.
+      - Reports Disconnect, Stats and SessionEnded, and ends with the compositor (logout).
+    - Configuration: everything farland-server takes on the command line that a daemon-run session needs is a key in `farland.toml` — `[graphics]` (GFX and bitmap codec, H.264 encoder, OpenH264 library, render node, zero-copy, ClearCodec, refinement, frame rate), `[network] autodetect`, `[audio]`, `[clipboard]`, `[policy] activation_timeout` and `[server] log_level`. The defaults are farland-server's, except `activation_timeout`, which is 60 s rather than 30 because a GDM session takes 10-20 s to start. `farlandd --check-config` prints every effective setting, one per line. The shipped `data/farland.toml` lists every key with its default and is checked against the parser by a test.
+    - The broker protocol gained `Terminate` (daemon to agent) and `Settings` (daemon to agent, right after the agent's Hello and before the first connection), so the agent gets the configuration without reading `/etc`; the version is 2.
+    - Auto-reconnect: `server::Connection` passes on the client's ARC cookie and sends Save Session Info. The agent checks the cookie against the session's `arc::Secret` and rotates it on every activation. NLA stays authoritative; a mismatch is logged.
+    - Self-enrolment: `farlandctl passwd` calls `org.farland.Farland1.EnrolSelf` on the system bus. farlandd asks polkit (`enrol-self`, auth_self; farlandctl starts pkttyagent), checks the account password with PAM and stores the NT hash with the account.
+    - `data/`: `farlandd.service`, the PAM file, the D-Bus and polkit policies, an example `farland.toml`.
+  - Tested:
+    - Unit tests for the registry and policies, the launcher's command lines and environments, and self-enrolment's store update.
+    - The agent in process against a scripted farlandd: handover, takeover, cookies, Terminate, logout, and the takeover question with an asker of the test's own.
+    - `[policy] takeover`: the decisions with a fake clock, and the notification itself against a fake service on a private bus (`tests/apps/mock_notifications.py`): Yes, Cancel, dismissal, a timeout, a desktop with no service, and a question withdrawn while it stands.
+    - End to end with the real farlandd, network processes and agents (`--no-pam`, test pattern) and a scripted TLS/NLA client:
+      - Two users get separate sessions.
+      - A dropped client returns to its session (keys typed before still shown, cookie verified).
+      - A second connection takes over.
+      - A client beyond `max_sessions` receives ERRINFO_SERVER_DENIED_CONNECTION.
+    - Builds: macOS (Apple clang), Ubuntu 26.04 (GCC 15, Clang 21).
+    - Live as root on Ubuntu 26.04 with GDM 50.0 and FreeRDP 3.31:
+      - PAM route with the test pattern: logind sessions of type wayland, class user, Remote=yes. Two users at once, reconnect with the typed keys still there, takeover, idle and disconnected timeouts, refusal of a user logged in at the seat. Stopping farlandd closes the PAM sessions.
+      - GNOME route with the Mutter backend of S2: a headless GNOME session per user through GDM, reconnect (the virtual monitor follows the new client size), logout ending the farland session, and stopping farlandd ending the GNOME session.
+      - Self-enrolment with polkit, including a refused wrong password.
+  - Differences from the plan:
+    - GDM 50.0 has no `preauthenticated-user` for `CreateRemoteDisplay`: it only starts a greeter there. farlandd uses `CreateUserDisplay`, which logs the user in through `gdm-autologin`.
+    - FreeRDP 3.31 does not announce Set Error Info support, so it shows its generic "logged off" message for takeovers, timeouts and refusals, rather than the precise reason.
+  - Open:
+    - The Plasma and wlroots backends and their live test (S3, S4).
+    - `on_local_session = "attach"` live.
+    - mstsc and Windows App.
+    - The rest of S5: `farlandctl sessions` and `terminate`, metrics, packaging.
+    - Sessions do not survive a farlandd restart.
+    - The agent answers the MCS Connect Initial only once its desktop has started, which takes GDM 10–20 s; FreeRDP needs `/timeout`.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)
 - Submit to OSS-Fuzz; run a 72-hour fuzzing campaign with no open crashes; get an **external security review** of pre-auth, NLA and client→server parsers.

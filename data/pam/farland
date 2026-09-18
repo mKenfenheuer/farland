@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# PAM configuration for farlandd (Debian and Ubuntu layout).
+#
+# farlandd opens a session here for users whom NLA already authenticated, so
+# a login never runs the auth stack; it is used only when farlandctl passwd
+# checks an account's password for self-enrolment. The account stack decides
+# whether the account may log in at all (expired, locked). The session stack
+# must include pam_systemd, which registers the remote wayland session with
+# logind and starts the user's service manager and XDG_RUNTIME_DIR.
+#
+# Fedora and Arch: replace the @include lines with
+#   auth     include system-remote-login
+#   account  include system-remote-login
+#   session  include system-remote-login
+
+@include common-auth
+@include common-account
+session  required  pam_loginuid.so
+session  optional  pam_keyinit.so force revoke
+session  required  pam_limits.so
+session  required  pam_env.so readenv=1
+session  required  pam_env.so readenv=1 envfile=/etc/default/locale
+@include common-session

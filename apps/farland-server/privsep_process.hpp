@@ -5,13 +5,17 @@
 
 #include <farland/auth/gss.hpp>
 #include <farland/auth/tls_identity.hpp>
+#include <farland/base/unique_fd.hpp>
 
 #include "session.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 /// The process split of privilege separation (docs/PLAN.md §6).
@@ -44,6 +48,30 @@ struct ChildLaunch {
 /// stream it relays. Closes `client_fd`; reaps the process.
 void run_monitored_session(int client_fd, const std::string& peer, const ChildLaunch& launch,
                            auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop);
+
+/// A client whose network process finished pre-authentication: the
+/// plaintext RDP stream it relays from now on.
+struct AuthenticatedClient {
+    server::Negotiation negotiation;
+    UniqueFd plain;
+    /// Relays until either side closes the stream; reap it with
+    /// wait_network_process().
+    pid_t network_process = -1;
+};
+
+/// The first half of run_monitored_session(), for farlandd: spawns the
+/// network process for `client_fd` (closed here) and answers its
+/// verification requests until pre-authentication is done. nullopt when the
+/// client did not get through (the process is reaped then); `started` is
+/// when the client connected, for the activation timeout.
+[[nodiscard]] std::optional<AuthenticatedClient>
+authenticate_monitored(int client_fd, const std::string& peer, const ChildLaunch& launch, auth::NtlmVerifier& verifier,
+                       const SessionOptions& options, const std::atomic<bool>& stop,
+                       std::chrono::steady_clock::time_point started);
+
+/// Waits for a network process to exit, however long it relays, and logs
+/// how it ended.
+void wait_network_process(pid_t pid);
 
 /// Network process main, after enter_network_sandbox(): serves the client on
 /// the inherited descriptors. `make_nla` may be empty (TLS only). Returns the

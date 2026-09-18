@@ -156,6 +156,80 @@ TEST_CASE("Broker messages round-trip")
     CHECK(decoded_stats.bytes_sent == std::uint64_t{1} << 40);
     CHECK(decoded_stats.rtt_ms == 23);
 
+    broker::Settings settings;
+    settings.frames_per_second = 60;
+    settings.bitmap_codec = farland::server::BitmapCodec::uncompressed;
+    settings.gfx_codec = farland::server::TileCodec::avc444;
+    settings.h264_backend = farland::video::Backend::vaapi;
+    settings.openh264_library = "libopenh264.so.7";
+    settings.render_node = "/dev/dri/renderD129";
+    settings.zero_copy = false;
+    settings.refine = false;
+    settings.microphone = false;
+    settings.autodetect = farland::server::AutoDetectMode::off;
+    settings.activation_seconds = 90;
+    const auto settings_frame = broker::encode(settings);
+    const auto decoded_settings = std::get<broker::Settings>(broker::decode(settings_frame).value());
+    CHECK(decoded_settings.frames_per_second == 60);
+    CHECK(decoded_settings.bitmap_codec == farland::server::BitmapCodec::uncompressed);
+    CHECK(decoded_settings.gfx_codec == farland::server::TileCodec::avc444);
+    CHECK(decoded_settings.h264_backend == farland::video::Backend::vaapi);
+    CHECK(decoded_settings.openh264_library == "libopenh264.so.7");
+    CHECK(decoded_settings.render_node == "/dev/dri/renderD129");
+    CHECK_FALSE(decoded_settings.zero_copy);
+    CHECK(decoded_settings.clearcodec);
+    CHECK_FALSE(decoded_settings.refine);
+    CHECK(decoded_settings.audio);
+    CHECK_FALSE(decoded_settings.microphone);
+    CHECK(decoded_settings.clipboard);
+    CHECK(decoded_settings.autodetect == farland::server::AutoDetectMode::off);
+    CHECK(decoded_settings.activation_seconds == 90);
+    CHECK(broker::encode(decoded_settings) == settings_frame);
+    CHECK(broker::describe(settings).starts_with("gfx avc444, bitmap raw, h264 vaapi, 60 fps, autodetect off"));
+    CHECK(broker::describe(broker::Settings{}).find("h264 auto, 30 fps") != std::string::npos);
+
+    // The defaults are farland-server's, so an agent that never hears the
+    // settings behaves as the command line does.
+    const auto defaults = std::get<broker::Settings>(broker::decode(broker::encode(broker::Settings{})).value());
+    CHECK(defaults.gfx_codec == farland::server::TileCodec::progressive);
+    CHECK_FALSE(defaults.h264_backend.has_value());
+    CHECK(defaults.audio);
+
+    broker::ConsentRequest request;
+    request.connection_id = 11;
+    request.user = "LAB\\alice";
+    request.peer = "192.0.2.10:50123";
+    request.client_name = "WORKSTATION";
+    request.timeout_seconds = 45;
+    request.allow_on_timeout = false;
+    const auto request_frame = broker::encode(request);
+    const auto decoded_request = std::get<broker::ConsentRequest>(broker::decode(request_frame).value());
+    CHECK(decoded_request.connection_id == 11);
+    CHECK(decoded_request.user == "LAB\\alice");
+    CHECK(decoded_request.peer == "192.0.2.10:50123");
+    CHECK(decoded_request.client_name == "WORKSTATION");
+    CHECK(decoded_request.timeout_seconds == 45);
+    CHECK_FALSE(decoded_request.allow_on_timeout);
+    CHECK(broker::encode(decoded_request) == request_frame);
+
+    // A client that said nothing about itself.
+    const auto bare_request = std::get<broker::ConsentRequest>(
+        broker::decode(broker::encode(broker::ConsentRequest{3, "bob", "[2001:db8::1]:3389", "", 30, true})).value());
+    CHECK(bare_request.client_name.empty());
+    CHECK(bare_request.allow_on_timeout);
+
+    const auto cancel =
+        std::get<broker::ConsentCancel>(broker::decode(broker::encode(broker::ConsentCancel{11})).value());
+    CHECK(cancel.connection_id == 11);
+
+    for (const auto answer : {broker::ConsentAnswer::allowed, broker::ConsentAnswer::denied,
+                              broker::ConsentAnswer::timed_out, broker::ConsentAnswer::unavailable}) {
+        const auto reply =
+            std::get<broker::ConsentReply>(broker::decode(broker::encode(broker::ConsentReply{11, answer})).value());
+        CHECK(reply.connection_id == 11);
+        CHECK(reply.answer == answer);
+    }
+
     // A connection without NLA, summary, cookie or input.
     broker::NewConnection bare;
     bare.connection_id = 9;
@@ -282,6 +356,156 @@ TEST_CASE("Malformed broker messages are rejected")
                     w.u16le(1025);  // detail too long
                 }),
                 Errc::limit_exceeded);
+
+    // The takeover question and its answer.
+    const auto consent_request = [](const std::function<void(Writer&)>& tail) {
+        return frame([&tail](Writer& w) {
+            w.u8(8);     // ConsentRequest
+            w.u64le(4);  // connection id
+            w.u16le(0);  // user
+            w.u16le(0);  // peer
+            w.u16le(0);  // client name
+            tail(w);
+        });
+    };
+    CHECK(broker::decode(consent_request([](Writer& w) {
+              w.u32le(30);
+              w.u8(1);
+              w.u8(0);  // not from the seat
+          })).has_value());
+    // The question about somebody logging in at the machine.
+    {
+        const auto decoded = broker::decode(consent_request([](Writer& w) {
+            w.u32le(30);
+            w.u8(1);
+            w.u8(1);
+        }));
+        REQUIRE(decoded.has_value());
+        const auto* request = std::get_if<broker::ConsentRequest>(&*decoded);
+        REQUIRE(request != nullptr);
+        CHECK(request->from_seat);
+    }
+    check_error(consent_request([](Writer& w) {
+                    w.u32le(0);  // no time to answer at all
+                    w.u8(1);
+                    w.u8(0);
+                }),
+                Errc::invalid_value);
+    check_error(consent_request([](Writer& w) {
+                    w.u32le(broker::max_consent_seconds + 1);
+                    w.u8(1);
+                    w.u8(0);
+                }),
+                Errc::invalid_value);
+    check_error(consent_request([](Writer& w) {
+                    w.u32le(30);
+                    w.u8(2);  // a flag other than 0 or 1
+                    w.u8(0);
+                }),
+                Errc::invalid_value);
+    check_error(consent_request([](Writer& w) {
+                    w.u32le(30);
+                    w.u8(1);
+                    w.u8(2);  // and the same for the seat's flag
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(8);
+                    w.u64le(0);  // connection id 0
+                    w.u16le(0);
+                    w.u16le(0);
+                    w.u16le(0);
+                    w.u32le(30);
+                    w.u8(1);
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(9);  // ConsentCancel
+                    w.u64le(0);
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(10);  // ConsentReply
+                    w.u64le(4);
+                    w.u8(0);  // no such answer
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(10);
+                    w.u64le(4);
+                    w.u8(5);
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(10);
+                    w.u64le(4);
+                    w.u8(1);
+                    w.u8(0);  // a trailing byte
+                }),
+                Errc::trailing_data);
+
+    // Settings: every enum, flag and range is checked.
+    const auto settings = [](const std::function<void(Writer&)>& tail) {
+        return frame([&tail](Writer& w) {
+            w.u8(7);      // Settings
+            w.u16le(30);  // frames per second
+            tail(w);
+        });
+    };
+    check_error(settings([](Writer& w) { w.u8(2); }), Errc::invalid_value);  // bitmap codec
+    check_error(settings([](Writer& w) {
+                    w.u8(0);
+                    w.u8(4);  // GFX codec
+                }),
+                Errc::invalid_value);
+    check_error(settings([](Writer& w) {
+                    w.u8(0);
+                    w.u8(0);
+                    w.u8(1);
+                    w.u8(9);  // H.264 backend
+                }),
+                Errc::invalid_value);
+    check_error(frame([](Writer& w) {
+                    w.u8(7);
+                    w.u16le(0);  // frame rate below the range
+                }),
+                Errc::invalid_value);
+
+    /// Everything of a Settings up to the activation timeout.
+    const auto settings_prefix = [](Writer& w) {
+        w.u8(7);
+        w.u16le(30);
+        w.u8(0);     // bitmap codec
+        w.u8(0);     // GFX codec
+        w.u8(0);     // no H.264 backend
+        w.u8(0);     // its value
+        w.u16le(0);  // openh264
+        w.u16le(0);  // render node
+        for (int i = 0; i < 6; ++i) {
+            w.u8(1);  // zero-copy, clearcodec, refine, audio, microphone, clipboard
+        }
+        w.u8(2);  // auto-detect: full
+    };
+    CHECK(broker::decode(frame([&](Writer& w) {
+              settings_prefix(w);
+              w.u32le(60);
+          })).has_value());
+    check_error(frame([&](Writer& w) {
+                    settings_prefix(w);
+                    w.u32le(4);  // activation timeout below the range
+                }),
+                Errc::invalid_value);
+    check_error(frame([&](Writer& w) {
+                    settings_prefix(w);
+                    w.u32le(3601);  // and above it
+                }),
+                Errc::invalid_value);
+    check_error(frame([&](Writer& w) {
+                    settings_prefix(w);
+                    w.u32le(60);
+                    w.u8(0);  // a trailing byte
+                }),
+                Errc::trailing_data);
 }
 
 TEST_CASE("Each side may send only its own broker messages, with a descriptor only on NewConnection")
@@ -299,6 +523,25 @@ TEST_CASE("Each side may send only its own broker messages, with a descriptor on
     const auto stats = broker::encode(broker::Stats{});
     CHECK(broker::decode_from(broker::Sender::agent, stats, false).has_value());
     CHECK_FALSE(broker::decode_from(broker::Sender::daemon, stats, false).has_value());
+
+    const auto settings = broker::encode(broker::Settings{});
+    CHECK(broker::decode_from(broker::Sender::daemon, settings, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::agent, settings, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::daemon, settings, true).has_value());
+
+    // Only farlandd asks about a takeover, and only the agent answers.
+    const auto request = broker::encode(broker::ConsentRequest{5, "alice", "192.0.2.10:1", "", 30, true});
+    CHECK(broker::decode_from(broker::Sender::daemon, request, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::agent, request, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::daemon, request, true).has_value());
+
+    const auto cancel = broker::encode(broker::ConsentCancel{5});
+    CHECK(broker::decode_from(broker::Sender::daemon, cancel, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::agent, cancel, false).has_value());
+
+    const auto reply = broker::encode(broker::ConsentReply{5, broker::ConsentAnswer::denied});
+    CHECK(broker::decode_from(broker::Sender::agent, reply, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::daemon, reply, false).has_value());
 }
 
 TEST_CASE("farlandd accepts an agent only after a hello with its token")
@@ -331,6 +574,8 @@ TEST_CASE("farlandd accepts an agent only after a hello with its token")
     CHECK(link.receive(stats, false).has_value());
     CHECK_FALSE(link.receive(stats, true).has_value());
     CHECK(link.receive(broker::encode(broker::Disconnect{3, 0}), false).has_value());
+    CHECK(link.receive(broker::encode(broker::ConsentReply{3, broker::ConsentAnswer::allowed}), false).has_value());
+    CHECK_FALSE(link.receive(broker::encode(broker::ConsentCancel{3}), false).has_value());
     CHECK_FALSE(link.receive(broker::encode(full_connection()), true).has_value());
 
     CHECK(link.receive(broker::encode(broker::SessionEnded{broker::EndReason::logout, {}}), false).has_value());

@@ -1,0 +1,4 @@
+[submodule "packaging/mutter"]
+	path = packaging/mutter
+	url = git@github.com:mKenfenheuer/mutter.git
+	branch = farland/keep-virtual-rendering-50.1

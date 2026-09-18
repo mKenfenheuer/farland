@@ -57,6 +57,7 @@ if sd_bus_dep.found() and libei_dep.found() and pipewire_dep.found()
 
   farland_platform_portal_lib = static_library(
     'farland-platform-portal',
+    'clipboard_pipes.cpp',
     'dmabuf_reader.cpp',
     'ei_input.cpp',
     'pipewire_capture.cpp',

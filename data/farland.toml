@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# /etc/farland/farland.toml: farlandd, the multi-session RDP server.
+# Every key is optional and every one of them is listed below with its
+# default; the commented-out lines show a default that suits most
+# installations. Unknown sections and keys are errors.
+# Check a file with: farlandd --check-config --config FILE
+# It prints every setting as it will be used.
+
+[server]
+# Listen address: an IPv4 or IPv6 address. "0.0.0.0" is every IPv4
+# interface, "::" every IPv6 one (and IPv4 where the host maps them).
+bind = "0.0.0.0"
+port = 3389
+# A certificate and its key (PEM), both or neither. Neither: farlandd creates
+# a self-signed one in /var/lib/farland/tls/.
+# certificate = "/etc/farland/tls.crt"
+# private_key = "/etc/farland/tls.key"
+# Log level of farlandd, its network processes and the agents: trace, debug,
+# info, warn or error. trace and debug log every input event and every frame,
+# which is a lot on a busy host. --log-level on the command line wins.
+# log_level = "info"
+
+[auth]
+# store: NT hashes in the credential store below. kerberos (GSSAPI with a
+# keytab) is not implemented yet.
+mode = "store"
+# NT hashes of the users who may log in, with their local accounts. Users
+# enrol themselves with farlandctl passwd; an administrator can also write
+# entries (farlandctl --file /var/lib/farland/users passwd USER
+# --local-account ACCOUNT).
+credential_store = "/var/lib/farland/users"
+# The keytab for mode = "kerberos"; an error with any other mode.
+# keytab = "/etc/krb5.keytab"
+
+[session]
+# The desktop each user gets:
+#   gnome   GDM starts a headless GNOME session; the agent attaches to its
+#           Mutter. GDM must be running.
+#   plasma, sway, labwc, cage
+#           farlandd opens its own PAM and logind session and the agent
+#           starts the compositor.
+#   cage    runs one application, which "command" must name.
+#   test    the synthetic test pattern, for checking an installation.
+# Which of them this build can start is in the "meson setup" summary.
+desktop = "gnome"
+# The application cage runs, as an argument vector (no shell). Required when
+# the desktop is cage, an error with any other desktop.
+# command = ["firefox", "--kiosk", "https://example.org"]
+
+[policy]
+# Timeouts take seconds, or a number with s, m, h or d ("90s", "30m", "2h").
+# End a session nobody reconnected to after this long; 0: never. A session
+# holds a compositor and its applications, so a timeout ("1h", say) frees
+# what a forgotten session would keep, at the cost of its unsaved work.
+# disconnected_timeout = 0
+# Disconnect a client that sent no input for this long; 0: never. The
+# session stays and disconnected_timeout takes over from there.
+idle_timeout = 0
+# How long a client may take from its TCP connection to an active RDP
+# connection: pre-authentication, and starting the desktop. A headless GNOME
+# session through GDM takes 10-20 s, so the default leaves room; 5 s to 1 h.
+# activation_timeout = "60s"
+# Sessions on this host at once; 0: no limit. Each one runs a compositor, so
+# set it to what the host's memory and CPU allow.
+max_sessions = 0
+# Sessions per user. Only 1 for now: the NLA identity picks the user's
+# session, and choosing among several needs a session picker.
+max_sessions_per_user = 1
+# A user logged in at a local seat:
+#   separate  leave that session alone and give the client a second,
+#             headless desktop (the default). GDM starts no second session
+#             for a user who already has one, so this one is a bare GNOME
+#             Shell: a top bar, but no dock, extensions or settings daemons.
+#   attach    hand the client that session, with the windows in it. GNOME
+#             draws only the session that is active on its seat, so it stays
+#             there and its monitors are switched off while the client holds
+#             it, and on again when it disconnects. The screen at the machine
+#             shows nothing meanwhile, but its keyboard and mouse still reach
+#             the session, and Ctrl+Alt+F1 still reaches the login screen.
+#   replace   end that session, losing the applications running in it, and
+#             give the client a full headless session through GDM. The seat
+#             falls back to the login screen.
+#   refuse    turn the connection away.
+on_local_session = "separate"
+# A connection for a session someone else is holding — another client, or
+# the user at the machine when on_local_session = "attach":
+#   ask     ask them first (the default). A notification appears in that
+#           session, "Hand over your session?", with the connecting user,
+#           the client's address and its name, and a countdown; the answer
+#           decides. Nobody is asked for a session no client holds, which
+#           is the ordinary reconnect.
+#   always  take it over without asking, ending the other connection with
+#           "disconnected by another connection"
+#   never   refuse the new connection while someone holds the session
+# takeover = "ask"
+# How long the question stands, 5 s to 5 min. The new client waits that
+# long, so leave room inside activation_timeout above.
+# takeover_timeout = "30s"
+# What happens when nobody answers in time: allow (the default) hands the
+# session over, deny refuses the new connection. The countdown runs in
+# whichever button that is.
+# takeover_on_timeout = "allow"
+
+[graphics]
+# Codec for clients that run the Graphics Pipeline (mstsc, Windows App,
+# FreeRDP with /gfx):
+#   progressive  RemoteFX Progressive; lossy, small, and no encoder per
+#                session, so it scales to many users on one host
+#   planar       lossless, several times the bandwidth
+#   avc420       H.264 4:2:0; needs an encoder (below) and, on the CPU,
+#                a core or so per session
+#   avc444       H.264 4:4:4, sharp text at H.264 bandwidth; the most
+#                expensive to encode
+# Clients without the Graphics Pipeline, or without H.264, fall back by
+# themselves.
+# gfx_codec = "progressive"
+# Codec for bitmap updates, for clients without the Graphics Pipeline:
+# planar (compressed) or raw.
+# bitmap_codec = "planar"
+# H.264 backend for avc420 and avc444: auto, nvenc, vaapi, openh264 or x264
+# (x264 only where this build has it). auto takes the GPU encoders this
+# build has first (NVENC on NVIDIA, VA-API on AMD and Intel), then OpenH264
+# on the CPU. A GPU encodes a limited number of streams at once, so on a
+# multi-user host check that the count suffices before choosing one.
+# h264_encoder = "auto"
+# The OpenH264 library: a soname the loader finds or an absolute path.
+# Unset: libopenh264.so.8 and the older names.
+# openh264 = "libopenh264.so.8"
+# DRM render node for the compositor and for NVENC and VA-API. Unset: the
+# first node that has an H.264 encoder. Set it where a host has several GPUs.
+# render_node = "/dev/dri/renderD128"
+# Hand captured frames to an H.264 encoder as dmabufs instead of reading
+# every frame into CPU memory. Only applies where both the capture and the
+# encoder do dmabufs; turn it off to compare, or around a driver problem.
+# zero_copy = true
+# Progressive surfaces: send tiles with few colours (text, UI) through
+# ClearCodec, so they stay sharp.
+# clearcodec = true
+# Progressive surfaces: send pictures coarse first and refine them while
+# they stand still. Off sends every tile at full quality at once, which
+# costs bandwidth on a moving picture.
+# refine = true
+# Frames per second the session aims for, 1 to 240. The quality tiers lower
+# it on a slow network. Above 30 costs bandwidth and CPU for little gain on
+# a desktop.
+# frames_per_second = 30
+
+[network]
+# Network characteristics detection, for clients that support it. It
+# measures the round trip and the bandwidth and feeds the quality tiers:
+#   full        also measures at connect time, before licensing
+#   continuous  only once the connection is active, which saves a moment on
+#               connect but leaves the first frames to guess the network
+#   off         no measurements; the tiers follow the frame acknowledgements
+# autodetect = "full"
+
+[audio]
+# Play the desktop's audio on the client (rdpsnd and the audio playback
+# channel). The client decides too (mstsc "play on this computer",
+# FreeRDP /sound). Silence sends nothing.
+# playback = true
+# Offer the client's microphone to the desktop as a local source (audin).
+# microphone = true
+
+[clipboard]
+# Copy text, HTML, images and files between the client and the desktop
+# (cliprdr), where the desktop has a clipboard. Data is transferred only
+# when someone pastes. Turn it off where copying out of a session is not
+# allowed.
+# enabled = true

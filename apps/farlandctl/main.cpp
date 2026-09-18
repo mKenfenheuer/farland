@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
 // SPDX-License-Identifier: Apache-2.0
 
-// farlandctl: administration for farland-server. M2 manages the NLA user
-// store; the file holds NT hashes, never passwords.
+// farlandctl: administration for farland-server and farlandd. It manages the
+// NLA user store (the file holds NT hashes, never passwords) and enrols the
+// calling user with farlandd (self-enrolment, docs/PLAN.md §3.5).
 
 #include <farland/auth/credential_store.hpp>
 #include <farland/auth/ntlm.hpp>
 #include <farland/base/text.hpp>
 
+#include <array>
+#include <cerrno>
+#include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -17,6 +22,15 @@
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
+
+#ifdef FARLAND_HAVE_LIBSYSTEMD
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <systemd/sd-bus.h>
+
+extern char** environ;  // NOLINT(readability-redundant-declaration): POSIX leaves its declaration to the caller
+#endif
 
 namespace {
 
@@ -37,8 +51,11 @@ std::filesystem::path default_store()
 void usage()
 {
     std::cout << "usage: farlandctl [--file FILE] COMMAND\n"
+                 "  passwd [--domain DOMAIN] [--stdin]         enrol yourself for remote login with farlandd:\n"
+                 "                                            it checks your account password (polkit and\n"
+                 "                                            PAM) and stores what NLA needs\n"
                  "  passwd USER [--domain DOMAIN] [--local-account ACCOUNT] [--stdin]\n"
-                 "                                            add a user or change the password\n"
+                 "                                            add a user to FILE or change the password\n"
                  "  remove USER [--domain DOMAIN]             remove a user\n"
                  "  users                                     list users\n"
                  "\n"
@@ -110,6 +127,70 @@ int passwd(const std::filesystem::path& file, const std::string& user, const std
     return 0;
 }
 
+/// Self-enrolment through farlandd (org.farland.Farland1.EnrolSelf).
+int enrol_self(const std::string& domain, bool from_stdin)
+{
+    auto password = read_password("Your account password: ", from_stdin);
+    if (!password || password->view().empty()) {
+        std::cerr << "farlandctl: no password given\n";
+        return 1;
+    }
+#ifdef FARLAND_HAVE_LIBSYSTEMD
+    sd_bus* bus = nullptr;
+    if (const int rc = sd_bus_open_system(&bus); rc < 0) {
+        std::cerr << "farlandctl: cannot reach the system bus: " << std::strerror(-rc) << "\n";
+        return 1;
+    }
+    // polkit asks for the password through an agent; on a terminal that is
+    // pkttyagent for this process, as systemctl does.
+    pid_t agent = -1;
+    if (!from_stdin && ::isatty(STDIN_FILENO) != 0) {
+        std::array<int, 2> notify{-1, -1};
+        if (::pipe(notify.data()) == 0) {
+            const std::string pid = std::to_string(::getpid());
+            const std::string fd = std::to_string(notify[1]);
+            std::array<std::string, 6> args{"pkttyagent", "--process", pid, "--notify-fd", fd, "--fallback"};
+            std::array<char*, 7> argv{};
+            for (std::size_t i = 0; i < args.size(); ++i) {
+                argv.at(i) = args.at(i).data();
+            }
+            if (::posix_spawnp(&agent, "pkttyagent", nullptr, nullptr, argv.data(), environ) != 0) {
+                agent = -1;
+            }
+            ::close(notify[1]);
+            pollfd pfd{notify[0], POLLIN, 0};
+            static_cast<void>(::poll(&pfd, 1, 5000));  // closed once the agent is registered
+            ::close(notify[0]);
+        }
+    }
+    sd_bus_set_method_call_timeout(bus, std::uint64_t{300} * 1'000'000);
+    sd_bus_error error = {};
+    const int rc =
+        sd_bus_call_method(bus, "org.farland.Farland1", "/org/farland/Farland1", "org.farland.Farland1", "EnrolSelf",
+                           &error, nullptr, "ss", std::string(password->view()).c_str(), domain.c_str());
+    if (agent > 0) {
+        ::kill(agent, SIGTERM);
+        int status = 0;
+        ::waitpid(agent, &status, 0);
+    }
+    int result = 0;
+    if (rc < 0) {
+        std::cerr << "farlandctl: enrolment failed: " << (error.message != nullptr ? error.message : std::strerror(-rc))
+                  << "\n";
+        result = 1;
+    } else {
+        std::cout << "farlandctl: you can now log in over RDP with your account and this password\n";
+    }
+    sd_bus_error_free(&error);
+    sd_bus_flush_close_unref(bus);
+    return result;
+#else
+    static_cast<void>(domain);
+    std::cerr << "farlandctl: this build cannot talk to farlandd (no libsystemd); use passwd USER with --file\n";
+    return 1;
+#endif
+}
+
 int remove(const std::filesystem::path& file, const std::string& user, const std::string& domain)
 {
     auto store = CredentialStore::load(file);
@@ -151,6 +232,7 @@ int main(int argc, char** argv)
 {
     const std::span args(argv, static_cast<std::size_t>(argc));
     std::filesystem::path file = default_store();
+    bool file_given = false;
     std::vector<std::string> positional;
     std::string domain;
     std::string local_account;
@@ -159,6 +241,7 @@ int main(int argc, char** argv)
         const std::string_view arg = args[i];
         if (arg == "--file" && i + 1 < args.size()) {
             file = args[++i];
+            file_given = true;
         } else if (arg == "--domain" && i + 1 < args.size()) {
             domain = args[++i];
         } else if (arg == "--local-account" && i + 1 < args.size()) {
@@ -185,6 +268,13 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string& command = positional[0];
+    if (command == "passwd" && positional.size() == 1 && !file_given && local_account.empty()) {
+        if (!CredentialStore::valid_name(domain, true)) {
+            std::cerr << "farlandctl: names may not contain ':' or control characters\n";
+            return 2;
+        }
+        return enrol_self(domain, from_stdin);
+    }
     if (command == "users" && positional.size() == 1) {
         return users(file);
     }

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>farland</vendor>
+
+  <!-- farlandctl passwd: a user enrols their own account for remote desktop
+       login. farlandd also checks the account password with PAM before it
+       stores the NT hash. -->
+  <action id="org.farland.Farland1.enrol-self">
+    <description>Enrol your account for remote desktop login</description>
+    <message>Authentication is required to enable remote desktop login for your account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+  <!-- farlandctl passwd USER for another account, farlandctl remove. -->
+  <action id="org.farland.Farland1.manage-users">
+    <description>Manage remote desktop logins of other users</description>
+    <message>Authentication is required to manage remote desktop logins</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- farlandctl sessions and terminate for sessions of other users. -->
+  <action id="org.farland.Farland1.manage-sessions">
+    <description>Manage remote desktop sessions</description>
+    <message>Authentication is required to manage remote desktop sessions</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

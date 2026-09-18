@@ -29,14 +29,17 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <poll.h>
 #include <set>
+#include <span>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -575,6 +578,55 @@ private:
     Cursor cursor_;
 };
 
+/// A desktop of virtual monitors that follow the client's monitors
+/// (Desktop::screens_follow_monitors()): it starts with two screens, drops
+/// those beyond the monitors the session asks for, and adds one on its own
+/// in dispatch() once `grow` is set.
+class FollowingDesktop final : public farland::app::Desktop {
+public:
+    FollowingDesktop()
+    {
+        screens_.push_back(std::make_unique<FakeDesktop::Frames>(false));
+        screens_.push_back(std::make_unique<FakeDesktop::Frames>(false));
+    }
+
+    [[nodiscard]] farland::platform::FrameSource& frames() override { return *screens_.front(); }
+    [[nodiscard]] farland::platform::CursorSource* cursor() override { return nullptr; }
+    [[nodiscard]] farland::platform::InputSink& input() override { return sink_; }
+    [[nodiscard]] std::vector<int> dispatch_fds() const override { return {}; }
+    void dispatch() override
+    {
+        if (grow.exchange(false)) {
+            screens_.push_back(std::make_unique<FakeDesktop::Frames>(false));
+            max_count = std::max(max_count.load(), screens_.size());
+        }
+    }
+    [[nodiscard]] bool closed() const override { return false; }
+    [[nodiscard]] std::size_t screen_count() const override { return screens_.size(); }
+    [[nodiscard]] farland::platform::FrameSource& screen_frames(std::size_t index) override
+    {
+        return *screens_.at(index);
+    }
+    [[nodiscard]] farland::platform::CursorSource* screen_cursor(std::size_t /*index*/) override { return nullptr; }
+    [[nodiscard]] bool resizable() const override { return true; }
+    [[nodiscard]] bool screens_follow_monitors() const override { return true; }
+    void request_screen_sizes(std::span<const std::pair<std::uint32_t, std::uint32_t>> sizes) override
+    {
+        requested.store(sizes.size());
+        screens_.resize(std::max<std::size_t>(sizes.size(), 1));
+    }
+
+    std::atomic<std::size_t> requested{0};
+    std::atomic<std::size_t> max_count{2};
+    std::atomic<bool> grow{false};
+    /// Read by the test after joining the session thread.
+    [[nodiscard]] std::size_t count() const { return screens_.size(); }
+
+private:
+    std::vector<std::unique_ptr<FakeDesktop::Frames>> screens_;
+    FakeDesktop::Sink sink_;
+};
+
 /// A certificate and key on disk for the network process, removed afterwards.
 struct TempIdentity {
     std::filesystem::path dir = std::filesystem::temp_directory_path() / ("farland-e2e-" + std::to_string(::getpid()));
@@ -759,4 +811,46 @@ TEST_CASE("End to end with a shared desktop: its size, frames and cursor, input 
     CHECK(desktop.frames().maps == (dmabuf_only ? 1 : 0));
     CHECK(desktop.frames().access == farland::platform::FrameAccess::cpu);
     CHECK(desktop.frames().releases == 1);
+}
+
+TEST_CASE("End to end with a desktop whose screens follow the client's monitors")
+{
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto identity = farland::auth::TlsIdentity::generate("e2e.farland.test").value();
+    FollowingDesktop desktop;
+    std::atomic<bool> stop{false};
+    farland::app::SessionOptions options;
+    options.frames_per_second = 60;
+    options.preauth.require_nla = false;
+    options.desktop = &desktop;
+    std::thread server([&] { farland::app::run_session(fds[0], "e2e-following", identity, options, stop); });
+    {
+        TestClient c(fds[1]);
+        REQUIRE_FALSE(negotiate(c, proto::protocol::ssl, nullptr).has_value());
+        std::optional<client::AutoDetectResponder> autodetect;
+        // One client monitor: the second screen goes.
+        CHECK(activate(c, proto::protocol::ssl, width, height, autodetect) ==
+              std::pair<std::uint16_t, std::uint16_t>{width, height});
+        Canvas canvas;
+        for (int i = 0; i < 400 && canvas.tiles_seen.size() < 20; ++i) {
+            canvas.apply(next_pdu(c, *autodetect));
+        }
+        CHECK(desktop.requested.load() == 1);
+        CHECK(canvas.tiles_seen.size() == 20);
+        CHECK(canvas.rgb(5, 5) == FakeDesktop::color);
+        CHECK(canvas.rgb(315, 235) == FakeDesktop::color);
+
+        // A screen the desktop adds on its own shows nowhere, and nothing breaks.
+        desktop.grow = true;
+        for (int i = 0; i < 300 && desktop.grow.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));  // a few more loops with three screens
+        CHECK_FALSE(desktop.grow.load());
+        stop = true;
+    }
+    server.join();
+    CHECK(desktop.max_count.load() == 2);
+    CHECK(desktop.count() == 2);
 }

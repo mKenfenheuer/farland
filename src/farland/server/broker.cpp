@@ -9,6 +9,7 @@
 #include <farland/server/broker.hpp>
 
 #include <algorithm>
+#include <format>
 
 namespace farland::server::broker {
 
@@ -24,6 +25,11 @@ enum class Type : std::uint8_t {
     disconnect = 3,
     session_ended = 4,
     stats = 5,
+    terminate = 6,
+    settings = 7,
+    consent_request = 8,
+    consent_cancel = 9,
+    consent_reply = 10,
 };
 
 void write_string(Writer& w, std::string_view text, std::size_t max)
@@ -69,6 +75,18 @@ Result<std::array<std::byte, N>> read_array(Reader& r)
     std::array<std::byte, N> out{};
     std::ranges::copy(bytes, out.begin());
     return out;
+}
+
+/// An enum given by its value, which must be at most `last`.
+template <class Enum>
+Result<Enum> read_enum(Reader& r, Enum last, const char* what)
+{
+    const std::size_t start = r.offset();
+    FARLAND_TRY(const std::uint8_t value, r.u8());
+    if (value > static_cast<std::uint8_t>(last)) {
+        return fail(Errc::invalid_value, what, start);
+    }
+    return static_cast<Enum>(value);
 }
 
 Result<std::int32_t> read_i32(Reader& r)
@@ -198,6 +216,25 @@ void encode_body(Writer& w, const Hello& m)
     w.bytes(m.token);
 }
 
+void encode_body(Writer& w, const Settings& m)
+{
+    FARLAND_ASSERT(m.frames_per_second >= min_frames_per_second && m.frames_per_second <= max_frames_per_second);
+    FARLAND_ASSERT(m.activation_seconds >= min_activation_seconds && m.activation_seconds <= max_activation_seconds);
+    w.u8(static_cast<std::uint8_t>(Type::settings));
+    w.u16le(m.frames_per_second);
+    w.u8(static_cast<std::uint8_t>(m.bitmap_codec));
+    w.u8(static_cast<std::uint8_t>(m.gfx_codec));
+    write_flag(w, m.h264_backend.has_value());
+    w.u8(m.h264_backend ? static_cast<std::uint8_t>(*m.h264_backend) : 0);
+    write_string(w, m.openh264_library, max_settings_path);
+    write_string(w, m.render_node, max_settings_path);
+    for (const bool flag : {m.zero_copy, m.clearcodec, m.refine, m.audio, m.microphone, m.clipboard}) {
+        write_flag(w, flag);
+    }
+    w.u8(static_cast<std::uint8_t>(m.autodetect));
+    w.u32le(m.activation_seconds);
+}
+
 void encode_body(Writer& w, const NewConnection& m)
 {
     FARLAND_ASSERT(m.connection_id != 0);
@@ -228,6 +265,35 @@ void encode_body(Writer& w, const Disconnect& m)
     w.u32le(m.error_info);
 }
 
+void encode_body(Writer& w, const ConsentRequest& m)
+{
+    FARLAND_ASSERT(m.connection_id != 0);
+    FARLAND_ASSERT(m.timeout_seconds >= min_consent_seconds && m.timeout_seconds <= max_consent_seconds);
+    w.u8(static_cast<std::uint8_t>(Type::consent_request));
+    w.u64le(m.connection_id);
+    write_string(w, m.user, max_long_string);
+    write_string(w, m.peer, max_short_string);
+    write_string(w, m.client_name, max_short_string);
+    w.u32le(m.timeout_seconds);
+    write_flag(w, m.allow_on_timeout);
+    write_flag(w, m.from_seat);
+}
+
+void encode_body(Writer& w, const ConsentCancel& m)
+{
+    FARLAND_ASSERT(m.connection_id != 0);
+    w.u8(static_cast<std::uint8_t>(Type::consent_cancel));
+    w.u64le(m.connection_id);
+}
+
+void encode_body(Writer& w, const ConsentReply& m)
+{
+    FARLAND_ASSERT(m.connection_id != 0);
+    w.u8(static_cast<std::uint8_t>(Type::consent_reply));
+    w.u64le(m.connection_id);
+    w.u8(static_cast<std::uint8_t>(m.answer));
+}
+
 void encode_body(Writer& w, const SessionEnded& m)
 {
     w.u8(static_cast<std::uint8_t>(Type::session_ended));
@@ -248,6 +314,90 @@ void encode_body(Writer& w, const Stats& m)
     w.u64le(m.bytes_received);
     w.u32le(m.rtt_ms);
     w.u32le(m.bandwidth_kbps);
+}
+
+void encode_body(Writer& w, const Terminate& m)
+{
+    w.u8(static_cast<std::uint8_t>(Type::terminate));
+    w.u8(static_cast<std::uint8_t>(m.reason));
+}
+
+Result<EndReason> read_end_reason(Reader& r)
+{
+    const std::size_t reason_offset = r.offset();
+    FARLAND_TRY(const std::uint8_t reason, r.u8());
+    if (reason < static_cast<std::uint8_t>(EndReason::logout) || reason > static_cast<std::uint8_t>(EndReason::error)) {
+        return fail(Errc::invalid_value, "unknown session end reason", reason_offset);
+    }
+    return static_cast<EndReason>(reason);
+}
+
+/// A connection id, which is never 0.
+Result<std::uint64_t> read_connection_id(Reader& r)
+{
+    const std::size_t id_offset = r.offset();
+    FARLAND_TRY(const std::uint64_t id, r.u64le());
+    if (id == 0) {
+        return fail(Errc::invalid_value, "connection id 0", id_offset);
+    }
+    return id;
+}
+
+Result<ConsentAnswer> read_consent_answer(Reader& r)
+{
+    const std::size_t answer_offset = r.offset();
+    FARLAND_TRY(const std::uint8_t answer, r.u8());
+    if (answer < static_cast<std::uint8_t>(ConsentAnswer::allowed) ||
+        answer > static_cast<std::uint8_t>(ConsentAnswer::unavailable)) {
+        return fail(Errc::invalid_value, "unknown consent answer", answer_offset);
+    }
+    return static_cast<ConsentAnswer>(answer);
+}
+
+Result<Message> decode_consent_request(Reader& r)
+{
+    ConsentRequest m;
+    FARLAND_TRY(m.connection_id, read_connection_id(r));
+    FARLAND_TRY(m.user, read_string(r, max_long_string));
+    FARLAND_TRY(m.peer, read_string(r, max_short_string));
+    FARLAND_TRY(m.client_name, read_string(r, max_short_string));
+    const std::size_t timeout_offset = r.offset();
+    FARLAND_TRY(m.timeout_seconds, r.u32le());
+    if (m.timeout_seconds < min_consent_seconds || m.timeout_seconds > max_consent_seconds) {
+        return fail(Errc::invalid_value, "consent timeout out of range", timeout_offset);
+    }
+    FARLAND_TRY(m.allow_on_timeout, read_flag(r));
+    FARLAND_TRY(m.from_seat, read_flag(r));
+    return m;
+}
+
+Result<Message> decode_settings(Reader& r)
+{
+    Settings m;
+    const std::size_t rate_offset = r.offset();
+    FARLAND_TRY(m.frames_per_second, r.u16le());
+    if (m.frames_per_second < min_frames_per_second || m.frames_per_second > max_frames_per_second) {
+        return fail(Errc::invalid_value, "frame rate out of range", rate_offset);
+    }
+    FARLAND_TRY(m.bitmap_codec, read_enum(r, BitmapCodec::uncompressed, "unknown bitmap codec"));
+    FARLAND_TRY(m.gfx_codec, read_enum(r, TileCodec::avc444, "unknown GFX codec"));
+    FARLAND_TRY(const bool has_backend, read_flag(r));
+    FARLAND_TRY(const auto backend, read_enum(r, video::Backend::nvenc, "unknown H.264 backend"));
+    if (has_backend) {
+        m.h264_backend = backend;
+    }
+    FARLAND_TRY(m.openh264_library, read_string(r, max_settings_path));
+    FARLAND_TRY(m.render_node, read_string(r, max_settings_path));
+    for (bool* flag : {&m.zero_copy, &m.clearcodec, &m.refine, &m.audio, &m.microphone, &m.clipboard}) {
+        FARLAND_TRY(*flag, read_flag(r));
+    }
+    FARLAND_TRY(m.autodetect, read_enum(r, AutoDetectMode::full, "unknown auto-detect mode"));
+    const std::size_t timeout_offset = r.offset();
+    FARLAND_TRY(m.activation_seconds, r.u32le());
+    if (m.activation_seconds < min_activation_seconds || m.activation_seconds > max_activation_seconds) {
+        return fail(Errc::invalid_value, "activation timeout out of range", timeout_offset);
+    }
+    return m;
 }
 
 Result<Message> decode_new_connection(Reader& r)
@@ -292,16 +442,27 @@ Result<Message> decode_body(Reader& r)
         FARLAND_TRY(m.token, read_array<std::tuple_size_v<Token>>(r));
         return m;
     }
+    case Type::settings:
+        return decode_settings(r);
     case Type::new_connection:
         return decode_new_connection(r);
     case Type::disconnect: {
         Disconnect m;
-        const std::size_t id_offset = r.offset();
-        FARLAND_TRY(m.connection_id, r.u64le());
-        if (m.connection_id == 0) {
-            return fail(Errc::invalid_value, "connection id 0", id_offset);
-        }
+        FARLAND_TRY(m.connection_id, read_connection_id(r));
         FARLAND_TRY(m.error_info, r.u32le());
+        return m;
+    }
+    case Type::consent_request:
+        return decode_consent_request(r);
+    case Type::consent_cancel: {
+        ConsentCancel m;
+        FARLAND_TRY(m.connection_id, read_connection_id(r));
+        return m;
+    }
+    case Type::consent_reply: {
+        ConsentReply m;
+        FARLAND_TRY(m.connection_id, read_connection_id(r));
+        FARLAND_TRY(m.answer, read_consent_answer(r));
         return m;
     }
     case Type::session_ended: {
@@ -330,6 +491,11 @@ Result<Message> decode_body(Reader& r)
         FARLAND_TRY(m.bandwidth_kbps, r.u32le());
         return m;
     }
+    case Type::terminate: {
+        Terminate m;
+        FARLAND_TRY(m.reason, read_end_reason(r));
+        return m;
+    }
     default:
         return fail(Errc::invalid_value, "unknown broker message type", r.offset() - 1);
     }
@@ -345,17 +511,71 @@ bool tokens_equal(const Token& a, const Token& b) noexcept
     return difference == 0;
 }
 
+std::string_view name_of(BitmapCodec codec)
+{
+    return codec == BitmapCodec::planar ? "planar" : "raw";
+}
+
+std::string_view name_of(TileCodec codec)
+{
+    switch (codec) {
+    case TileCodec::progressive:
+        return "progressive";
+    case TileCodec::planar:
+        return "planar";
+    case TileCodec::avc420:
+        return "avc420";
+    case TileCodec::avc444:
+        return "avc444";
+    }
+    return "progressive";
+}
+
+std::string_view name_of(AutoDetectMode mode)
+{
+    switch (mode) {
+    case AutoDetectMode::off:
+        return "off";
+    case AutoDetectMode::continuous:
+        return "continuous";
+    case AutoDetectMode::full:
+        return "full";
+    }
+    return "full";
+}
+
 }  // namespace
+
+std::string describe(const Settings& settings)
+{
+    const auto on_off = [](bool value) { return value ? "on" : "off"; };
+    std::string out =
+        std::format("gfx {}, bitmap {}, h264 {}, {} fps, autodetect {}, zero-copy {}, clearcodec {}, refine {}, "
+                    "audio {}, microphone {}, clipboard {}, activation {} s",
+                    name_of(settings.gfx_codec), name_of(settings.bitmap_codec),
+                    settings.h264_backend ? video::to_string(*settings.h264_backend) : std::string_view("auto"),
+                    settings.frames_per_second, name_of(settings.autodetect), on_off(settings.zero_copy),
+                    on_off(settings.clearcodec), on_off(settings.refine), on_off(settings.audio),
+                    on_off(settings.microphone), on_off(settings.clipboard), settings.activation_seconds);
+    if (!settings.render_node.empty()) {
+        out += ", render node " + settings.render_node;
+    }
+    if (!settings.openh264_library.empty()) {
+        out += ", openh264 " + settings.openh264_library;
+    }
+    return out;
+}
 
 bool may_send(Sender sender, const Message& message) noexcept
 {
     if (std::holds_alternative<Disconnect>(message)) {
         return true;
     }
-    if (sender == Sender::daemon) {
-        return std::holds_alternative<NewConnection>(message);
-    }
-    return !std::holds_alternative<NewConnection>(message);
+    const bool daemon_only = std::holds_alternative<NewConnection>(message) ||
+                             std::holds_alternative<Terminate>(message) || std::holds_alternative<Settings>(message) ||
+                             std::holds_alternative<ConsentRequest>(message) ||
+                             std::holds_alternative<ConsentCancel>(message);
+    return sender == Sender::daemon ? daemon_only : !daemon_only;
 }
 
 bool carries_fd(const Message& message) noexcept
@@ -365,7 +585,10 @@ bool carries_fd(const Message& message) noexcept
 
 std::vector<std::byte> encode(const Message& message)
 {
-    Writer w;
+    // Room for every message but a NewConnection with pending input. Growing
+    // from empty also let GCC 16 at -O3 see the buffer as 8 bytes and warn
+    // about the writes after it (-Warray-bounds, a false positive).
+    Writer w(256);
     w.u32le(0);  // length, patched below
     std::visit([&w](const auto& m) { encode_body(w, m); }, message);
     const std::size_t length = w.size() - length_prefix;

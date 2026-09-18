@@ -17,6 +17,8 @@ Useful configurations:
 | Warnings as errors (as in CI) | add `-Dwerror=true` |
 | Benchmarks (not run by `meson test`) | `meson setup build-rel --buildtype=release`, then `meson compile -C build-rel bench-progressive && ./build-rel/benchmarks/bench-progressive` |
 
+GitHub CI runs one job only: a release build with `-Dwerror=true`, one `meson test` run, one run of the release binary, and the Debian package (`sh packaging/make-deb.sh BUILD_DIR OUTPUT_DIR`, needs `dpkg-dev`), which it installs to check that the `farlandd` service starts. That keeps runner minutes low, so everything else is on you before you push: the sanitizer, fuzz and clang-tidy builds above, the other compilers (GCC 13 to 16, Clang 19 to 21) and distributions, and the compositor tests.
+
 On macOS, use Apple clang for the sanitizer builds (ASan, UBSan and TSan all work). Apple clang has no libFuzzer, though, so fuzz with Homebrew LLVM (`CC=$(brew --prefix llvm)/bin/clang`) and `-Db_sanitize=undefined` only: Homebrew LLVM 20's AddressSanitizer runtime deadlocks at startup on macOS 26, inside `AsanInitInternal`. ASan fuzzing therefore only works on Linux. farland itself targets Linux, and macOS is only for working on the platform-independent libraries.
 
 Tests that need an H.264 encoder are skipped unless one is available. To run them, set `FARLAND_OPENH264_LIBRARY` to a libopenh264 (Cisco's prebuilt binaries from ciscobinary.openh264.org work) or configure with `-Dx264=enabled`. `FARLAND_FFMPEG` and `FARLAND_FFPROBE` point the H.264 quality tests at ffmpeg.
@@ -31,6 +33,12 @@ The portal backend (Linux only) needs `libsystemd-dev`, `libei-dev` and `libpipe
 - the capture tests need the `pipewire` daemon, which they start privately; the ones that pass dmabufs on also need read-write access to `/dev/udmabuf` (logind grants it to the user at the seat on Ubuntu), and skip without it.
 
 `build/tests/platform/portal/farland-portal-probe` tries a real portal session on a desktop.
+
+The wlroots backend (Linux only) needs `libwayland-dev`, `libxkbcommon-dev` and, preferably, `wayland-protocols` (older releases fall back to the protocol copies in `src/farland/platform/wlroots/protocols/`). Its keymap tests need xkeyboard-config (`xkb-data`). Its compositor tests start headless `sway`, `labwc` and `cage` with the pixman renderer and skip the ones not installed; sway refuses to run as root, so run them as a user (`build/tests/farland-unit-tests "[wlroots]"`).
+
+The Mutter backend (headless GNOME) is built with the portal backend, and `libxkbcommon-dev` adds keymaps. Its tests run `tests/platform/mutter/mock_mutter.py` on a private bus and skip without the same Python modules; `build/tests/platform/mutter/farland-gnome-headless-probe 1600x900 1600x900,1280x1024` starts a real headless GNOME Shell and walks it through monitor layouts.
+
+farlandd (multi-session) uses `libsystemd-dev` for logind, GDM and the users' service managers, and `libpam0g-dev` (`-Dpam`) for its own login sessions; both are optional, and the end-to-end tests run it without either (`--no-pam`). The headless desktop backends are chosen with `-Dheadless-gnome`, `-Dheadless-plasma` and `-Dheadless-wlroots`; a missing one leaves a stub that fails at runtime.
 
 Install the git hooks once with `pre-commit install`. They run clang-format, the REUSE license check and whitespace fixes.
 

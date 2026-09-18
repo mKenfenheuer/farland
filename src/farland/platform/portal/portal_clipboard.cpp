@@ -5,14 +5,8 @@
 #include <farland/platform/portal/portal_bus.hpp>
 #include <farland/platform/portal/portal_clipboard.hpp>
 
-#include <algorithm>
-#include <array>
-#include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <format>
-#include <poll.h>
-#include <unistd.h>
 
 // org.freedesktop.portal.Clipboard, version 1 (xdg-desktop-portal 1.18).
 namespace farland::platform::portal {
@@ -28,24 +22,6 @@ constexpr std::string_view log_component = "platform.portal";
 constexpr const char* clipboard_interface = "org.freedesktop.portal.Clipboard";
 /// SelectionRead, SelectionWrite and RequestClipboard answer at once.
 constexpr auto call_timeout = std::chrono::seconds(5);
-constexpr std::size_t read_chunk = std::size_t{64} * 1024;
-
-/// A copy of the fd in `reply`, non-blocking.
-PortalResult<UniqueFd> reply_fd(sd_bus_message* reply, std::string_view what)
-{
-    int borrowed = -1;
-    if (!MessageReader(reply).fd(borrowed)) {
-        return detail::fail(PortalErrc::protocol, std::format("{}: the reply has no file descriptor", what));
-    }
-    UniqueFd fd(::fcntl(borrowed, F_DUPFD_CLOEXEC, 3));  // NOLINT(cppcoreguidelines-pro-type-vararg)
-    if (!fd.valid()) {
-        return detail::fail(PortalErrc::protocol,
-                            std::format("{}: cannot duplicate the fd: {}", what, std::strerror(errno)));
-    }
-    const int flags = ::fcntl(fd.get(), F_GETFL);    // NOLINT(cppcoreguidelines-pro-type-vararg)
-    ::fcntl(fd.get(), F_SETFL, flags | O_NONBLOCK);  // NOLINT(cppcoreguidelines-pro-type-vararg)
-    return fd;
-}
 
 PortalResult<detail::SlotPtr> subscribe(sd_bus* bus, const std::string& sender, const char* member,
                                         sd_bus_message_handler_t handler, void* userdata)
@@ -138,16 +114,13 @@ detail::MessagePtr PortalSession::take_clipboard_owner_signal()
 // --- PortalClipboard
 
 PortalClipboard::PortalClipboard(PortalSession& session, PortalClipboardOptions options)
-    : session_(session), options_(options)
+    : session_(session), pipes_(options, [this](std::uint32_t serial, bool success) { write_done(serial, success); })
 {
 }
 
 PortalClipboard::~PortalClipboard()
 {
-    for (auto& write : writes_) {
-        write.fd.reset();
-        write_done(write.serial, false);
-    }
+    pipes_.cancel_writes();
 }
 
 PortalResult<std::unique_ptr<PortalClipboard>> PortalClipboard::create(PortalSession& session,
@@ -286,16 +259,13 @@ void PortalClipboard::write(std::uint32_t serial, std::optional<std::vector<std:
     }
     MessageWriter(call->get()).object_path(session_.session_handle()).u32(serial);
     auto reply = session_.bus()->call(call->get(), "SelectionWrite", Clock::now() + call_timeout, -1);
-    auto fd = reply ? reply_fd(reply->get(), "SelectionWrite") : std::unexpected(std::move(reply).error());
+    auto fd = reply ? take_reply_fd(reply->get(), "SelectionWrite") : std::unexpected(std::move(reply).error());
     if (!fd) {
         log::warn(log_component, "{}", fd.error().message);
         write_done(serial, false);
         return;
     }
-    writes_.push_back(Write{serial, std::move(*fd), std::move(*data), 0, Clock::now() + options_.write_timeout});
-    if (pump(writes_.back())) {
-        writes_.pop_back();
-    }
+    pipes_.write(serial, std::move(*fd), std::move(*data));
 }
 
 std::uint64_t PortalClipboard::read(const std::string& mime_type)
@@ -308,13 +278,13 @@ std::uint64_t PortalClipboard::read(const std::string& mime_type)
     }
     MessageWriter(call->get()).object_path(session_.session_handle()).string(mime_type);
     auto reply = session_.bus()->call(call->get(), "SelectionRead", Clock::now() + call_timeout, -1);
-    auto fd = reply ? reply_fd(reply->get(), "SelectionRead") : std::unexpected(std::move(reply).error());
+    auto fd = reply ? take_reply_fd(reply->get(), "SelectionRead") : std::unexpected(std::move(reply).error());
     if (!fd) {
         log::warn(log_component, "{}", fd.error().message);
         events_.emplace_back(clipboard_event::ReadFinished{id, std::nullopt});
         return id;
     }
-    reads_.push_back(Read{id, std::move(*fd), {}, Clock::now() + options_.read_timeout});
+    pipes_.read(id, std::move(*fd));
     return id;
 }
 
@@ -328,82 +298,10 @@ std::optional<ClipboardEvent> PortalClipboard::poll_event()
     return event;
 }
 
-std::vector<PollFd> PortalClipboard::poll_fds() const
-{
-    std::vector<PollFd> fds;
-    fds.reserve(reads_.size() + writes_.size());
-    for (const auto& read : reads_) {
-        fds.push_back(PollFd{read.fd.get(), POLLIN});
-    }
-    for (const auto& write : writes_) {
-        fds.push_back(PollFd{write.fd.get(), POLLOUT});
-    }
-    return fds;
-}
-
-bool PortalClipboard::pump(Read& read)
-{
-    std::array<std::byte, read_chunk> buffer{};
-    for (;;) {
-        const auto n = ::read(read.fd.get(), buffer.data(), buffer.size());
-        if (n > 0) {
-            if (read.data.size() + static_cast<std::size_t>(n) > options_.max_read_size) {
-                log::warn(log_component, "the desktop's clipboard data is larger than {} bytes",
-                          options_.max_read_size);
-                events_.emplace_back(clipboard_event::ReadFinished{read.id, std::nullopt});
-                return true;
-            }
-            const auto got = std::span(buffer).first(static_cast<std::size_t>(n));
-            read.data.insert(read.data.end(), got.begin(), got.end());
-            continue;
-        }
-        if (n == 0) {
-            events_.emplace_back(clipboard_event::ReadFinished{read.id, std::move(read.data)});
-            return true;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN) {  // EWOULDBLOCK on Linux
-            if (Clock::now() < read.deadline) {
-                return false;
-            }
-            log::warn(log_component, "the desktop did not hand over its clipboard data in time");
-        }
-        events_.emplace_back(clipboard_event::ReadFinished{read.id, std::nullopt});
-        return true;
-    }
-}
-
-bool PortalClipboard::pump(Write& write)
-{
-    while (write.offset < write.data.size()) {
-        const auto rest = std::span(write.data).subspan(write.offset);
-        const auto n = ::write(write.fd.get(), rest.data(), rest.size());
-        if (n > 0) {
-            write.offset += static_cast<std::size_t>(n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        if (n < 0 && errno == EAGAIN && Clock::now() < write.deadline) {
-            return false;
-        }
-        write.fd.reset();
-        write_done(write.serial, false);
-        return true;
-    }
-    write.fd.reset();  // EOF for the reader
-    write_done(write.serial, true);
-    return true;
-}
-
 void PortalClipboard::dispatch()
 {
     session_.process();
-    std::erase_if(reads_, [this](Read& read) { return pump(read); });
-    std::erase_if(writes_, [this](Write& write) { return pump(write); });
+    pipes_.pump(events_);
 }
 
 }  // namespace farland::platform::portal

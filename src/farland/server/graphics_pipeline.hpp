@@ -161,7 +161,10 @@ public:
     /// `frame` has surface_size(index).
     [[nodiscard]] Result<bool> add_dmabuf_frame(std::size_t index, const video::DmabufFrame& frame,
                                                 std::span<const PixelRect> damage);
-    /// Closes the frame and returns its ID; nullopt when nothing was added.
+    /// Closes the frame and returns its ID; nullopt when it stayed empty.
+    /// A screen that got no picture is refined here (has_pending_refinement()):
+    /// a still desktop sends no frames of its own, so its Progressive tiles
+    /// would stay at the quality their TILE_FIRST pass had.
     [[nodiscard]] std::optional<std::uint32_t> end_frame();
 
     /// A frame of the first screen alone: add_frame(0, frame).
@@ -208,6 +211,9 @@ private:
         std::vector<std::byte> previous;  ///< Last picture sent, tightly packed BGRX
         /// A dmabuf picture went out since: `previous` is not what the client has.
         bool previous_stale = false;
+        /// A picture of this screen went into the open frame, which refined it
+        /// already; end_frame() refines the others.
+        bool in_frame = false;
         std::vector<bool> dirty;
     };
 
@@ -240,6 +246,9 @@ private:
     /// TILE_UPGRADE passes for the tiles not in `changed`, within what is left
     /// of options_.upgrade_budget after `used` bytes.
     void send_upgrades(Screen& s, const TileList& changed, std::size_t used);
+    /// What a screen that got no picture in the open frame still owes the
+    /// client: Progressive upgrades, or the AVC444 chroma held back earlier.
+    void refine_still_screen(Screen& s);
     /// Looks for a vertical scroll among `tiles` (the changed ones). When one
     /// is found, sends it as a SurfaceToSurface in the open frame, moves the
     /// same pixels in `previous` and returns true: the tiles must then be

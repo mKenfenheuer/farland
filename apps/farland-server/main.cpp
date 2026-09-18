@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // farland-server: an RDP server with NLA that shares the running Wayland
-// desktop (--share) or shows the synthetic test backend.
+// desktop (--share), runs a headless one (--headless), or shows the
+// synthetic test backend.
 
 #include <farland/auth/credential_store.hpp>
 #include <farland/auth/ntlm.hpp>
@@ -16,6 +17,7 @@
 #ifdef FARLAND_HAVE_PORTAL
 #include "portal_desktop.hpp"
 #endif
+#include "headless.hpp"
 #include "privsep_process.hpp"
 #include "sandbox.hpp"
 #include "session.hpp"
@@ -27,13 +29,16 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <optional>
 #include <poll.h>
 #include <span>
 #include <string>
@@ -70,6 +75,8 @@ struct Options {
     /// Share the running desktop through xdg-desktop-portal.
     bool share = false;
     bool virtual_monitor = false;
+    /// Start (or attach to) a headless compositor instead: sway, labwc or cage.
+    std::optional<app::HeadlessOptions> headless;
     bool allow_tls_only = false;
     /// Internal: this process is the network process for one client.
     bool privsep_child = false;
@@ -132,6 +139,13 @@ void usage()
                  "                        each on one of the client's monitors; one session at a time\n"
                  "  --virtual-monitor     with --share: share a new virtual monitor where the portal offers it,\n"
                  "                        sized to the client's monitor and resized with its window (GNOME)\n"
+                 "  --headless KIND       run a headless desktop for this user instead of the test pattern:\n"
+                 "                        gnome, plasma, sway, labwc or cage (cage runs the command after --,\n"
+                 "                        e.g. --headless cage -- foot); stopped when farland-server exits\n"
+                 "  --headless-size WxH   its first output's size until the client resizes it (default 1920x1080)\n"
+                 "  --headless-layout L   XKB layout for its keymap, e.g. de or fr(azerty) (default us)\n"
+                 "  --headless-attach     with --headless: use the compositor of this session ($WAYLAND_DISPLAY)\n"
+                 "                        instead of starting one\n"
                  "  --no-clipboard        do not share the clipboard (text, HTML, images, files); without --share\n"
                  "                        the clipboard is a loopback that offers back what the client copies\n"
                  "  --allow-tls-only      also accept clients without NLA (anyone reaches the login screen)\n"
@@ -142,6 +156,7 @@ void usage()
 
 bool parse_options(std::span<char*> args, Options& options)
 {
+    bool headless_given = false;  // --headless-* options apply only with it
     for (std::size_t i = 1; i < args.size(); ++i) {
         const std::string_view arg = args[i];
         const auto value = [&]() -> std::string {
@@ -228,6 +243,31 @@ bool parse_options(std::span<char*> args, Options& options)
         } else if (arg == "--virtual-monitor") {
             options.share = true;
             options.virtual_monitor = true;
+        } else if (arg == "--headless") {
+            const auto kind = app::parse_headless_kind(value());
+            if (!kind) {
+                throw std::runtime_error("--headless must be gnome, plasma, sway, labwc or cage");
+            }
+            auto& headless = options.headless ? *options.headless : options.headless.emplace();
+            headless.kind = *kind;
+            headless_given = true;
+        } else if (arg == "--headless-size") {
+            const auto size = value();
+            auto& headless = options.headless ? *options.headless : options.headless.emplace();
+            if (std::sscanf(size.c_str(), "%ux%u", &headless.width, &headless.height) != 2 || headless.width < 200 ||
+                headless.height < 200 || headless.width > 8192 || headless.height > 8192) {
+                throw std::runtime_error("--headless-size must be WIDTHxHEIGHT, 200 to 8192 each");
+            }
+        } else if (arg == "--headless-layout") {
+            auto& headless = options.headless ? *options.headless : options.headless.emplace();
+            headless.keymap_layout = value();
+        } else if (arg == "--headless-attach") {
+            auto& headless = options.headless ? *options.headless : options.headless.emplace();
+            headless.attach = true;
+        } else if (arg == "--") {
+            auto& headless = options.headless ? *options.headless : options.headless.emplace();
+            headless.cage_command.assign(args.begin() + static_cast<std::ptrdiff_t>(i) + 1, args.end());
+            break;
         } else if (arg == "--no-clipboard") {
             options.session.clipboard = false;
         } else if (arg == "--no-privsep") {
@@ -252,6 +292,16 @@ bool parse_options(std::span<char*> args, Options& options)
         } else {
             throw std::runtime_error("unknown option " + std::string(arg));
         }
+    }
+    if (options.headless && !headless_given) {
+        throw std::runtime_error("--headless-size, --headless-layout, --headless-attach and -- need --headless");
+    }
+    if (options.headless && options.share) {
+        throw std::runtime_error("--headless and --share exclude each other");
+    }
+    if (options.headless && options.headless->kind == app::HeadlessKind::cage &&
+        options.headless->cage_command.empty() && !options.headless->attach) {
+        throw std::runtime_error("--headless cage needs the application to run after --");
     }
     if (options.cert.empty() != options.key.empty()) {
         throw std::runtime_error("--cert and --key go together");
@@ -396,19 +446,20 @@ int main(int argc, char** argv)
 #ifdef FARLAND_HAVE_PORTAL
     // Declared before the listener and the session threads, destroyed after them.
     std::unique_ptr<app::Desktop> desktop;
-    if (options.share) {
-        // The capture offers the dmabuf layouts of the encoder's GPU, so it
-        // needs the encoder's render node.
-        std::string render_node = options.session.render_node;
+    // The capture offers the dmabuf layouts of the encoder's GPU, so it
+    // needs the encoder's render node.
+    std::string render_node = options.session.render_node;
 #ifdef FARLAND_HAVE_VAAPI
-        const auto backend = options.session.h264_backend;
-        if (render_node.empty() && options.session.gfx_codec == farland::server::TileCodec::avc420 &&
-            (!backend || *backend == farland::video::Backend::vaapi)) {
-            if (const auto device = farland::video::vaapi::probe()) {
-                render_node = device->render_node;
-            }
+    const auto backend = options.session.h264_backend;
+    if ((options.share || options.headless) && render_node.empty() &&
+        options.session.gfx_codec == farland::server::TileCodec::avc420 &&
+        (!backend || *backend == farland::video::Backend::vaapi)) {
+        if (const auto device = farland::video::vaapi::probe()) {
+            render_node = device->render_node;
         }
+    }
 #endif
+    if (options.share) {
         auto shared = app::start_portal_desktop(app::PortalDesktopOptions{
             .virtual_monitor = options.virtual_monitor,
             .restore_token_file = std::nullopt,
@@ -431,6 +482,19 @@ int main(int argc, char** argv)
         return 2;
     }
 #endif
+    std::unique_ptr<app::Desktop> headless_desktop;
+    if (options.headless) {
+        auto headless = *options.headless;
+        headless.render_node = options.session.render_node;
+        auto started = app::start_headless_desktop(headless);
+        if (!started) {
+            std::cerr << "farland-server: cannot start the headless desktop: " << started.error().message() << "\n";
+            return 1;
+        }
+        headless_desktop = std::move(*started);
+        options.session.desktop = headless_desktop.get();
+        options.max_sessions = 1;  // one session drives the desktop at a time
+    }
     if (const auto users = farland::auth::CredentialStore::load(options.users); !users) {
         std::cerr << "farland-server: cannot read the NLA user store " << options.users.string() << "\n";
         return 1;

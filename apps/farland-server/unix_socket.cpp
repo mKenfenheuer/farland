@@ -132,8 +132,12 @@ Result<std::size_t> receive_some(int socket, std::span<std::byte> into, UniqueFd
 
 }  // namespace
 
-Result<void> send_message(int socket, std::span<const std::byte> frame, int fd)
+Result<void> send_message(int socket, std::span<const std::byte> frame, int fd, int timeout_ms)
 {
+    std::optional<Clock::time_point> deadline;
+    if (timeout_ms >= 0) {
+        deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    }
     FARLAND_ASSERT(frame.size() > length_prefix);
 #ifdef SO_NOSIGPIPE
     const int one = 1;
@@ -165,7 +169,7 @@ Result<void> send_message(int socket, std::span<const std::byte> frame, int fd)
                 continue;
             }
             if (would_block(errno)) {
-                FARLAND_TRY_VOID(wait_for(socket, POLLOUT, std::nullopt));
+                FARLAND_TRY_VOID(wait_for(socket, POLLOUT, deadline));
                 continue;
             }
             log::debug(log_component, "sendmsg: {}", std::strerror(errno));

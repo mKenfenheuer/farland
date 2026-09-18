@@ -13,8 +13,21 @@ option('vaapi', type: 'feature', value: 'auto',
   description: 'VA-API H.264 encoder backend (libva and libva-drm >= 2.14): GPU encoding with zero-copy dmabuf input on AMD and Intel')
 option('portal', type: 'feature', value: 'auto',
   description: 'Portal platform backend (Linux only): xdg-desktop-portal over sd-bus (libsystemd or basu), PipeWire and libei')
+option('wlroots', type: 'feature', value: 'auto',
+  description: 'wlroots platform backend (Linux only): headless sway, labwc and cage as a Wayland client (wayland-client, wayland-scanner, xkbcommon)')
 
 option('nvenc', type: 'feature', value: 'auto',
   description: 'NVENC H.264 encoder backend (Linux): NVIDIA GPU encoding with zero-copy dmabuf input. Needs nothing to build; the driver libraries are loaded at runtime')
 option('png', type: 'feature', value: 'auto',
   description: 'PNG images on the clipboard, with deflate from zlib. Without it, images are exchanged as BMP only')
+
+option('headless-gnome', type: 'feature', value: 'auto',
+  description: 'Headless GNOME sessions for farlandd through Mutter\'s D-Bus API (needs the portal backend\'s sd-bus, PipeWire and libei)')
+option('headless-plasma', type: 'feature', value: 'auto',
+  description: 'Headless Plasma sessions for farlandd through KWin')
+option('headless-wlroots', type: 'feature', value: 'auto',
+  description: 'Headless sway, labwc and cage sessions for farlandd (wayland-client)')
+option('pam', type: 'feature', value: 'auto',
+  description: 'farlandd starts sessions through PAM and logind (libpam, Linux). Without it farlandd only runs agents as its own user (--no-pam)')
+option('kwin', type: 'feature', value: 'auto',
+  description: 'KWin platform backend (Linux only, needs the portal backend and wayland-client): headless Plasma sessions through zkde_screencast, EIS and ext-data-control')

@@ -426,7 +426,11 @@ Result<void> Connection::on_client_info(Reader& data)
     session_.info_flags = info.flags;
     log::info(log_component, "client info: user '{}' domain '{}' flags 0x{:x}", info.user_name, info.domain,
               info.flags);
-    events_.emplace_back(event::ClientInfo{info.domain, info.user_name, std::move(info.password), info.flags});
+    std::optional<proto::AutoReconnectCookie> cookie;
+    if (info.extended) {
+        cookie = info.extended->auto_reconnect_cookie;
+    }
+    events_.emplace_back(event::ClientInfo{info.domain, info.user_name, std::move(info.password), info.flags, cookie});
 
     // Auto-detect and heartbeats need the client's support and the message
     // channel ([MS-RDPBCGR] 2.2.14.3, 2.2.16.1); the joins are over by now.
@@ -684,6 +688,19 @@ void Connection::send_pointer(const proto::PointerUpdate& update)
     proto::pointer::encode_slow_path(payload, update);
     Writer pdu;
     proto::write_data_pdu(pdu, session_.share_id, mcs::server_channel_id, proto::pdu_type2::pointer, payload.view());
+    send_io(pdu.view());
+}
+
+void Connection::send_save_session_info(const proto::LogonInfoExtended& info)
+{
+    if (state_ != State::active) {
+        return;
+    }
+    Writer payload;
+    proto::encode_save_session_info(payload, info);
+    Writer pdu;
+    proto::write_data_pdu(pdu, session_.share_id, mcs::server_channel_id, proto::pdu_type2::save_session_info,
+                          payload.view());
     send_io(pdu.view());
 }
 

@@ -4,7 +4,11 @@
 #pragma once
 
 #include <farland/base/error.hpp>
+#include <farland/server/connection.hpp>
+#include <farland/server/frame_encoder.hpp>
+#include <farland/server/graphics_pipeline.hpp>
 #include <farland/server/preauth.hpp>
+#include <farland/video/h264_encoder.hpp>
 
 #include <array>
 #include <cstddef>
@@ -31,14 +35,19 @@
 ///
 /// Who sends what:
 ///
-/// | Message       | Sender                                      | Descriptor           |
-/// |---------------|---------------------------------------------|----------------------|
-/// | Hello         | agent, as its first message                 | none                 |
-/// | NewConnection | daemon                                      | the plaintext socket |
-/// | Disconnect    | daemon: end that connection with this code  | none                 |
-/// |               | agent: that connection has ended            |                      |
-/// | SessionEnded  | agent, as its last message                  | none                 |
-/// | Stats         | agent, periodically                         | none                 |
+/// | Message        | Sender                                      | Descriptor           |
+/// |----------------|---------------------------------------------|----------------------|
+/// | Hello          | agent, as its first message                 | none                 |
+/// | Settings       | daemon, right after the agent's Hello       | none                 |
+/// | NewConnection  | daemon                                      | the plaintext socket |
+/// | Disconnect     | daemon: end that connection with this code  | none                 |
+/// |                | agent: that connection has ended            |                      |
+/// | ConsentRequest | daemon: ask the user about a takeover       | none                 |
+/// | ConsentCancel  | daemon: take that question back             | none                 |
+/// | ConsentReply   | agent: what the user answered               | none                 |
+/// | SessionEnded   | agent, as its last message                  | none                 |
+/// | Stats          | agent, periodically                         | none                 |
+/// | Terminate      | daemon: end the whole session               | none                 |
 ///
 /// Wire format, as privsep: u32le length of what follows, a u8 message type,
 /// then the fields. Integers are little-endian; strings are a u16le length
@@ -49,7 +58,7 @@ namespace farland::server::broker {
 
 /// Bumped on every incompatible change; farlandd and the agent come from one
 /// package, so the daemon simply refuses another version.
-inline constexpr std::uint16_t protocol_version = 1;
+inline constexpr std::uint16_t protocol_version = 3;
 
 /// A per-agent secret farlandd generates when it starts the agent. Together
 /// with the peer's uid (SO_PEERCRED) it ties the socket connection to the
@@ -66,6 +75,44 @@ inline constexpr std::size_t max_monitors = 16;  ///< [MS-RDPBCGR] 2.2.1.3.6
 struct Hello {
     std::uint16_t version = protocol_version;
     Token token{};
+};
+
+/// Longest library name or device path in Settings.
+inline constexpr std::size_t max_settings_path = 1024;
+/// Frame rate range of Settings; the quality tiers lower it from there.
+inline constexpr std::uint16_t min_frames_per_second = 1;
+inline constexpr std::uint16_t max_frames_per_second = 240;
+/// Activation timeout range of Settings, in seconds.
+inline constexpr std::uint32_t min_activation_seconds = 5;
+inline constexpr std::uint32_t max_activation_seconds = 3600;
+
+/// Codecs, channels and timeouts for every connection of this session: the
+/// part of /etc/farland/farland.toml the session needs. The agent runs as
+/// the user and does not read /etc, so farlandd sends it once, right after
+/// the agent's Hello and before the first NewConnection; the agent applies
+/// it before it starts the desktop. The defaults are farland-server's, so
+/// an agent that never hears it behaves as the command line does.
+struct Settings {
+    std::uint16_t frames_per_second = 30;
+    BitmapCodec bitmap_codec = BitmapCodec::planar;
+    TileCodec gfx_codec = TileCodec::progressive;
+    /// nullopt: try the backends this build has, GPU first.
+    std::optional<video::Backend> h264_backend;
+    /// OpenH264 library for AVC420 and AVC444 (empty: the usual sonames).
+    std::string openh264_library;
+    /// DRM render node for the compositor and for NVENC and VA-API (empty:
+    /// the first that works).
+    std::string render_node;
+    bool zero_copy = true;
+    bool clearcodec = true;
+    bool refine = true;
+    bool audio = true;
+    bool microphone = true;
+    bool clipboard = true;
+    AutoDetectMode autodetect = AutoDetectMode::full;
+    /// Seconds from the TCP connection to an active RDP connection, which
+    /// includes starting the desktop.
+    std::uint32_t activation_seconds = 60;
 };
 
 /// One monitor, as TS_MONITOR_DEF ([MS-RDPBCGR] 2.2.1.3.6.1): inclusive
@@ -131,6 +178,51 @@ struct Disconnect {
     std::uint32_t error_info = 0;
 };
 
+/// Range of ConsentRequest's timeout, in seconds; [policy] takeover_timeout
+/// stays well inside it.
+inline constexpr std::uint32_t min_consent_seconds = 1;
+inline constexpr std::uint32_t max_consent_seconds = 3600;
+
+/// Daemon to agent: connection `connection_id` wants this session, which
+/// someone is holding — another client, or the user at the machine with
+/// on_local_session = "attach". The agent asks them and answers with one
+/// ConsentReply ([policy] takeover, apps/farland-agent/consent.hpp).
+struct ConsentRequest {
+    std::uint64_t connection_id = 0;
+    std::string user;         ///< the connecting user, as NLA named them
+    std::string peer;         ///< the client's address
+    std::string client_name;  ///< what the client calls itself; empty: unknown
+    std::uint32_t timeout_seconds = 30;
+    /// What happens when nobody answers in time ([policy]
+    /// takeover_on_timeout); the countdown runs in that button.
+    bool allow_on_timeout = true;
+    /// The session is wanted by somebody logging in at the machine, not by
+    /// another client ([policy] seat_takeover): `user` is the account they
+    /// log in as, `peer` and `client_name` are empty, and the prompt says so.
+    bool from_seat = false;
+};
+
+/// Daemon to agent: the question about `connection_id` no longer stands —
+/// whoever held the session let go, or the client is gone. The agent takes
+/// the prompt down and sends no reply.
+struct ConsentCancel {
+    std::uint64_t connection_id = 0;
+};
+
+enum class ConsentAnswer : std::uint8_t {
+    allowed = 1,      ///< hand the session over
+    denied = 2,       ///< keep it
+    timed_out = 3,    ///< nobody answered in time
+    unavailable = 4,  ///< no notification service answered; nobody was asked
+};
+
+/// Agent to daemon: the answer to one ConsentRequest. farlandd applies
+/// takeover_on_timeout to `timed_out` and `unavailable`.
+struct ConsentReply {
+    std::uint64_t connection_id = 0;
+    ConsentAnswer answer = ConsentAnswer::allowed;
+};
+
 enum class EndReason : std::uint8_t {
     logout = 1,                ///< the user logged out; the compositor exited normally
     desktop_failed = 2,        ///< the compositor or the capture backend died
@@ -161,9 +253,21 @@ struct Stats {
     std::uint32_t bandwidth_kbps = 0;  ///< 0: unknown
 };
 
-using Message = std::variant<Hello, NewConnection, Disconnect, SessionEnded, Stats>;
+/// Daemon to agent: end the session (the connection, if any, then the
+/// desktop) for `reason`; the agent answers with SessionEnded and exits.
+/// farlandd sends it for [policy] disconnected_timeout, an administrator's
+/// request and its own shutdown.
+struct Terminate {
+    EndReason reason = EndReason::terminated;
+};
+
+using Message = std::variant<Hello, Settings, NewConnection, Disconnect, ConsentRequest, ConsentCancel, ConsentReply,
+                             SessionEnded, Stats, Terminate>;
 
 enum class Sender : std::uint8_t { daemon, agent };
+
+/// One line naming every setting, for the logs of both sides.
+[[nodiscard]] std::string describe(const Settings& settings);
 
 /// Whether `sender` may send `message` at all.
 [[nodiscard]] bool may_send(Sender sender, const Message& message) noexcept;

@@ -913,6 +913,112 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
     CHECK(text_exact);
 }
 
+TEST_CASE("GFX: frames without a picture refine what a desktop standing still left coarse")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    gfx::GfxServerConfig config;
+    config.avc420 = config.avc444 = config.avc444v2 = false;
+    GraphicsPipeline pipeline(channels, width, height, config);  // Progressive with refinement
+    const auto id = establish(client, channels, pipeline);
+
+    // A gradient with a colour per pixel, like a photo: every tile goes out
+    // as Progressive, none as ClearCodec.
+    Bytes pixels(std::size_t{width} * height * 4);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto at = ((std::size_t{y} * width) + x) * 4;
+            pixels[at] = static_cast<std::byte>(x * 2);
+            pixels[at + 1] = static_cast<std::byte>(y * 2);
+            pixels[at + 2] = static_cast<std::byte>(x + y);
+            pixels[at + 3] = std::byte{0xFF};
+        }
+    }
+    const farland::codec::ImageView frame{pixels, width, height, std::size_t{width} * 4};
+
+    auto decoder = farland::codec::progressive::Decoder::create(width, height).value();
+    const auto receive = [&](std::uint32_t frame_id) {
+        std::size_t streams = 0;
+        for (const auto& pdu : client.take_gfx(id)) {
+            if (const auto* w2 = std::get_if<gfx::WireToSurface2>(&pdu)) {
+                REQUIRE(decoder.decode(w2->bitmap_data, frame_id).has_value());
+                ++streams;
+            }
+        }
+        return streams;
+    };
+
+    const auto first = pipeline.send_frame(frame);
+    REQUIRE(first.has_value());
+    CHECK(receive(*first) > 0);
+    REQUIRE(pipeline.has_pending_refinement());
+    const Bytes coarse(decoder.image().data.begin(), decoder.image().data.end());
+
+    // The desktop stands still, so the capture has no frame to give and the
+    // session opens frames with no picture in them at all: the refinement
+    // has to go out in those.
+    int refinements = 0;
+    while (pipeline.has_pending_refinement() && refinements < 50) {
+        pipeline.begin_frame();
+        const auto frame_id = pipeline.end_frame();
+        REQUIRE(frame_id.has_value());
+        CHECK(receive(*frame_id) > 0);
+        ++refinements;
+    }
+    CHECK_FALSE(pipeline.has_pending_refinement());
+    CHECK(refinements > 0);
+    pipeline.begin_frame();
+    CHECK_FALSE(pipeline.end_frame().has_value());  // and then nothing
+
+    const Bytes fine(decoder.image().data.begin(), decoder.image().data.end());
+    const auto view = [](const Bytes& image) {
+        return farland::codec::ImageView{image, width, height, std::size_t{width} * 4};
+    };
+    CHECK(psnr(view(fine), frame) > psnr(view(coarse), frame));
+    CHECK(psnr(view(fine), frame) >= 38.0);
+}
+
+TEST_CASE("GFX: deferred AVC444 chroma goes out while the desktop stands still")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    GraphicsPipeline pipeline(channels, width, height, {}, TileCodec::avc444, stub_factory);
+    const auto id = establish_with(client, channels, pipeline, gfx::make_capability_set(gfx::cap_version::v10_7, 0));
+    REQUIRE(pipeline.codec() == TileCodec::avc444);
+    // The congested tier: chroma waits until the picture stops changing.
+    pipeline.set_quality({}, {}, true);
+
+    farland::server::TestPattern pattern(width, height);
+    const auto frame = pattern.render(0);
+    const auto first = pipeline.send_frame(frame);
+    REQUIRE(first.has_value());
+    const auto layout_of = [&](std::uint32_t frame_id) {
+        static_cast<void>(frame_id);
+        std::optional<farland::codec::avc::Avc444Layout> layout;
+        for (const auto& pdu : client.take_gfx(id)) {
+            if (const auto* w = std::get_if<gfx::WireToSurface1>(&pdu)) {
+                layout = farland::codec::avc::decode_avc444(w->bitmap_data).value().layout;
+            }
+        }
+        return layout;
+    };
+    REQUIRE(layout_of(*first) == farland::codec::avc::Avc444Layout::luma);
+    REQUIRE(pipeline.has_pending_refinement());  // the chroma of a 4:2:0 picture
+
+    // The desktop stands still from here: the capture has nothing to give and
+    // the session opens frames with no picture in them. The chroma still owed
+    // has to go out in one of those, or the client keeps a 4:2:0 desktop.
+    pipeline.begin_frame();
+    const auto second = pipeline.end_frame();
+    REQUIRE(second.has_value());
+    CHECK(layout_of(*second) == farland::codec::avc::Avc444Layout::chroma);
+    CHECK_FALSE(pipeline.has_pending_refinement());
+    pipeline.begin_frame();
+    CHECK_FALSE(pipeline.end_frame().has_value());  // and then nothing
+}
+
 TEST_CASE("GFX: a surface per screen, black surfaces around letterboxed pictures, and a new layout")
 {
     Client client;

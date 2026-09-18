@@ -22,6 +22,17 @@ using Error = std::unexpected<ConfigError>;
 
 constexpr std::int64_t max_timeout_seconds = std::int64_t{366} * 24 * 3600;
 constexpr std::int64_t max_session_limit = 100'000;
+/// A client that reaches no active connection in this long is dropped; a
+/// headless GNOME session through GDM needs most of a minute.
+constexpr std::chrono::seconds min_activation_timeout{5};
+constexpr std::chrono::seconds max_activation_timeout{3600};
+/// How long the takeover prompt may stand. The client waits meanwhile, so
+/// it has to leave room inside the activation timeout.
+constexpr std::chrono::seconds min_takeover_timeout{5};
+constexpr std::chrono::seconds max_takeover_timeout{300};
+/// The frame rate the session aims for; the quality tiers lower it.
+constexpr std::int64_t min_frame_rate = 1;
+constexpr std::int64_t max_frame_rate = 240;
 
 Error error_at(const toml::source_region& where, std::string message)
 {
@@ -67,6 +78,15 @@ std::expected<std::int64_t, ConfigError> get_integer(const toml::node& node, std
     return value->get();
 }
 
+std::expected<bool, ConfigError> get_bool(const toml::node& node, std::string_view name)
+{
+    const auto* value = node.as_boolean();
+    if (value == nullptr) {
+        return error_at(node, std::format("{} must be true or false", name));
+    }
+    return value->get();
+}
+
 std::expected<std::filesystem::path, ConfigError> get_path(const toml::node& node, std::string_view name)
 {
     auto text = get_string(node, name);
@@ -78,6 +98,22 @@ std::expected<std::filesystem::path, ConfigError> get_path(const toml::node& nod
         return error_at(node, std::format("{} must be an absolute path", name));
     }
     return path;
+}
+
+/// A shared library: a soname the loader searches for, or an absolute path.
+std::expected<std::string, ConfigError> get_library(const toml::node& node, std::string_view name)
+{
+    auto text = get_string(node, name);
+    if (!text) {
+        return std::unexpected(std::move(text).error());
+    }
+    if (text->empty()) {
+        return error_at(node, std::format("{} must not be empty", name));
+    }
+    if (text->find('/') != std::string::npos && !std::filesystem::path(*text).is_absolute()) {
+        return error_at(node, std::format("{} must be a soname or an absolute path, not \"{}\"", name, *text));
+    }
+    return text;
 }
 
 /// An enum given by name; `names[i]` names the value `i`.
@@ -156,7 +192,7 @@ bool is_ip_address(const std::string& text)
 
 std::expected<void, ConfigError> parse_server(const toml::table& table, ServerSection& out)
 {
-    if (auto ok = check_keys(table, "server", {"bind", "port", "certificate", "private_key"}); !ok) {
+    if (auto ok = check_keys(table, "server", {"bind", "port", "certificate", "private_key", "log_level"}); !ok) {
         return ok;
     }
     if (const auto* node = table.get("bind")) {
@@ -188,6 +224,14 @@ std::expected<void, ConfigError> parse_server(const toml::table& table, ServerSe
     if (out.certificate.has_value() != out.private_key.has_value()) {
         const auto* node = out.certificate ? table.get("certificate") : table.get("private_key");
         return error_at(*node, "[server] certificate and private_key go together");
+    }
+    if (const auto* node = table.get("log_level")) {
+        auto level = get_enum<LogLevel>(*node, "[server] log_level",
+                                        std::array<std::string_view, 5>{"trace", "debug", "info", "warn", "error"});
+        if (!level) {
+            return std::unexpected(std::move(level).error());
+        }
+        out.log_level = *level;
     }
     return {};
 }
@@ -230,8 +274,9 @@ std::expected<void, ConfigError> parse_session(const toml::table& table, Session
         return ok;
     }
     if (const auto* node = table.get("desktop")) {
-        auto desktop = get_enum<DesktopKind>(
-            *node, "[session] desktop", std::array<std::string_view, 5>{"gnome", "plasma", "sway", "labwc", "cage"});
+        auto desktop =
+            get_enum<DesktopKind>(*node, "[session] desktop",
+                                  std::array<std::string_view, 6>{"gnome", "plasma", "sway", "labwc", "cage", "test"});
         if (!desktop) {
             return std::unexpected(std::move(desktop).error());
         }
@@ -265,9 +310,10 @@ std::expected<void, ConfigError> parse_session(const toml::table& table, Session
 
 std::expected<void, ConfigError> parse_policy(const toml::table& table, PolicySection& out)
 {
-    if (auto ok = check_keys(
-            table, "policy",
-            {"disconnected_timeout", "idle_timeout", "max_sessions", "max_sessions_per_user", "on_local_session"});
+    if (auto ok = check_keys(table, "policy",
+                             {"disconnected_timeout", "idle_timeout", "activation_timeout", "max_sessions",
+                              "max_sessions_per_user", "on_local_session", "takeover", "takeover_timeout",
+                              "takeover_on_timeout", "seat_takeover"});
         !ok) {
         return ok;
     }
@@ -280,6 +326,16 @@ std::expected<void, ConfigError> parse_policy(const toml::table& table, PolicySe
             }
             *field = *duration;
         }
+    }
+    if (const auto* node = table.get("activation_timeout")) {
+        auto duration = get_duration(*node, "[policy] activation_timeout");
+        if (!duration) {
+            return std::unexpected(std::move(duration).error());
+        }
+        if (*duration < min_activation_timeout || *duration > max_activation_timeout) {
+            return error_at(*node, "[policy] activation_timeout must be between 5 s and 1 h");
+        }
+        out.activation_timeout = *duration;
     }
     if (const auto* node = table.get("max_sessions")) {
         auto limit = get_integer(*node, "[policy] max_sessions", 0, max_session_limit);
@@ -301,12 +357,162 @@ std::expected<void, ConfigError> parse_policy(const toml::table& table, PolicySe
         out.max_sessions_per_user = static_cast<unsigned>(*limit);
     }
     if (const auto* node = table.get("on_local_session")) {
-        auto policy = get_enum<LocalSessionPolicy>(*node, "[policy] on_local_session",
-                                                   std::array<std::string_view, 2>{"refuse", "attach"});
+        auto policy =
+            get_enum<LocalSessionPolicy>(*node, "[policy] on_local_session",
+                                         std::array<std::string_view, 4>{"refuse", "attach", "replace", "separate"});
         if (!policy) {
             return std::unexpected(std::move(policy).error());
         }
         out.on_local_session = *policy;
+    }
+    if (const auto* node = table.get("takeover")) {
+        auto takeover = get_enum<TakeoverPolicy>(*node, "[policy] takeover",
+                                                 std::array<std::string_view, 3>{"ask", "always", "never"});
+        if (!takeover) {
+            return std::unexpected(std::move(takeover).error());
+        }
+        out.takeover = *takeover;
+    }
+    if (const auto* node = table.get("takeover_timeout")) {
+        auto duration = get_duration(*node, "[policy] takeover_timeout");
+        if (!duration) {
+            return std::unexpected(std::move(duration).error());
+        }
+        if (*duration < min_takeover_timeout || *duration > max_takeover_timeout) {
+            return error_at(*node, "[policy] takeover_timeout must be between 5 s and 5 min");
+        }
+        out.takeover_timeout = *duration;
+    }
+    if (const auto* node = table.get("seat_takeover")) {
+        auto takeover = get_enum<TakeoverPolicy>(*node, "[policy] seat_takeover",
+                                                 std::array<std::string_view, 3>{"ask", "always", "never"});
+        if (!takeover) {
+            return std::unexpected(std::move(takeover).error());
+        }
+        out.seat_takeover = *takeover;
+    }
+    if (const auto* node = table.get("takeover_on_timeout")) {
+        auto action = get_enum<TakeoverDefault>(*node, "[policy] takeover_on_timeout",
+                                                std::array<std::string_view, 2>{"allow", "deny"});
+        if (!action) {
+            return std::unexpected(std::move(action).error());
+        }
+        out.takeover_on_timeout = *action;
+    }
+    return {};
+}
+
+std::expected<void, ConfigError> parse_graphics(const toml::table& table, GraphicsSection& out)
+{
+    if (auto ok = check_keys(table, "graphics",
+                             {"gfx_codec", "bitmap_codec", "h264_encoder", "openh264", "render_node", "zero_copy",
+                              "clearcodec", "refine", "frames_per_second"});
+        !ok) {
+        return ok;
+    }
+    if (const auto* node = table.get("gfx_codec")) {
+        auto codec = get_enum<GfxCodec>(*node, "[graphics] gfx_codec",
+                                        std::array<std::string_view, 4>{"progressive", "planar", "avc420", "avc444"});
+        if (!codec) {
+            return std::unexpected(std::move(codec).error());
+        }
+        out.gfx_codec = *codec;
+    }
+    if (const auto* node = table.get("bitmap_codec")) {
+        auto codec =
+            get_enum<BitmapCodec>(*node, "[graphics] bitmap_codec", std::array<std::string_view, 2>{"planar", "raw"});
+        if (!codec) {
+            return std::unexpected(std::move(codec).error());
+        }
+        out.bitmap_codec = *codec;
+    }
+    if (const auto* node = table.get("h264_encoder")) {
+        auto encoder =
+            get_enum<H264Encoder>(*node, "[graphics] h264_encoder",
+                                  std::array<std::string_view, 5>{"auto", "nvenc", "vaapi", "openh264", "x264"});
+        if (!encoder) {
+            return std::unexpected(std::move(encoder).error());
+        }
+        out.h264_encoder = *encoder;
+    }
+    if (const auto* node = table.get("openh264")) {
+        auto library = get_library(*node, "[graphics] openh264");
+        if (!library) {
+            return std::unexpected(std::move(library).error());
+        }
+        out.openh264 = std::move(*library);
+    }
+    if (const auto* node = table.get("render_node")) {
+        auto path = get_path(*node, "[graphics] render_node");
+        if (!path) {
+            return std::unexpected(std::move(path).error());
+        }
+        out.render_node = std::move(*path);
+    }
+    for (auto [key, field] : {std::pair{"zero_copy", &out.zero_copy}, std::pair{"clearcodec", &out.clearcodec},
+                              std::pair{"refine", &out.refine}}) {
+        if (const auto* node = table.get(key)) {
+            auto value = get_bool(*node, std::format("[graphics] {}", key));
+            if (!value) {
+                return std::unexpected(std::move(value).error());
+            }
+            *field = *value;
+        }
+    }
+    if (const auto* node = table.get("frames_per_second")) {
+        auto rate = get_integer(*node, "[graphics] frames_per_second", min_frame_rate, max_frame_rate);
+        if (!rate) {
+            return std::unexpected(std::move(rate).error());
+        }
+        out.frames_per_second = static_cast<unsigned>(*rate);
+    }
+    return {};
+}
+
+std::expected<void, ConfigError> parse_network(const toml::table& table, NetworkSection& out)
+{
+    if (auto ok = check_keys(table, "network", {"autodetect"}); !ok) {
+        return ok;
+    }
+    if (const auto* node = table.get("autodetect")) {
+        auto mode = get_enum<AutoDetect>(*node, "[network] autodetect",
+                                         std::array<std::string_view, 3>{"off", "continuous", "full"});
+        if (!mode) {
+            return std::unexpected(std::move(mode).error());
+        }
+        out.autodetect = *mode;
+    }
+    return {};
+}
+
+std::expected<void, ConfigError> parse_audio(const toml::table& table, AudioSection& out)
+{
+    if (auto ok = check_keys(table, "audio", {"playback", "microphone"}); !ok) {
+        return ok;
+    }
+    for (auto [key, field] : {std::pair{"playback", &out.playback}, std::pair{"microphone", &out.microphone}}) {
+        if (const auto* node = table.get(key)) {
+            auto value = get_bool(*node, std::format("[audio] {}", key));
+            if (!value) {
+                return std::unexpected(std::move(value).error());
+            }
+            *field = *value;
+        }
+    }
+    return {};
+}
+
+std::expected<void, ConfigError> parse_clipboard(const toml::table& table, ClipboardSection& out)
+{
+    if (auto ok = check_keys(table, "clipboard", {"enabled"}); !ok) {
+        return ok;
+    }
+    if (const auto* node = table.get("enabled")) {
+        auto value = get_bool(*node, "[clipboard] enabled");
+        if (!value) {
+            return std::unexpected(std::move(value).error());
+        }
+        out.enabled = *value;
     }
     return {};
 }
@@ -339,11 +545,15 @@ std::expected<Config, ConfigError> parse_config(std::string_view text)
 #endif
 
     using Parser = std::expected<void, ConfigError> (*)(const toml::table&, Config&);
-    static constexpr std::array<std::pair<std::string_view, Parser>, 4> sections{{
+    static constexpr std::array<std::pair<std::string_view, Parser>, 8> sections{{
         {"server", [](const toml::table& t, Config& c) { return parse_server(t, c.server); }},
         {"auth", [](const toml::table& t, Config& c) { return parse_auth(t, c.auth); }},
         {"session", [](const toml::table& t, Config& c) { return parse_session(t, c.session); }},
         {"policy", [](const toml::table& t, Config& c) { return parse_policy(t, c.policy); }},
+        {"graphics", [](const toml::table& t, Config& c) { return parse_graphics(t, c.graphics); }},
+        {"network", [](const toml::table& t, Config& c) { return parse_network(t, c.network); }},
+        {"audio", [](const toml::table& t, Config& c) { return parse_audio(t, c.audio); }},
+        {"clipboard", [](const toml::table& t, Config& c) { return parse_clipboard(t, c.clipboard); }},
     }};
 
     Config config;
@@ -395,13 +605,163 @@ std::string_view to_string(DesktopKind desktop) noexcept
         return "labwc";
     case DesktopKind::cage:
         return "cage";
+    case DesktopKind::test:
+        return "test";
     }
     return "unknown";
 }
 
 std::string_view to_string(LocalSessionPolicy policy) noexcept
 {
-    return policy == LocalSessionPolicy::refuse ? "refuse" : "attach";
+    switch (policy) {
+    case LocalSessionPolicy::refuse:
+        return "refuse";
+    case LocalSessionPolicy::attach:
+        return "attach";
+    case LocalSessionPolicy::replace:
+        return "replace";
+    case LocalSessionPolicy::separate:
+        return "separate";
+    }
+    return "attach";
+}
+
+std::string_view to_string(TakeoverPolicy takeover) noexcept
+{
+    switch (takeover) {
+    case TakeoverPolicy::ask:
+        return "ask";
+    case TakeoverPolicy::always:
+        return "always";
+    case TakeoverPolicy::never:
+        return "never";
+    }
+    return "ask";
+}
+
+std::string_view to_string(TakeoverDefault action) noexcept
+{
+    return action == TakeoverDefault::allow ? "allow" : "deny";
+}
+
+std::string_view to_string(LogLevel level) noexcept
+{
+    switch (level) {
+    case LogLevel::trace:
+        return "trace";
+    case LogLevel::debug:
+        return "debug";
+    case LogLevel::info:
+        return "info";
+    case LogLevel::warn:
+        return "warn";
+    case LogLevel::error:
+        return "error";
+    }
+    return "info";
+}
+
+std::string_view to_string(GfxCodec codec) noexcept
+{
+    switch (codec) {
+    case GfxCodec::progressive:
+        return "progressive";
+    case GfxCodec::planar:
+        return "planar";
+    case GfxCodec::avc420:
+        return "avc420";
+    case GfxCodec::avc444:
+        return "avc444";
+    }
+    return "progressive";
+}
+
+std::string_view to_string(BitmapCodec codec) noexcept
+{
+    return codec == BitmapCodec::planar ? "planar" : "raw";
+}
+
+std::string_view to_string(H264Encoder encoder) noexcept
+{
+    switch (encoder) {
+    case H264Encoder::automatic:
+        return "auto";
+    case H264Encoder::nvenc:
+        return "nvenc";
+    case H264Encoder::vaapi:
+        return "vaapi";
+    case H264Encoder::openh264:
+        return "openh264";
+    case H264Encoder::x264:
+        return "x264";
+    }
+    return "auto";
+}
+
+std::string_view to_string(AutoDetect autodetect) noexcept
+{
+    switch (autodetect) {
+    case AutoDetect::off:
+        return "off";
+    case AutoDetect::continuous:
+        return "continuous";
+    case AutoDetect::full:
+        return "full";
+    }
+    return "full";
+}
+
+std::string describe(const Config& config)
+{
+    const auto seconds = [](std::chrono::seconds value) { return std::to_string(value.count()); };
+    const auto quoted = [](std::string_view value) { return std::format("\"{}\"", value); };
+    const auto optional_path = [&quoted](const std::optional<std::filesystem::path>& value) {
+        return value ? quoted(value->string()) : std::string("unset");
+    };
+    const auto flag = [](bool value) { return value ? "true" : "false"; };
+    std::string out;
+    const auto line = [&out](std::string_view key, std::string_view value) {
+        out += std::format("{} = {}\n", key, value);
+    };
+    line("server.bind", quoted(config.server.bind));
+    line("server.port", std::to_string(config.server.port));
+    line("server.certificate", optional_path(config.server.certificate));
+    line("server.private_key", optional_path(config.server.private_key));
+    line("server.log_level", quoted(to_string(config.server.log_level)));
+    line("auth.mode", quoted(to_string(config.auth.mode)));
+    line("auth.credential_store", quoted(config.auth.credential_store.string()));
+    line("auth.keytab", optional_path(config.auth.keytab));
+    line("session.desktop", quoted(to_string(config.session.desktop)));
+    std::string command;
+    for (const auto& argument : config.session.command) {
+        command += command.empty() ? "" : ", ";
+        command += quoted(argument);
+    }
+    line("session.command", std::format("[{}]", command));
+    line("policy.disconnected_timeout", seconds(config.policy.disconnected_timeout));
+    line("policy.idle_timeout", seconds(config.policy.idle_timeout));
+    line("policy.activation_timeout", seconds(config.policy.activation_timeout));
+    line("policy.max_sessions", std::to_string(config.policy.max_sessions));
+    line("policy.max_sessions_per_user", std::to_string(config.policy.max_sessions_per_user));
+    line("policy.on_local_session", quoted(to_string(config.policy.on_local_session)));
+    line("policy.takeover", quoted(to_string(config.policy.takeover)));
+    line("policy.takeover_timeout", seconds(config.policy.takeover_timeout));
+    line("policy.takeover_on_timeout", quoted(to_string(config.policy.takeover_on_timeout)));
+    line("policy.seat_takeover", quoted(to_string(config.policy.seat_takeover)));
+    line("graphics.gfx_codec", quoted(to_string(config.graphics.gfx_codec)));
+    line("graphics.bitmap_codec", quoted(to_string(config.graphics.bitmap_codec)));
+    line("graphics.h264_encoder", quoted(to_string(config.graphics.h264_encoder)));
+    line("graphics.openh264", config.graphics.openh264 ? quoted(*config.graphics.openh264) : std::string("unset"));
+    line("graphics.render_node", optional_path(config.graphics.render_node));
+    line("graphics.zero_copy", flag(config.graphics.zero_copy));
+    line("graphics.clearcodec", flag(config.graphics.clearcodec));
+    line("graphics.refine", flag(config.graphics.refine));
+    line("graphics.frames_per_second", std::to_string(config.graphics.frames_per_second));
+    line("network.autodetect", quoted(to_string(config.network.autodetect)));
+    line("audio.playback", flag(config.audio.playback));
+    line("audio.microphone", flag(config.audio.microphone));
+    line("clipboard.enabled", flag(config.clipboard.enabled));
+    return out;
 }
 
 }  // namespace farland::daemon

@@ -1340,6 +1340,7 @@ Result<std::unique_ptr<PipeWireCapture>> PipeWireCapture::create(int pipewire_fd
 {
     auto impl = std::make_unique<Impl>();
     impl->options = options;
+    impl->requested_size = options.size;
     impl->target_node = node_id;
     impl->frame_wake = UniqueFd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     impl->cursor_wake = UniqueFd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));

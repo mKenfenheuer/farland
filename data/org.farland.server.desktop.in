@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# KWin grants its screen casting protocol only to programs named here
+# (X-KDE-Wayland-Interfaces, matched by the executable's path). Needed to
+# attach to a running Plasma session: farland-server --headless plasma
+# --attach, and farland-agent for a session of farlandd's. One file is
+# installed per program, since an entry names a single executable; a
+# headless Plasma session farland starts finds its own copy.
+[Desktop Entry]
+Type=Application
+Name=farland
+Comment=Remote desktop server
+Exec=@BINDIR@/@PROGRAM@
+NoDisplay=true
+X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1

@@ -28,15 +28,30 @@ subdir('channels')
 subdir('auth')
 subdir('platform')
 subdir('platform/portal')
+subdir('platform/kwin')
+subdir('platform/mutter')
+subdir('platform/wlroots')
 subdir('server')
 subdir('integration')
 subdir('apps')
+
+# PipeWire's pkg-config hands every user -fno-strict-overflow (libspa-0.2.pc),
+# and GCC then miscompiles the RemoteFX reference encoder: GCC 16 gets
+# std::bit_width wrong at -O2, GCC 15 a hand-written equivalent at -O3. The
+# flag says nothing our code needs, so the last word is ours. Dependency
+# arguments come before a target's own, so this cancels it.
+unit_test_args = [
+  '-DFARLAND_TEST_DATA_DIR="@0@"'.format(meson.current_source_dir() / 'data'),
+  # data/farland.toml, the file the package installs as /etc/farland/farland.toml.
+  '-DFARLAND_SOURCE_DATA_DIR="@0@"'.format(meson.project_source_root() / 'data'),
+]
+unit_test_args += cxx.get_supported_arguments('-fstrict-overflow')
 
 unit_tests = executable(
   'farland-unit-tests',
   unit_test_sources,
   dependencies: unit_test_deps,
-  cpp_args: '-DFARLAND_TEST_DATA_DIR="@0@"'.format(meson.current_source_dir() / 'data'),
+  cpp_args: unit_test_args,
 )
 
 # The privilege-separation test starts farland-server as the network process.
@@ -47,6 +62,10 @@ test(
   # The codec round trips take over 30 s unoptimised (debug and sanitizer
   # builds on small CI machines).
   timeout: 300,
-  env: {'FARLAND_SERVER': farland_server_exe.full_path()},
-  depends: farland_server_exe,
+  env: {
+    'FARLAND_SERVER': farland_server_exe.full_path(),
+    'FARLAND_DAEMON': farlandd_exe.full_path(),
+    'FARLAND_AGENT': farland_agent_exe.full_path(),
+  },
+  depends: [farland_server_exe, farlandd_exe, farland_agent_exe],
 )

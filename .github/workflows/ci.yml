@@ -7,8 +7,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "23 2 * * *" # nightly: longer fuzzing runs
   workflow_dispatch:
 
 permissions:
@@ -16,100 +14,35 @@ permissions:
 
 jobs:
   build:
-    # Ubuntu 24.04 is the oldest supported baseline (GCC 13, Clang 19 from clang-19, Meson 1.3).
-    name: ${{ matrix.image }} / ${{ matrix.compiler }}
+    # Deliberately small, to keep runner minutes down: one build, one test
+    # run, one run of the release binary, and the Debian package, installed
+    # to check that its multi-session service starts. Sanitizers, fuzzing,
+    # clang-tidy, other distributions and compilers, and the compositor
+    # tests run locally; CONTRIBUTING.md says how.
     runs-on: ubuntu-24.04
-    container: ${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        image: ["ubuntu:24.04", "debian:trixie", "fedora:latest", "archlinux:latest"]
-        compiler: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sh ci/install-deps.sh
-      - name: Configure
+        run: sudo sh ci/install-deps.sh
+      - name: Build (release, warnings as errors)
         run: |
-          if [ "${{ matrix.compiler }}" = gcc ]; then export CC=gcc CXX=g++; else export CC=clang CXX=clang++; fi
           meson setup build --buildtype=release -Dwerror=true
-      - name: Build
-        run: meson compile -C build
+          meson compile -C build
       - name: Test
         run: meson test -C build --print-errorlogs
-
-  sanitizers:
-    name: sanitizer / ${{ matrix.sanitizer }}
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: ["address,undefined", "thread"]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang-19 libclang-rt-19-dev libssl-dev libsystemd-dev libei-dev libeis-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libegl-dev libva-dev dbus python3-dbus python3-gi pipewire
-      - name: Allow sanitizer shadow memory on current kernels
-        run: sudo sysctl vm.mmap_rnd_bits=28
-      - name: Configure
-        run: >
-          CC=clang-19 CXX=clang++-19 meson setup build --buildtype=debug -Dwerror=true -Dhardening=false
-          -Db_sanitize=${{ matrix.sanitizer }} -Db_lundef=false
-      - name: Test
-        run: meson test -C build --print-errorlogs
-        env:
-          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-          TSAN_OPTIONS: halt_on_error=1
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang-19 libclang-rt-19-dev libssl-dev libsystemd-dev libei-dev libeis-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libegl-dev libva-dev dbus python3-dbus python3-gi pipewire
-      - name: Allow sanitizer shadow memory on current kernels
-        run: sudo sysctl vm.mmap_rnd_bits=28
-      - name: Build fuzz targets
+      - name: Run the release binary
+        run: ./build/apps/farland-server --fingerprint
+      - name: Build the Debian package
         run: |
-          CC=clang-19 CXX=clang++-19 meson setup build-fuzz --buildtype=debugoptimized -Dfuzzing=true -Dhardening=false \
-            -Db_sanitize=address,undefined -Db_lundef=false
-          meson compile -C build-fuzz
-      - name: Fuzz
+          sudo apt-get install -y --no-install-recommends dpkg-dev file
+          sh packaging/make-deb.sh build "$RUNNER_TEMP/pkg"
+      - name: Install it and start the multi-session service
         run: |
-          seconds=60
-          if [ "${{ github.event_name }}" = schedule ]; then seconds=900; fi
-          mkdir -p artifacts
-          for target in ber per planar x224 mcs_gcc share input server ntlm credssp privsep drdynvc svc zgfx rdpgfx progressive avc420 clear pointer autodetect rdpei disp rdpsnd audin broker save_session_info; do
-            mkdir -p "corpus-$target" && cp fuzz/corpus/$target/* "corpus-$target/"
-            "./build-fuzz/fuzz/fuzz-$target" -max_total_time=$seconds -artifact_prefix=artifacts/ "corpus-$target"
-          done
-      - name: Upload crashing inputs
-        if: failure()
-        uses: actions/upload-artifact@v4
+          sudo apt-get install -y "$RUNNER_TEMP"/pkg/farland_*.deb
+          systemctl is-enabled farlandd
+          systemctl is-active farlandd || { sudo journalctl -u farlandd --no-pager -n 40; exit 1; }
+      - uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
-          path: artifacts/
-
-  lint:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: pre-commit (clang-format, REUSE, whitespace)
-        run: |
-          pip install pre-commit
-          pre-commit run --all-files --show-diff-on-failure
-
-  clang-tidy:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build clang-19 clang-tidy-19 clang-tools-19 libssl-dev libsystemd-dev libei-dev libeis-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libegl-dev libva-dev dbus python3-dbus python3-gi pipewire
-      - name: Configure
-        run: CC=clang-19 CXX=clang++-19 meson setup build
-      - name: clang-tidy
-        run: run-clang-tidy-19 -p build -quiet 'src/farland/'
+          name: farland-deb
+          path: ${{ runner.temp }}/pkg/*.deb
+          retention-days: 14

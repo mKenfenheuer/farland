@@ -347,6 +347,9 @@ void GraphicsPipeline::begin_frame(std::uint32_t timestamp)
     FARLAND_ASSERT(ready());
     FARLAND_ASSERT(!frame_id_);
     frame_timestamp_ = timestamp;
+    for (const auto& s : screens_) {
+        s->in_frame = false;
+    }
 }
 
 void GraphicsPipeline::ensure_frame()
@@ -358,6 +361,16 @@ void GraphicsPipeline::ensure_frame()
 
 std::optional<std::uint32_t> GraphicsPipeline::end_frame()
 {
+    // A screen nothing was added for got no refinement from add_frame(): a
+    // desktop that stands still delivers no frames at all, and its tiles
+    // would never leave the quality of their first pass.
+    if (!closed_) {
+        for (const auto& s : screens_) {
+            if (!s->in_frame) {
+                refine_still_screen(*s);
+            }
+        }
+    }
     const auto id = std::exchange(frame_id_, std::nullopt);
     if (!id || closed_) {
         return std::nullopt;
@@ -397,6 +410,7 @@ void GraphicsPipeline::add_frame(std::size_t index, const codec::ImageView& fram
     FARLAND_ASSERT(ready() && index < screens_.size());
     Screen& s = *screens_[index];
     FARLAND_ASSERT(frame.width == s.width && frame.height == s.height);
+    s.in_frame = true;
     if (s.previous_stale) {
         // Dmabuf pictures went out that `previous` never saw: diffing against
         // it could miss a change back to what it holds.
@@ -526,6 +540,7 @@ Result<bool> GraphicsPipeline::add_dmabuf_frame(std::size_t index, const video::
     FARLAND_ASSERT(ready() && accepts_dmabuf(index));
     Screen& s = *screens_[index];
     FARLAND_ASSERT(frame.width == s.width && frame.height == s.height);
+    s.in_frame = true;
     // The damage marks tiles like an invalidation: they stay marked until a
     // frame carries them, whichever path it takes.
     for (const PixelRect& rect : damage) {
@@ -754,6 +769,22 @@ std::size_t GraphicsPipeline::send_clear(Screen& s, const codec::ImageView& fram
     return stream.size();
 }
 
+void GraphicsPipeline::refine_still_screen(Screen& s)
+{
+    if (s.avc444) {
+        // The chroma view is encoded from the picture the luma came from, and
+        // no other: `previous` still holds it, tile for tile, because every
+        // tile that went out was remembered. A stale `previous` is not that
+        // picture, so the chroma waits for the next real frame instead.
+        if (s.avc444->chroma_pending() && !s.previous_stale) {
+            const codec::ImageView last{s.previous, s.width, s.height, std::size_t{s.width} * bytes_per_pixel};
+            send_avc444_frame(s, last, {});
+        }
+        return;
+    }
+    send_upgrades(s, {}, 0);
+}
+
 void GraphicsPipeline::send_upgrades(Screen& s, const TileList& changed, std::size_t used)
 {
     if (!s.progressive || s.progressive->pending_tiles() == 0 || used >= options_.upgrade_budget) {
@@ -780,6 +811,7 @@ void GraphicsPipeline::send_upgrades(Screen& s, const TileList& changed, std::si
         streams = s.progressive->upgrade(area, budget);
     }
     for (const auto& stream : streams) {
+        ensure_frame();  // refinement alone opens the frame too
         gfx_.wire_to_surface_2(s.surface, gfx::codec::progressive, progressive_context, gfx::pixel_format::xrgb_8888,
                                stream);
     }

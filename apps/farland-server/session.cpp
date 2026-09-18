@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <limits>
 #include <optional>
 #include <poll.h>
 #include <span>
@@ -105,14 +106,25 @@ public:
         }
     }
 
-    void run(const std::atomic<bool>& stop, Clock::time_point started)
+    void run(const std::atomic<bool>& stop, Clock::time_point started, std::span<const std::byte> initial_input)
     {
         std::vector<std::byte> data;
         start_connection_if_ready();
+        if (connection_ && !initial_input.empty()) {
+            count_received(initial_input.size());
+            connection_->tick(Clock::now());
+            connection_->receive(initial_input);
+            pump();
+        }
         while (running_) {
             if (stop.load()) {
                 if (connection_) {
-                    connection_->disconnect(proto::errinfo::rpc_initiated_disconnect);
+                    const std::uint32_t code = control() != nullptr ? control()->stop_error_info.load()
+                                                                    : proto::errinfo::rpc_initiated_disconnect;
+                    connection_->disconnect(code);
+                    if (control() != nullptr) {
+                        control()->sent_error_info = code;
+                    }
                     pump();
                 }
                 break;
@@ -138,6 +150,7 @@ public:
                 if (!transport_.read(data)) {
                     break;
                 }
+                count_received(data.size());
                 start_connection_if_ready();
                 if (connection_ && !data.empty()) {
                     connection_->tick(Clock::now());
@@ -197,6 +210,30 @@ private:
     };
 
     [[nodiscard]] bool active() const { return connection_ && connection_->active(); }
+
+    [[nodiscard]] SessionControl* control() const { return options_.control; }
+
+    void count_received(std::size_t bytes) const
+    {
+        if (control() != nullptr) {
+            control()->bytes_received += bytes;
+        }
+    }
+
+    void count_frame() const
+    {
+        if (control() != nullptr) {
+            ++control()->frames_sent;
+        }
+    }
+
+    /// Input (or the activation) now, for [policy] idle_timeout.
+    void note_input() const
+    {
+        if (control() != nullptr) {
+            control()->last_input = Clock::now().time_since_epoch().count();
+        }
+    }
 
     [[nodiscard]] int poll_timeout_ms() const
     {
@@ -300,6 +337,7 @@ private:
             return;
         }
         desktop_->dispatch();
+        sync_screen_count();
         if (desktop_->closed()) {
             log::info(log_component, "{}: the shared desktop went away", peer_);
             if (connection_) {
@@ -363,6 +401,29 @@ private:
         if (scheduler_) {
             scheduler_->damage();
         }
+    }
+
+    /// A desktop whose screens follow the client's monitors added or removed
+    /// some (Desktop::screens_follow_monitors()): the removed ones are
+    /// forgotten before their frames could be used again, new ones start
+    /// from their source's size, and the output is laid out again.
+    void sync_screen_count()
+    {
+        const std::size_t count = desktop_->screen_count();
+        if (count == screens_.size()) {
+            return;
+        }
+        log::info(log_component, "{}: the desktop has {} screen{} now", peer_, count, count == 1 ? "" : "s");
+        const std::size_t old_count = screens_.size();
+        screens_.resize(count);
+        for (std::size_t i = old_count; i < count; ++i) {
+            screens_[i].size = desktop_->screen_frames(i).size();
+        }
+        if (cursor_screen_ && *cursor_screen_ >= count) {
+            cursor_screen_.reset();
+        }
+        screens_resized_ = false;
+        on_screens_resized();
     }
 
     /// A screen changed its size (a virtual monitor followed the client, a
@@ -615,6 +676,9 @@ private:
     void send(std::span<const std::byte> bytes)
     {
         bytes_sent_ += bytes.size();
+        if (control() != nullptr) {
+            control()->bytes_sent += bytes.size();
+        }
         if (!transport_.send(bytes)) {
             running_ = false;
         }
@@ -627,6 +691,14 @@ private:
         if (connection_ && running_) {
             connection_->tick(Clock::now());
             pump();
+        }
+        if (control() != nullptr && connection_) {
+            const auto& network = connection_->network();
+            const auto rtt =
+                network.rtt ? std::chrono::duration_cast<std::chrono::milliseconds>(*network.rtt).count() : 0;
+            control()->rtt_ms =
+                static_cast<std::uint32_t>(std::clamp<std::int64_t>(rtt, 0, std::numeric_limits<std::uint32_t>::max()));
+            control()->bandwidth_kbps = network.bandwidth_kbps.value_or(0);
         }
     }
 
@@ -723,6 +795,7 @@ private:
                         log::info(log_component, "{}: touch input ready (RDPEI version {:#010x}, {} contacts{})", peer_,
                                   e.client.protocol_version, e.max_touch_contacts, e.pen ? ", pen" : "");
                     } else if constexpr (std::is_same_v<T, channels::rdpei::event::Frame>) {
+                        note_input();
                         if (translator_) {
                             translator_->translate(e.contacts);
                             return;
@@ -832,7 +905,8 @@ private:
         if (!layout_) {
             return;
         }
-        const std::size_t count = desktop_ != nullptr ? screens_.size() : layout_->monitors().size();
+        const std::size_t count =
+            desktop_ != nullptr && !desktop_->screens_follow_monitors() ? screens_.size() : layout_->monitors().size();
         std::vector<Size> wanted;
         for (const std::size_t monitor : layout_->screen_monitors(count)) {
             const auto& rect = layout_->monitors()[monitor].rect;
@@ -841,6 +915,7 @@ private:
         if (desktop_ != nullptr) {
             if (desktop_->resizable() && client_layout_) {
                 desktop_->request_screen_sizes(wanted);
+                sync_screen_count();
             }
         } else {
             std::vector<server::TestPattern> patterns;
@@ -1107,6 +1182,7 @@ private:
         if (const auto frame_id = gfx_->end_frame()) {
             scheduler_->frame_sent(*frame_id, now);
             ++gfx_frames_;
+            count_frame();
         }
         log_gfx_statistics(now);
         pump();
@@ -1116,6 +1192,9 @@ private:
     void on_event(server::event::ClientInfo& e)
     {
         log::info(log_component, "{}: user '{}'{}", peer_, e.user_name, e.password.empty() ? "" : " (password sent)");
+        if (control() != nullptr && control()->on_client_info) {
+            control()->on_client_info(e.auto_reconnect_cookie);
+        }
     }
 
     void on_event(server::event::Activated& e)
@@ -1143,6 +1222,18 @@ private:
         start_dynamic_channels();
         start_audio();
         start_clipboard();
+        if (control() != nullptr) {
+            control()->desktop_width = session.desktop_width;
+            control()->desktop_height = session.desktop_height;
+            if (!e.reactivation) {
+                note_input();
+                if (control()->on_activated) {
+                    if (const auto info = control()->on_activated()) {
+                        connection_->send_save_session_info(*info);
+                    }
+                }
+            }
+        }
     }
 
     /// Audio starts with the first activation and lasts the session.
@@ -1220,6 +1311,7 @@ private:
 
     void on_event(server::event::Input& e)
     {
+        note_input();
         if (translator_) {
             translator_->translate(e.events);
             return;
@@ -1360,6 +1452,7 @@ private:
             for (const auto& update : encoder_->encode(*image, connection_->max_update_size())) {
                 connection_->send_bitmap_update(update);
             }
+            count_frame();
             pump();
         }
         next_frame_ += frame_interval_;
@@ -1421,10 +1514,11 @@ private:
 }  // namespace
 
 void run_session(Transport& transport, const std::string& peer, const SessionOptions& options,
-                 const std::atomic<bool>& stop, std::chrono::steady_clock::time_point started)
+                 const std::atomic<bool>& stop, std::chrono::steady_clock::time_point started,
+                 std::span<const std::byte> initial_input)
 {
     SessionRunner runner(transport, peer, options);
-    runner.run(stop, started);
+    runner.run(stop, started, initial_input);
 }
 
 void run_session(int fd, std::string peer, const auth::TlsIdentity& identity, const SessionOptions& options,

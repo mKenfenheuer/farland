@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=farland multi-session RDP server
+Wants=network-online.target
+After=network-online.target systemd-logind.service systemd-user-sessions.service
+
+[Service]
+Type=exec
+ExecStart=@sbindir@/farlandd --config /etc/farland/farland.toml
+# The agent socket, /run/farland/agent.sock.
+RuntimeDirectory=farland
+RuntimeDirectoryMode=0755
+# A generated TLS certificate, when farland.toml names none.
+StateDirectory=farland
+StateDirectoryMode=0700
+Restart=on-failure
+# farlandd ends its sessions itself on SIGTERM; the network processes follow.
+# Sessions from PAM live in their own logind scopes.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

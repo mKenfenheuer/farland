@@ -18,3 +18,60 @@ path = [
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Maximilian Kenfenheuer"
 SPDX-License-Identifier = "Apache-2.0"
+
+# Wayland protocol descriptions vendored for the wlroots backend: the wlroots
+# protocols no package installs, and stand-ins for older wayland-protocols.
+# Each file carries its licence text.
+[[annotations]]
+path = [
+  "src/farland/platform/wlroots/protocols/ext-image-capture-source-v1.xml",
+  "src/farland/platform/wlroots/protocols/ext-image-copy-capture-v1.xml",
+  "src/farland/platform/wlroots/protocols/virtual-keyboard-unstable-v1.xml",
+  "src/farland/platform/wlroots/protocols/wlr-screencopy-unstable-v1.xml",
+  "src/farland/platform/wlroots/protocols/wlr-virtual-pointer-unstable-v1.xml",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = [
+  "2008-2011 Kristian Høgsberg",
+  "2010-2013 Intel Corporation",
+  "2012-2013 Collabora, Ltd.",
+  "2018 Purism SPC",
+  "2018 Simon Ser",
+  "2019 Andri Yngvason",
+  "2019 Josef Gajdusek",
+  "2021-2023 Andri Yngvason",
+  "2022 Andri Yngvason",
+  "2024 Simon Ser",
+]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "src/farland/platform/wlroots/protocols/ext-data-control-v1.xml",
+  "src/farland/platform/wlroots/protocols/ext-foreign-toplevel-list-v1.xml",
+  "src/farland/platform/wlroots/protocols/wlr-data-control-unstable-v1.xml",
+  "src/farland/platform/wlroots/protocols/wlr-output-management-unstable-v1.xml",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = [
+  "2018 Ilia Bozhinov",
+  "2018 Simon Ser",
+  "2019 Ivan Molodetskikh",
+  "2019 Purism SPC",
+  "2020 Isaac Freund",
+  "2022 wb9688",
+  "2023 i509VCB",
+]
+SPDX-License-Identifier = "HPND-sell-variant"
+
+# Vendored from wayland-protocols (staging), which keeps its licence in the
+# copyright element instead of SPDX tags.
+[[annotations]]
+path = "src/farland/platform/kwin/protocols/ext-data-control-v1.xml"
+precedence = "aggregate"
+SPDX-FileCopyrightText = [
+  "2018 Simon Ser",
+  "2019 Ivan Molodetskikh",
+  "2024 Neal Gompa",
+]
+SPDX-License-Identifier = "HPND-sell-variant"

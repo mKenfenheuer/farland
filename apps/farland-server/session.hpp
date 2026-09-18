@@ -15,10 +15,41 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace farland::app {
+
+/// How a caller that runs sessions on another thread (farland-agent) follows
+/// and steers one (docs/ROADMAP.md M7). The session updates the counters and
+/// calls the callbacks on its own thread; the caller reads the counters from
+/// its own.
+struct SessionControl {
+    /// The Set Error Info code ([MS-RDPBCGR] 2.2.5.1.1) the session sends when
+    /// `stop` ends it, e.g. ERRINFO_DISCONNECTED_BY_OTHERCONNECTION.
+    std::atomic<std::uint32_t> stop_error_info{proto::errinfo::rpc_initiated_disconnect};
+    /// The code the session sent when `stop` ended it; 0 when it ended
+    /// otherwise (the client left).
+    std::atomic<std::uint32_t> sent_error_info{0};
+    /// When the client last sent input (keyboard, pointer, touch), in
+    /// steady_clock ticks since its epoch; set at activation too; 0 before.
+    std::atomic<std::int64_t> last_input{0};
+    std::atomic<std::uint64_t> frames_sent{0};
+    std::atomic<std::uint64_t> bytes_sent{0};
+    std::atomic<std::uint64_t> bytes_received{0};
+    std::atomic<std::uint32_t> desktop_width{0};
+    std::atomic<std::uint32_t> desktop_height{0};
+    std::atomic<std::uint32_t> rtt_ms{0};          ///< 0: unknown
+    std::atomic<std::uint32_t> bandwidth_kbps{0};  ///< 0: unknown
+    /// The Client Info PDU arrived, with the client's auto-reconnect cookie
+    /// if it sent one.
+    std::function<void(const std::optional<proto::AutoReconnectCookie>& cookie)> on_client_info;
+    /// The connection became active (not on reactivation); returns what to
+    /// send in a Save Session Info PDU, such as a fresh auto-reconnect cookie.
+    std::function<std::optional<proto::LogonInfoExtended>()> on_activated;
+};
 
 struct SessionOptions {
     unsigned frames_per_second = 30;
@@ -58,6 +89,8 @@ struct SessionOptions {
     Desktop* desktop = nullptr;
     /// Share the desktop's clipboard (cliprdr), where the desktop has one.
     bool clipboard = true;
+    /// Set by farland-agent to follow and steer the session; must outlive it.
+    SessionControl* control = nullptr;
 };
 
 /// Runs one client connection on a connected socket until it ends or `stop`
@@ -68,8 +101,11 @@ void run_session(int fd, std::string peer, const auth::TlsIdentity& identity, co
 
 /// Runs a session over `transport` (which pre-authenticates first if it is
 /// not ready yet). `started` is when the client connected, for the
-/// activation timeout. Closes the transport.
+/// activation timeout. `initial_input` is RDP stream the caller already read
+/// from the transport (farland-agent reads the Connect Initial to size a new
+/// desktop); the connection gets it before anything else. Closes the transport.
 void run_session(Transport& transport, const std::string& peer, const SessionOptions& options,
-                 const std::atomic<bool>& stop, std::chrono::steady_clock::time_point started);
+                 const std::atomic<bool>& stop, std::chrono::steady_clock::time_point started,
+                 std::span<const std::byte> initial_input = {});
 
 }  // namespace farland::app
