@@ -23,4 +23,12 @@ if farland_platform_kwin_dep.found()
       include_directories: include_directories('.', is_system: true),
     )
   endif
+
+  # Manual check against a real KWin (virtual outputs, resizing, and whether
+  # KWin keeps drawing them off the seat); not run as a test.
+  executable(
+    'farland-plasma-headless-probe',
+    'plasma_headless_probe.cpp',
+    dependencies: farland_app_dep,
+  )
 endif

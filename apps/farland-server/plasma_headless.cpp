@@ -10,10 +10,12 @@
 #include <farland/platform/kwin/output_management.hpp>
 #include <farland/platform/kwin/screencast.hpp>
 #include <farland/platform/kwin/wayland_connection.hpp>
+#include <farland/platform/logind/seat.hpp>
 #include <farland/platform/portal/ei_input.hpp>
 #include <farland/platform/portal/pipewire_capture.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -25,12 +27,16 @@ namespace farland::app {
 namespace {
 
 namespace kwin = platform::kwin;
+namespace logind = platform::logind;
 namespace portal = platform::portal;
 using Clock = std::chrono::steady_clock;
+using Size = std::pair<std::uint32_t, std::uint32_t>;
 constexpr std::string_view log_component = "app.plasma";
 /// The largest monitor RDP describes (MS-RDPEDISP 2.2.2.2.1).
 constexpr std::int32_t max_size = 8192;
 constexpr std::int32_t min_size = 200;
+/// RDP clients show at most 16 monitors ([MS-RDPBCGR] 2.2.1.3.6).
+constexpr std::size_t max_screens = 16;
 
 std::chrono::milliseconds left(Clock::time_point deadline)
 {
@@ -69,12 +75,38 @@ std::vector<std::string> attach_candidates()
 
 class PlasmaHeadlessDesktop final : public Desktop {
 public:
+    PlasmaHeadlessDesktop() = default;
+    PlasmaHeadlessDesktop(const PlasmaHeadlessDesktop&) = delete;
+    PlasmaHeadlessDesktop& operator=(const PlasmaHeadlessDesktop&) = delete;
+    PlasmaHeadlessDesktop(PlasmaHeadlessDesktop&&) = delete;
+    PlasmaHeadlessDesktop& operator=(PlasmaHeadlessDesktop&&) = delete;
+    ~PlasmaHeadlessDesktop() override
+    {
+        // The seat's screens come back before ours go: KWin is not to be left
+        // with a session that has no screen at all, and whoever is at the
+        // machine finds their screens as they were.
+        if (outputs_ && wayland_ && !wayland_->broken()) {
+            outputs_->restore_layout(std::chrono::seconds(2));
+        }
+    }
+
     [[nodiscard]] Result<void> start(const HeadlessOptions& options);
 
     [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
     [[nodiscard]] platform::CursorSource* cursor() override { return &screens_.front().capture->cursor(); }
     [[nodiscard]] platform::InputSink& input() override { return *ei_; }
-    [[nodiscard]] std::vector<int> dispatch_fds() const override { return {wayland_->fd(), ei_->fd(), eis_->bus_fd()}; }
+    [[nodiscard]] std::vector<int> dispatch_fds() const override
+    {
+        std::vector<int> fds{wayland_->fd(), ei_->fd(), eis_->bus_fd()};
+        if (seat_watch_) {
+            fds.push_back(seat_watch_->fd());
+        }
+        // The next screen to come wakes the session with its first frame.
+        if (!pending_.empty() && pending_.front().capture) {
+            fds.push_back(pending_.front().capture->frames().wake_fd());
+        }
+        return fds;
+    }
     void dispatch() override
     {
         wayland_->dispatch();
@@ -83,13 +115,42 @@ public:
         if (outputs_) {
             outputs_->check_timeouts();
         }
+        if (seat_watch_) {
+            seat_watch_->process();
+        }
+        service_pending();
     }
     [[nodiscard]] bool closed() const override
     {
-        return wayland_->broken() || (processes_ && processes_->exited()) || ei_->closed() ||
-               std::ranges::any_of(screens_, [](const Screen& s) {
-                   return s.capture->closed() || s.stream->state() != kwin::ScreencastStream::State::created;
-               });
+        // A session whose virtual outputs KWin keeps drawing off the seat
+        // lets the seat show a login screen while a client holds it, so
+        // losing the seat is what this connection asked for; it ends when
+        // somebody at the machine logs in and the session goes back to the
+        // seat. One that is drawn only on its seat ends the moment it loses
+        // it.
+        const char* reason = nullptr;
+        if (wayland_->broken()) {
+            reason = "the connection to KWin broke";
+        } else if (processes_ && processes_->exited()) {
+            reason = "the KWin this desktop started ended";
+        } else if (ei_->closed()) {
+            reason = "the input connection closed";
+        } else if (seat_watch_ && keeps_rendering() && seat_watch_->returned_to_the_seat()) {
+            reason = "somebody logged in at the machine and took the session back";
+        } else if (seat_watch_ && !keeps_rendering() && seat_watch_->left_the_seat()) {
+            reason = "something else took the seat the session is on";
+        } else if (screens_.empty()) {
+            reason = "the session has no screens left";
+        } else if (std::ranges::any_of(screens_, [](const Screen& s) {
+                       return s.capture->closed() || s.stream->state() != kwin::ScreencastStream::State::created;
+                   })) {
+            reason = "a screen's stream closed";
+        }
+        if (reason != nullptr && !said_why_closed_) {
+            said_why_closed_ = true;
+            log::info(log_component, "the desktop ends: {}", reason);
+        }
+        return reason != nullptr;
     }
     [[nodiscard]] platform::Clipboard* clipboard() override { return clipboard_.get(); }
 
@@ -103,12 +164,21 @@ public:
         return &screens_.at(index).capture->cursor();
     }
     [[nodiscard]] bool resizable() const override { return resizable_; }
-    void request_screen_sizes(std::span<const std::pair<std::uint32_t, std::uint32_t>> sizes) override;
+    [[nodiscard]] bool screens_follow_monitors() const override { return virtual_screens_; }
+    void request_screen_sizes(std::span<const Size> sizes) override;
     bool set_screen_targets(std::span<const std::optional<platform::Rect>> targets) override;
+    void set_held(bool held) override;
+    [[nodiscard]] bool keep_when_released() const override { return !options_.attach; }
 
 private:
     struct Screen {
+        /// The KWin output this screen shows: a real one when the desktop
+        /// mirrors the seat's screen, else a virtual one of ours. It is the
+        /// name KWin gives the output, which is what names the libei region
+        /// as well, and not always the name that was asked for.
         std::string output;
+        /// The size asked for; what the frames have once KWin followed.
+        Size size{0, 0};
         std::unique_ptr<kwin::ScreencastStream> stream;
         std::unique_ptr<portal::PipeWireCapture> capture;
     };
@@ -119,16 +189,74 @@ private:
     [[nodiscard]] Result<void> wait_for_first_frames(Clock::time_point deadline);
     void start_clipboard();
 
+    /// Starts watching the seat, so that this connection ends when the
+    /// session goes back to it.
+    [[nodiscard]] Result<void> take_the_session();
+    /// One virtual output of `size`, streamed; it becomes a screen once its
+    /// first frame arrived (service_pending()).
+    [[nodiscard]] bool add_screen(Size size);
+    /// Connects the capture of a screen KWin answered for, and gives it the
+    /// name KWin ended up using. False when the stream failed: it is no
+    /// screen and never will be.
+    [[nodiscard]] bool service_screen(Screen& screen);
+    /// The screen has a picture to show.
+    [[nodiscard]] static bool has_first_frame(const Screen& screen)
+    {
+        return screen.capture && screen.capture->frames().size().first != 0;
+    }
+    /// Connects the captures of new streams and moves screens whose first
+    /// frame came to screens_, in the order they were added.
+    void service_pending();
+    [[nodiscard]] Result<void> wait_for_first_screen(Clock::time_point deadline);
+    /// Puts the client's targets on the input sink, for the screens there are.
+    void apply_targets();
+    /// True while this desktop is attached to a session on a seat whose
+    /// screens KWin keeps drawing off that seat, so that the seat can show a
+    /// login screen while a client holds the session. Measured on KWin 6.6.6:
+    /// a virtual output made through zkde_screencast_unstable_v1 goes on
+    /// giving frames at its full rate while the session is not active on its
+    /// seat, and only the seat's own outputs stop (DrmGpu::setActive inhibits
+    /// their render loops alone).
+    [[nodiscard]] bool keeps_rendering() const { return options_.attach && virtual_screens_; }
+    /// Hands the seat the display manager's login screen while a client holds
+    /// the session, so that the screen at the machine shows neither the
+    /// session nor what was last on it, and whoever is there takes it back by
+    /// logging in. False when the seat kept the session, so that the screen
+    /// there still shows it.
+    [[nodiscard]] bool hand_the_seat_a_greeter();
+    /// Lays the session out around this connection's screens, so that the
+    /// panel, new windows and the overview are where the client looks.
+    void ensure_layout();
+    /// Waits until KWin has laid the session out, at most `timeout`.
+    void wait_for_layout(std::chrono::milliseconds timeout);
+
+    HeadlessOptions options_;
     // Destroyed in reverse: everything that talks to KWin before KWin ends.
     std::unique_ptr<kwin::PlasmaProcesses> processes_;
     std::unique_ptr<kwin::WaylandConnection> wayland_;
     std::unique_ptr<kwin::Screencast> screencast_;
     std::unique_ptr<kwin::OutputManagement> outputs_;
     std::vector<Screen> screens_;
+    /// Streamed, but without a first frame yet; they come after screens_.
+    std::vector<Screen> pending_;
     std::unique_ptr<kwin::KWinEis> eis_;
     std::unique_ptr<portal::EiInput> ei_;
     std::unique_ptr<kwin::DataControlClipboard> clipboard_;
+    std::vector<std::optional<platform::Rect>> targets_;
+    /// Set while this connection took the session from a seat: it ends when
+    /// the seat takes it back.
+    std::unique_ptr<logind::SeatWatch> seat_watch_;
+    /// The screens are virtual outputs of ours, one per client monitor, and
+    /// not the seat's own screen mirrored.
+    bool virtual_screens_ = false;
     bool resizable_ = false;
+    /// A client holds the desktop (set_held()).
+    bool held_ = false;
+    /// The virtual outputs created so far, for names that stay unique.
+    std::uint64_t next_virtual_ = 0;
+    /// closed() said why, once.
+    mutable bool said_why_closed_ = false;
+    bool warned_resize_ = false;
 };
 
 Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
@@ -136,6 +264,7 @@ Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
     if (options.kind != HeadlessKind::plasma) {
         return fail(Errc::invalid_value, "start_plasma_headless starts Plasma only");
     }
+    options_ = options;
     const auto deadline = Clock::now() + options.timeout;
     std::string bus_address;  // the session bus when attached
     if (options.attach) {
@@ -162,8 +291,8 @@ Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
     } else {
         FARLAND_TRY_VOID(launch(options, deadline));
         bus_address = processes_->bus_address();
+        FARLAND_TRY_VOID(wait_for_outputs(1, deadline));
     }
-    FARLAND_TRY_VOID(wait_for_outputs(1, deadline));
 
     auto screencast = kwin::Screencast::create(*wayland_);
     if (!screencast) {
@@ -182,7 +311,31 @@ Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
     } else {
         log::warn(log_component, "{}: the screens keep their size", outputs.error().what);
     }
-    FARLAND_TRY_VOID(start_streams(options, deadline));
+    // A session of our own is drawn wherever it runs, on outputs KWin made
+    // for it. One we attach to lives on a seat, and mirroring its screen
+    // would show the client what whoever walks past the machine sees: there
+    // the client gets virtual outputs of its own, so that the seat is free to
+    // show a login screen while the client holds the session.
+    virtual_screens_ = options.attach && screencast_->has_virtual_outputs();
+    if (options.attach && !virtual_screens_) {
+        log::warn(log_component,
+                  "this KWin has no virtual outputs in zkde_screencast_unstable_v1 (version {}); the client sees the "
+                  "screen at the machine, and the screen at the machine keeps showing the session",
+                  screencast_->version());
+    }
+    if (virtual_screens_) {
+        FARLAND_TRY_VOID(take_the_session());
+        if (!add_screen({options.width, options.height})) {
+            return fail(Errc::io, "KWin did not create a virtual output");
+        }
+        FARLAND_TRY_VOID(wait_for_first_screen(deadline));
+        resizable_ = true;
+    } else {
+        if (options.attach) {
+            FARLAND_TRY_VOID(wait_for_outputs(1, deadline));
+        }
+        FARLAND_TRY_VOID(start_streams(options, deadline));
+    }
 
     auto eis = kwin::KWinEis::connect(
         bus_address, kwin::KWinEis::keyboard | kwin::KWinEis::pointer | kwin::KWinEis::touch, left(deadline));
@@ -208,9 +361,232 @@ Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
         log::info(log_component, "screen {}x{}: KWin output {}", width, height, screen.output);
     }
     static_cast<void>(set_screen_targets(targets));
-    log::info(log_component, "{} screen{}{}", screens_.size(), screens_.size() == 1 ? "" : "s",
-              resizable_ ? ", resizable" : "");
+    // The seat keeps the session until a client actually holds the desktop:
+    // the agent says so (set_held()) as soon as a connection starts, and only
+    // then does the screen at the machine get a login screen.
+    log::info(log_component, "{} screen{}{}{}", screens_.size(), screens_.size() == 1 ? "" : "s",
+              resizable_ ? ", resizable" : "", virtual_screens_ ? ", on virtual outputs of this connection" : "");
     return {};
+}
+
+Result<void> PlasmaHeadlessDesktop::take_the_session()
+{
+    // From here on the seat taking the session back ends this connection.
+    if (auto watch = logind::SeatWatch::create()) {
+        seat_watch_ = std::move(*watch);
+    } else {
+        log::debug(log_component, "cannot watch the seat: {}", watch.error().message);
+    }
+    // Nothing brings the session to its seat first: KWin keeps drawing a
+    // virtual output while the session is not active there, so the session is
+    // this client's wherever it is. Where it is off its seat — an earlier
+    // connection left a login screen on it — a KWin without farland's fix
+    // refuses to *make* the output; wait_for_first_screen() says so.
+    return {};
+}
+
+bool PlasmaHeadlessDesktop::add_screen(Size size)
+{
+    const auto width = static_cast<std::int32_t>(std::clamp<std::uint32_t>(size.first, min_size, max_size));
+    const auto height = static_cast<std::int32_t>(std::clamp<std::uint32_t>(size.second, min_size, max_size));
+    const std::size_t index = screens_.size() + pending_.size();
+    // KWin makes an output of its own from this name (it prefixes its own
+    // "Virtual-"), and names the libei region after the output; the
+    // description is what the display settings show.
+    const std::string name = std::format("farland-{}", next_virtual_++);
+    auto stream = screencast_->stream_virtual_output(name, std::format("farland screen {}", index + 1), width, height,
+                                                     1.0, kwin::Screencast::Cursor::metadata);
+    if (!stream) {
+        return false;
+    }
+    Screen screen;
+    screen.output = name;
+    screen.size = {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
+    screen.stream = std::move(stream);
+    pending_.push_back(std::move(screen));
+    service_pending();
+    return true;
+}
+
+bool PlasmaHeadlessDesktop::service_screen(Screen& s)
+{
+    if (s.stream->state() == kwin::ScreencastStream::State::pending) {
+        return true;
+    }
+    if (s.stream->state() != kwin::ScreencastStream::State::created) {
+        log::error(log_component, "KWin cannot cast the virtual output {}: {}", s.output, s.stream->error());
+        return false;
+    }
+    if (!s.capture) {
+        portal::PipeWireCaptureOptions capture_options;
+        capture_options.render_node = options_.render_node;
+        capture_options.stream_name = std::format("farland-kwin-{}", s.output);
+        // KWin's streams are on the user's PipeWire daemon.
+        auto capture = portal::PipeWireCapture::create(-1, s.stream->node(), capture_options);
+        if (!capture) {
+            log::error(log_component, "PipeWire capture of node {}: {}", s.stream->node(), capture.error().message());
+            return false;
+        }
+        s.capture = std::move(*capture);
+    }
+    // KWin puts its own prefix in front of the name it was given, and the
+    // libei region carries the name KWin ended up with. The output global may
+    // arrive after the stream, so this keeps trying until it is there.
+    if (wayland_->find_output(s.output) == nullptr) {
+        const std::string prefixed = "Virtual-" + s.output;
+        if (wayland_->find_output(prefixed) != nullptr) {
+            s.output = prefixed;
+            apply_targets();
+        }
+    }
+    if (s.capture->closed()) {
+        log::warn(log_component, "a new virtual output's stream closed: {}", s.capture->error());
+        return false;
+    }
+    return true;
+}
+
+void PlasmaHeadlessDesktop::service_pending()
+{
+    bool changed = false;
+    for (auto it = pending_.begin(); it != pending_.end();) {
+        if (service_screen(*it)) {
+            ++it;
+        } else {
+            it = pending_.erase(it);
+        }
+    }
+    while (!pending_.empty() && has_first_frame(pending_.front())) {
+        Screen& s = pending_.front();
+        const auto [width, height] = s.capture->frames().size();
+        log::info(log_component, "screen {}: a virtual output of {}x{} (KWin output {}, PipeWire node {})",
+                  screens_.size(), width, height, s.output, s.capture->node_id());
+        screens_.push_back(std::move(s));
+        pending_.erase(pending_.begin());
+        changed = true;
+    }
+    if (changed) {
+        apply_targets();
+        ensure_layout();
+    }
+}
+
+Result<void> PlasmaHeadlessDesktop::wait_for_first_screen(Clock::time_point deadline)
+{
+    while (screens_.empty()) {
+        if (wayland_->broken()) {
+            return fail(Errc::io, "the connection to KWin broke before the first frame");
+        }
+        // KWin goes on drawing a virtual output while the session is not
+        // active on its seat, but a KWin without farland's fix will not make
+        // one there: it refuses every output configuration off the seat, so
+        // the output it made never becomes one it shows ("Could not find
+        // output"), and there is nothing to wait for.
+        const bool off_the_seat = seat_watch_ != nullptr && !seat_watch_->active();
+        const auto not_made = [] {
+            return fail(Errc::io,
+                        "this KWin will not make a screen for a client while the session is off its seat; somebody "
+                        "has to log in at the machine first, or the machine needs the KWin from "
+                        "packaging/make-kwin-deb.sh");
+        };
+        if (pending_.empty()) {
+            return off_the_seat ? not_made() : fail(Errc::io, "the virtual output's stream failed");
+        }
+        if (Clock::now() > deadline) {
+            return off_the_seat ? not_made() : fail(Errc::io, "no frame from the virtual output");
+        }
+        std::array<pollfd, 2> fds{{{wayland_->fd(), POLLIN, 0}, {-1, POLLIN, 0}}};
+        if (pending_.front().capture) {
+            fds[1].fd = pending_.front().capture->frames().wake_fd();
+        }
+        ::poll(fds.data(), fds.size(), 100);
+        wayland_->dispatch();
+        if (seat_watch_) {
+            seat_watch_->process();
+        }
+        service_pending();
+    }
+    return {};
+}
+
+void PlasmaHeadlessDesktop::set_held(bool held)
+{
+    if (held_ == held || !virtual_screens_) {
+        held_ = held;
+        return;
+    }
+    held_ = held;
+    if (held) {
+        // The layout first, and finished before the seat goes: KWin refuses
+        // every output configuration once the session is off its seat
+        // ("Atomic modeset test failed! Permission denied"), so a layout
+        // still on its way when the login screen arrives never happens.
+        ensure_layout();
+        wait_for_layout(std::chrono::seconds(3));
+        static_cast<void>(hand_the_seat_a_greeter());
+        return;
+    }
+    if (outputs_) {
+        outputs_->restore_layout(std::chrono::seconds(2));
+    }
+    // Nobody holds it any more. keep_when_released() is false for an attached
+    // desktop, so the agent takes the whole desktop down: the virtual outputs
+    // go with it and KWin lays the session out for the seat's screen again.
+    // Where the seat has a login screen, it keeps it, and logging in there
+    // brings the session back with its windows.
+    log::info(log_component, "no client holds the session: it is the seat's again");
+}
+
+bool PlasmaHeadlessDesktop::hand_the_seat_a_greeter()
+{
+    if (!keeps_rendering() || seat_watch_ == nullptr) {
+        return false;
+    }
+    if (!seat_watch_->active()) {
+        // Something else is on the seat already (a login screen from an
+        // earlier connection, or another session): nothing to hand over.
+        log::info(log_component, "the seat is not showing this session, so it keeps what it has");
+        return true;
+    }
+    if (auto handed = logind::switch_seat_to_greeter(); !handed) {
+        // The seat keeps showing the session; the client still has it.
+        log::warn(log_component,
+                  "cannot put a login screen on the seat ({}); the screen at the machine keeps showing the session",
+                  handed.error().message);
+        return false;
+    }
+    log::info(log_component, "the screen at the machine shows a login screen; logging in there takes the session back");
+    return true;
+}
+
+void PlasmaHeadlessDesktop::wait_for_layout(std::chrono::milliseconds timeout)
+{
+    if (outputs_ == nullptr) {
+        return;
+    }
+    const auto deadline = Clock::now() + timeout;
+    while (outputs_->busy() && Clock::now() < deadline) {
+        static_cast<void>(wayland_->roundtrip(std::chrono::milliseconds(100)));
+        outputs_->check_timeouts();
+    }
+}
+
+void PlasmaHeadlessDesktop::ensure_layout()
+{
+    if (!virtual_screens_ || !held_ || outputs_ == nullptr || screens_.empty()) {
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(screens_.size());
+    for (const auto& screen : screens_) {
+        names.push_back(screen.output);
+    }
+    // The client's first screen becomes the primary one, so the panel, new
+    // windows and the overview are where the client looks. The seat's own
+    // screen stays on beside them: the login screen is what keeps it from
+    // showing the session, and KWin would not let us switch it on again
+    // afterwards (it refuses configurations off the seat).
+    outputs_->request_layout(names);
 }
 
 Result<void> PlasmaHeadlessDesktop::launch(const HeadlessOptions& options, Clock::time_point deadline)
@@ -301,8 +677,11 @@ Result<void> PlasmaHeadlessDesktop::start_streams(const HeadlessOptions& options
     }
 
     for (const auto* output : outputs) {
-        screens_.push_back(Screen{
-            output->name, screencast_->stream_output(output->proxy, kwin::Screencast::Cursor::metadata), nullptr});
+        Screen screen;
+        screen.output = output->name;
+        screen.size = {static_cast<std::uint32_t>(output->width), static_cast<std::uint32_t>(output->height)};
+        screen.stream = screencast_->stream_output(output->proxy, kwin::Screencast::Cursor::metadata);
+        screens_.push_back(std::move(screen));
     }
     for (auto& screen : screens_) {
         while (screen.stream->state() == kwin::ScreencastStream::State::pending) {
@@ -358,33 +737,92 @@ Result<void> PlasmaHeadlessDesktop::wait_for_first_frames(Clock::time_point dead
     return {};
 }
 
-void PlasmaHeadlessDesktop::request_screen_sizes(std::span<const std::pair<std::uint32_t, std::uint32_t>> sizes)
+void PlasmaHeadlessDesktop::request_screen_sizes(std::span<const Size> sizes)
 {
     if (!resizable_) {
         return;
     }
-    for (std::size_t i = 0; i < std::min(sizes.size(), screens_.size()); ++i) {
-        const auto [width, height] = sizes[i];
-        if (width > 0 && height > 0) {
-            outputs_->request_size(screens_[i].output,
-                                   static_cast<std::int32_t>(std::min<std::uint32_t>(width, max_size)),
-                                   static_cast<std::int32_t>(std::min<std::uint32_t>(height, max_size)));
+    if (!virtual_screens_) {
+        for (std::size_t i = 0; i < std::min(sizes.size(), screens_.size()); ++i) {
+            const auto [width, height] = sizes[i];
+            if (width > 0 && height > 0) {
+                outputs_->request_size(screens_[i].output,
+                                       static_cast<std::int32_t>(std::min<std::uint32_t>(width, max_size)),
+                                       static_cast<std::int32_t>(std::min<std::uint32_t>(height, max_size)));
+            }
         }
+        wayland_->flush();
+        return;
+    }
+    const std::size_t wanted = std::clamp<std::size_t>(sizes.size(), 1, max_screens);
+    const auto size_at = [&](std::size_t i) -> Size {
+        if (i < sizes.size() && sizes[i].first > 0 && sizes[i].second > 0) {
+            return sizes[i];
+        }
+        return {options_.width, options_.height};
+    };
+    // Fewer monitors: the newest screens go, those still coming first. The
+    // virtual output goes away when its stream closes.
+    bool removed = false;
+    while (screens_.size() + pending_.size() > wanted) {
+        auto& from = pending_.empty() ? screens_ : pending_;
+        from.pop_back();
+        removed = true;
+    }
+    for (std::size_t i = 0; i < screens_.size() + pending_.size(); ++i) {
+        Screen& s = i < screens_.size() ? screens_[i] : pending_[i - screens_.size()];
+        const Size size = size_at(i);
+        if (s.size == size) {
+            continue;
+        }
+        s.size = size;
+        if (outputs_ != nullptr && outputs_->resizable(s.output)) {
+            outputs_->request_size(s.output, static_cast<std::int32_t>(std::min<std::uint32_t>(size.first, max_size)),
+                                   static_cast<std::int32_t>(std::min<std::uint32_t>(size.second, max_size)));
+        } else if (!warned_resize_) {
+            // KWin gives a virtual output custom modes; another compositor,
+            // or an output KWin has not described yet, may not.
+            warned_resize_ = true;
+            log::warn(log_component, "KWin does not resize the output {}; the client's picture is scaled to {}x{}",
+                      s.output, size.first, size.second);
+        }
+    }
+    // More: new virtual outputs, which show up in dispatch() once their first
+    // frame came.
+    while (screens_.size() + pending_.size() < wanted) {
+        const std::size_t index = screens_.size() + pending_.size();
+        if (!add_screen(size_at(index))) {
+            break;
+        }
+        log::info(log_component, "adding a virtual output of {}x{} for client monitor {}", size_at(index).first,
+                  size_at(index).second, index);
+    }
+    if (removed) {
+        apply_targets();
     }
     wayland_->flush();
 }
 
 bool PlasmaHeadlessDesktop::set_screen_targets(std::span<const std::optional<platform::Rect>> targets)
 {
+    targets_.assign(targets.begin(), targets.end());
+    apply_targets();
+    return true;
+}
+
+void PlasmaHeadlessDesktop::apply_targets()
+{
+    if (!ei_) {
+        return;
+    }
     // KWin names each EIS region after its output.
     std::vector<portal::EiInput::Output> outputs;
-    for (std::size_t i = 0; i < std::min(targets.size(), screens_.size()); ++i) {
-        if (targets[i]) {
-            outputs.push_back(portal::EiInput::Output{*targets[i], screens_[i].output});
+    for (std::size_t i = 0; i < std::min(targets_.size(), screens_.size()); ++i) {
+        if (targets_[i]) {
+            outputs.push_back(portal::EiInput::Output{*targets_[i], screens_[i].output});
         }
     }
     ei_->set_outputs(std::move(outputs));
-    return true;
 }
 
 }  // namespace

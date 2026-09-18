@@ -24,10 +24,22 @@ namespace farland::app {
 /// session bus), which is never stopped.
 ///
 /// The screens are KWin's outputs, streamed with zkde_screencast_unstable_v1
-/// into PipeWire; virtual outputs (all of a launched KWin's) are resizable
-/// through custom modes. Input goes through KWin's EIS
+/// into PipeWire, and resizable through custom modes of
+/// kde_output_management_v2. Input goes through KWin's EIS
 /// (org.kde.KWin.EIS.RemoteDesktop), the clipboard through
 /// ext-data-control-v1.
+///
+/// Attached, the screens are virtual outputs of this connection's own, one
+/// per client monitor (stream_virtual_output_with_description, since version
+/// 2 of the protocol), never the seat's screen: the client sees its own
+/// desktop, and the screen at the machine shows the display manager's login
+/// screen while a client holds the session (set_held()). The session is laid
+/// out around the client's screens, with the first of them primary, so that
+/// the panel and new windows are where the client looks; logging in at the
+/// machine takes the session back and ends the connection. A KWin without
+/// virtual outputs in its screen casting falls back to mirroring the seat's
+/// screen, where the client sees what a person at the machine sees.
+/// See docs/PLASMA-TAKEOVER.md.
 ///
 /// KWin grants the screen casting only to an executable named in a desktop
 /// file's X-KDE-Wayland-Interfaces: a launched KWin finds one this function

@@ -42,10 +42,26 @@ public:
     /// The client end of the connection, once.
     [[nodiscard]] int take_client_fd();
 
+    /// A virtual output the client asked for, as the request described it.
+    struct VirtualOutput {
+        std::string name;
+        /// Empty where the client used stream_virtual_output (version 2).
+        std::string description;
+        int width = 0;
+        int height = 0;
+        double scale = 1.0;
+    };
+
     /// KWin ends every stream.
     void close_streams();
+    /// The virtual outputs asked for, in order.
+    [[nodiscard]] std::vector<VirtualOutput> virtual_outputs();
     /// The output's current mode.
     [[nodiscard]] std::pair<int, int> current_mode();
+    /// Where the output sits and how far up the output order it is.
+    [[nodiscard]] std::pair<int, int> position();
+    [[nodiscard]] unsigned priority();
+    [[nodiscard]] bool output_enabled();
     /// Configurations applied (or refused) so far, and custom mode lists set.
     [[nodiscard]] int configurations();
     [[nodiscard]] int custom_mode_lists();

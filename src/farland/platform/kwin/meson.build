@@ -86,13 +86,13 @@ if wayland_client_dep.found() and wayland_scanner.found()
     'screencast.cpp',
     'wayland_connection.cpp',
     include_directories: farland_inc,
-    dependencies: [farland_platform_portal_dep, kwin_protocol_dep],
+    dependencies: [farland_platform_portal_dep, farland_platform_logind_dep, kwin_protocol_dep],
   )
 
   farland_platform_kwin_dep = declare_dependency(
     link_with: farland_platform_kwin_lib,
     include_directories: farland_inc,
-    dependencies: [farland_platform_portal_dep, kwin_protocol_dep],
+    dependencies: [farland_platform_portal_dep, farland_platform_logind_dep, kwin_protocol_dep],
   )
 endif
 

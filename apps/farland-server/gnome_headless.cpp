@@ -4,6 +4,7 @@
 #include "gnome_headless.hpp"
 
 #include <farland/base/log.hpp>
+#include <farland/platform/logind/seat.hpp>
 #include <farland/platform/mutter/headless_shell.hpp>
 #include <farland/platform/mutter/mutter_clipboard.hpp>
 #include <farland/platform/mutter/mutter_session.hpp>
@@ -20,6 +21,7 @@ namespace farland::app {
 
 namespace {
 
+namespace logind = platform::logind;
 namespace mutter = platform::mutter;
 namespace portal = platform::portal;
 using Clock = std::chrono::steady_clock;
@@ -167,7 +169,7 @@ private:
     std::string monitor_layout_;
     /// Set while this connection took the session from a seat: it ends when
     /// the seat takes it back.
-    std::unique_ptr<mutter::SeatWatch> seat_watch_;
+    std::unique_ptr<logind::SeatWatch> seat_watch_;
     /// A client holds the desktop (set_held()); until the first one does,
     /// the session stays where it is.
     bool held_ = false;
@@ -237,7 +239,7 @@ Result<void> GnomeHeadlessDesktop::take_the_session()
     // Mutter keeps our monitors going off the seat, the seat is free to show
     // something else, and the session is ours wherever it is.
     if (!keeps_rendering()) {
-        if (auto active = mutter::activate_user_session(); !active) {
+        if (auto active = logind::activate_user_session(); !active) {
             log::error(log_component, "{}", active.error().message);
             return fail(Errc::io,
                         "the GNOME session is not on its seat, so it draws nothing: switch to it on the machine first");
@@ -245,7 +247,7 @@ Result<void> GnomeHeadlessDesktop::take_the_session()
     }
     // From here on, something else taking the seat ends this connection: the
     // session is attached to one place at a time.
-    if (auto watch = mutter::SeatWatch::create()) {
+    if (auto watch = logind::SeatWatch::create()) {
         seat_watch_ = std::move(*watch);
     } else {
         log::debug(log_component, "cannot watch the seat: {}", watch.error().message);
@@ -481,7 +483,7 @@ void GnomeHeadlessDesktop::hand_the_seat_a_greeter()
         log::info(log_component, "the seat is not showing this session, so it keeps what it has");
         return;
     }
-    if (auto handed = mutter::switch_seat_to_greeter(); !handed) {
+    if (auto handed = logind::switch_seat_to_greeter(); !handed) {
         // The seat keeps showing the session; the client still has it.
         log::warn(log_component, "cannot put a login screen on the seat ({}); the screen at the machine keeps showing "
                                  "the session",

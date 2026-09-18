@@ -12,6 +12,8 @@ subdir('farland/auth')
 subdir('farland/platform')
 subdir('farland/server')
 subdir('farland/platform/portal')
+# Shared by the compositor backends: the seat and the display manager.
+subdir('farland/platform/logind')
 # wlroots first: its generated Wayland protocol code is shared with KWin,
 # which speaks some of the same protocols.
 subdir('farland/platform/wlroots')

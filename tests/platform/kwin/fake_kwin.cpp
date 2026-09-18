@@ -50,6 +50,9 @@ struct Configuration {
     FakeKWin::State* state = nullptr;
     std::optional<std::vector<std::pair<int, int>>> custom;
     wl_resource* mode = nullptr;
+    std::optional<bool> enabled;
+    std::optional<std::pair<std::int32_t, std::int32_t>> position;
+    std::optional<std::uint32_t> priority;
 };
 
 struct OfferContext {
@@ -102,8 +105,14 @@ struct FakeKWin::State {
     int configurations = 0;
     int custom_mode_lists = 0;
 
+    bool output_enabled = true;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::uint32_t priority = 1;
+
     std::vector<wl_resource*> streams;
     std::uint32_t next_node = 40;
+    std::vector<FakeKWin::VirtualOutput> virtual_outputs;
 
     std::vector<wl_resource*> data_devices;
     wl_resource* client_source = nullptr;
@@ -176,6 +185,25 @@ struct FakeKWin::State {
                 }
             }
         }
+        if (configuration.enabled) {
+            output_enabled = *configuration.enabled;
+            if (device != nullptr) {
+                kde_output_device_v2_send_enabled(device, output_enabled ? 1 : 0);
+            }
+        }
+        if (configuration.position) {
+            std::tie(x, y) = *configuration.position;
+            if (device != nullptr) {
+                const auto& mode = modes.at(current);
+                kde_output_device_v2_send_geometry(device, x, y, mode.width, mode.height, 0, "farland", "fake", 0);
+            }
+        }
+        if (configuration.priority) {
+            priority = *configuration.priority;
+            if (device != nullptr) {
+                kde_output_device_v2_send_priority(device, priority);
+            }
+        }
         if (device != nullptr) {
             kde_output_device_v2_send_done(device);
         }
@@ -236,6 +264,28 @@ const struct ext_data_control_offer_v1_interface FakeKWin::State::offer_context_
         },
     .destroy = &destroy_resource,
 };
+
+namespace {
+
+/// The stream every stream_* request answers with: a node, or the failure the
+/// options ask for.
+void open_stream(wl_client* client, wl_resource* manager, std::uint32_t stream_id)
+{
+    auto& state = FakeKWin::State::of(manager);
+    auto* stream = wl_resource_create(client, &zkde_screencast_stream_unstable_v1_interface,
+                                      wl_resource_get_version(manager), stream_id);
+    static const struct zkde_screencast_stream_unstable_v1_interface stream_impl{.close = &destroy_resource};
+    wl_resource_set_implementation(stream, &stream_impl, &state,
+                                   [](wl_resource* r) { FakeKWin::State::of(r).forget(r); });
+    state.streams.push_back(stream);
+    if (state.options.fail_streams) {
+        zkde_screencast_stream_unstable_v1_send_failed(stream, "no screen casting here");
+    } else {
+        zkde_screencast_stream_unstable_v1_send_created(stream, state.next_node++);
+    }
+}
+
+}  // namespace
 
 FakeKWin::FakeKWin() : FakeKWin(Options{}) {}
 
@@ -322,26 +372,27 @@ FakeKWin::FakeKWin(Options options) : state_(std::make_unique<State>())
                 static const struct zkde_screencast_unstable_v1_interface impl{
                     .stream_output =
                         [](wl_client* c, wl_resource* manager, std::uint32_t stream_id, wl_resource* /*output*/,
-                           std::uint32_t /*pointer*/) {
-                            auto& state = State::of(manager);
-                            auto* stream = wl_resource_create(c, &zkde_screencast_stream_unstable_v1_interface,
-                                                              wl_resource_get_version(manager), stream_id);
-                            static const struct zkde_screencast_stream_unstable_v1_interface stream_impl{
-                                .close = &destroy_resource};
-                            wl_resource_set_implementation(stream, &stream_impl, &state,
-                                                           [](wl_resource* r) { State::of(r).forget(r); });
-                            state.streams.push_back(stream);
-                            if (state.options.fail_streams) {
-                                zkde_screencast_stream_unstable_v1_send_failed(stream, "no screen casting here");
-                            } else {
-                                zkde_screencast_stream_unstable_v1_send_created(stream, state.next_node++);
-                            }
-                        },
+                           std::uint32_t /*pointer*/) { open_stream(c, manager, stream_id); },
                     .stream_window = ignore_event,
                     .destroy = &destroy_resource,
-                    .stream_virtual_output = ignore_event,
+                    .stream_virtual_output =
+                        [](wl_client* c, wl_resource* manager, std::uint32_t stream_id, const char* name,
+                           std::int32_t width, std::int32_t height, wl_fixed_t scale, std::uint32_t /*pointer*/) {
+                            State::of(manager).virtual_outputs.push_back(FakeKWin::VirtualOutput{
+                                name != nullptr ? name : "", "", width, height, wl_fixed_to_double(scale)});
+                            open_stream(c, manager, stream_id);
+                        },
                     .stream_region = ignore_event,
-                    .stream_virtual_output_with_description = ignore_event,
+                    .stream_virtual_output_with_description =
+                        [](wl_client* c, wl_resource* manager, std::uint32_t stream_id, const char* name,
+                           const char* description, std::int32_t width, std::int32_t height, wl_fixed_t scale,
+                           std::uint32_t /*pointer*/) {
+                            State::of(manager).virtual_outputs.push_back(
+                                FakeKWin::VirtualOutput{name != nullptr ? name : "",
+                                                        description != nullptr ? description : "", width, height,
+                                                        wl_fixed_to_double(scale)});
+                            open_stream(c, manager, stream_id);
+                        },
                 };
                 wl_resource_set_implementation(resource, &impl, data, nullptr);
             }));
@@ -357,6 +408,10 @@ FakeKWin::FakeKWin(Options options) : state_(std::make_unique<State>())
             state.devices.push_back(device);
             kde_output_device_v2_send_name(device, state.options.output_name.c_str());
             kde_output_device_v2_send_capabilities(device, custom_modes_capability);
+            kde_output_device_v2_send_enabled(device, state.output_enabled ? 1 : 0);
+            kde_output_device_v2_send_geometry(device, state.x, state.y, state.options.width, state.options.height, 0,
+                                               "farland", "fake", 0);
+            kde_output_device_v2_send_priority(device, state.priority);
             auto modes = std::move(state.modes);
             state.modes.clear();
             for (const auto& mode : modes) {
@@ -378,11 +433,13 @@ FakeKWin::FakeKWin(Options options) : state_(std::make_unique<State>())
                         auto* configuration = wl_resource_create(c, &kde_output_configuration_v2_interface,
                                                                  wl_resource_get_version(manager), configuration_id);
                         static const struct kde_output_configuration_v2_interface configuration_impl{
-                            .enable = ignore_event,
+                            .enable = [](wl_client* /*c*/, wl_resource* r, wl_resource* /*device*/,
+                                         std::int32_t enable) { context<Configuration>(r).enabled = enable != 0; },
                             .mode = [](wl_client* /*c*/, wl_resource* r, wl_resource* /*device*/,
                                        wl_resource* mode) { context<Configuration>(r).mode = mode; },
                             .transform = ignore_event,
-                            .position = ignore_event,
+                            .position = [](wl_client* /*c*/, wl_resource* r, wl_resource* /*device*/, std::int32_t x,
+                                           std::int32_t y) { context<Configuration>(r).position = std::pair{x, y}; },
                             .scale = ignore_event,
                             .apply = [](wl_client* /*c*/,
                                         wl_resource* r) { context<Configuration>(r).state->apply(r); },
@@ -391,7 +448,10 @@ FakeKWin::FakeKWin(Options options) : state_(std::make_unique<State>())
                             .set_vrr_policy = ignore_event,
                             .set_rgb_range = ignore_event,
                             .set_primary_output = ignore_event,
-                            .set_priority = ignore_event,
+                            .set_priority = [](wl_client* /*c*/, wl_resource* r, wl_resource* /*device*/,
+                                               std::uint32_t priority) {
+                                context<Configuration>(r).priority = priority;
+                            },
                             .set_high_dynamic_range = ignore_event,
                             .set_sdr_brightness = ignore_event,
                             .set_wide_color_gamut = ignore_event,
@@ -415,7 +475,7 @@ FakeKWin::FakeKWin(Options options) : state_(std::make_unique<State>())
                             .set_auto_brightness = ignore_event,
                         };
                         wl_resource_set_implementation(configuration, &configuration_impl,
-                                                       new Configuration{&State::of(manager), std::nullopt, nullptr},
+                                                       new Configuration{&State::of(manager), std::nullopt, nullptr, std::nullopt, std::nullopt, std::nullopt},
                                                        [](wl_resource* r) { destroy_data<Configuration>(r); });
                     },
                 .create_mode_list =
@@ -556,6 +616,13 @@ void FakeKWin::close_streams()
     });
 }
 
+std::vector<FakeKWin::VirtualOutput> FakeKWin::virtual_outputs()
+{
+    std::vector<VirtualOutput> outputs;
+    run([&] { outputs = state_->virtual_outputs; });
+    return outputs;
+}
+
 std::pair<int, int> FakeKWin::current_mode()
 {
     std::pair<int, int> size;
@@ -564,6 +631,27 @@ std::pair<int, int> FakeKWin::current_mode()
         size = {mode.width, mode.height};
     });
     return size;
+}
+
+std::pair<int, int> FakeKWin::position()
+{
+    std::pair<int, int> at;
+    run([&] { at = {state_->x, state_->y}; });
+    return at;
+}
+
+unsigned FakeKWin::priority()
+{
+    unsigned value = 0;
+    run([&] { value = state_->priority; });
+    return value;
+}
+
+bool FakeKWin::output_enabled()
+{
+    bool value = false;
+    run([&] { value = state_->output_enabled; });
+    return value;
 }
 
 int FakeKWin::configurations()

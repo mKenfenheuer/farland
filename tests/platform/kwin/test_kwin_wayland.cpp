@@ -103,6 +103,30 @@ TEST_CASE("KWin backend: screen casting", "[kwin]")
         CHECK(stream->state() == ScreencastStream::State::failed);
         CHECK(stream->error() == "no screen casting here");
     }
+    SECTION("a virtual output is asked for with its name, description and size")
+    {
+        FakeKWin kwin;
+        const auto connection = connect(kwin);
+        auto screencast = Screencast::create(*connection);
+        REQUIRE(screencast);
+        // The fake offers 5, as KWin offers at least that: the bound version
+        // has to reach the request that takes a description.
+        CHECK((*screencast)->version() >= Screencast::description_version);
+        CHECK((*screencast)->has_virtual_outputs());
+        const auto stream =
+            (*screencast)->stream_virtual_output("farland-0", "farland screen 1", 1280, 800, 1.0,
+                                                 Screencast::Cursor::metadata);
+        REQUIRE(stream);
+        REQUIRE(pump(*connection, [&] { return stream->state() != ScreencastStream::State::pending; }));
+        CHECK(stream->state() == ScreencastStream::State::created);
+        const auto asked = kwin.virtual_outputs();
+        REQUIRE(asked.size() == 1);
+        CHECK(asked.front().name == "farland-0");
+        CHECK(asked.front().description == "farland screen 1");
+        CHECK(asked.front().width == 1280);
+        CHECK(asked.front().height == 800);
+        CHECK(asked.front().scale == 1.0);
+    }
     SECTION("not granted: no global")
     {
         FakeKWin kwin(FakeKWin::Options{.screencast = false});
@@ -145,7 +169,42 @@ TEST_CASE("KWin backend: resizing an output through a custom mode", "[kwin]")
     CHECK(kwin.configurations() == applied);
 }
 
-TEST_CASE("KWin backend: a refused resize is not repeated", "[kwin]")
+TEST_CASE("KWin backend: laying the session out around a screen", "[kwin]")
+{
+    // The fake has one output, so this is the plumbing: the requests that go
+    // out, that the layout counts as reached once KWin followed, and that
+    // restoring puts back what was there. What a layout of several screens
+    // ends up looking like is checked against a real KWin with
+    // farland-plasma-headless-probe (docs/PLASMA-TAKEOVER.md).
+    FakeKWin kwin(FakeKWin::Options{.output_name = "Virtual-farland-0", .width = 1280, .height = 800});
+    const auto connection = connect(kwin);
+    auto management = OutputManagement::create(*connection);
+    REQUIRE(management);
+    auto& outputs = **management;
+    REQUIRE(pump(*connection, [&] { return outputs.enabled("Virtual-farland-0"); }));
+
+    const std::vector<std::string> ours{"Virtual-farland-0"};
+    outputs.request_layout(ours);
+    REQUIRE(pump(*connection, [&] {
+        outputs.check_timeouts();
+        return !outputs.busy();
+    }));
+    CHECK(kwin.output_enabled());
+    CHECK(kwin.position() == std::pair{0, 0});
+    // The primary screen, which is where the panel and new windows go.
+    CHECK(kwin.priority() == 1);
+
+    // Asking for what it already shows sends nothing more.
+    const auto applied = kwin.configurations();
+    outputs.request_layout(ours);
+    CHECK_FALSE(outputs.busy());
+    CHECK(kwin.configurations() == applied);
+
+    outputs.restore_layout(std::chrono::seconds(2));
+    CHECK(kwin.output_enabled());
+}
+
+TEST_CASE("KWin backend: a refused resize is tried again, then given up", "[kwin]")
 {
     FakeKWin kwin(FakeKWin::Options{.refuse_configurations = true});
     const auto connection = connect(kwin);
@@ -153,12 +212,20 @@ TEST_CASE("KWin backend: a refused resize is not repeated", "[kwin]")
     REQUIRE(management);
     auto& outputs = **management;
     outputs.request_size("Virtual-0", 1024, 768);
-    REQUIRE(pump(*connection, [&] { return !outputs.busy(); }));
+    // KWin refuses a configuration while its outputs are changing, which is
+    // exactly when a client adds or removes a monitor, so a refusal is tried
+    // again a few times (check_timeouts() is what takes the next try).
+    REQUIRE(pump(*connection, [&] {
+        outputs.check_timeouts();
+        return !outputs.busy();
+    }));
     CHECK(outputs.size("Virtual-0") == std::pair{1920, 1080});
-    CHECK(kwin.configurations() == 1);
+    CHECK(kwin.configurations() > 1);
+    // Once given up, the same size is not asked for again.
+    const auto asked = kwin.configurations();
     outputs.request_size("Virtual-0", 1024, 768);
     CHECK_FALSE(outputs.busy());
-    CHECK(kwin.configurations() == 1);
+    CHECK(kwin.configurations() == asked);
 }
 
 TEST_CASE("KWin backend: the clipboard through ext-data-control", "[kwin]")

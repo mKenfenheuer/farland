@@ -20,6 +20,9 @@ constexpr std::uint32_t device_version = 20;
 /// 60 Hz, in mHz.
 constexpr std::uint32_t refresh_rate = 60'000;
 constexpr auto step_timeout = std::chrono::seconds(10);
+/// How long to wait before asking again after KWin refused, and how often.
+constexpr auto retry_delay = std::chrono::milliseconds(500);
+constexpr int max_refusals = 3;
 using Clock = std::chrono::steady_clock;
 
 }  // namespace
@@ -37,6 +40,10 @@ struct OutputManagement::Device {
     kde_output_device_v2* proxy = nullptr;
     std::string name;
     std::uint32_t capabilities = 0;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    bool enabled = false;
+    std::uint32_t priority = 0;
     std::vector<std::unique_ptr<Mode>> modes;
     Mode* current = nullptr;
 
@@ -51,6 +58,12 @@ struct OutputManagement::Device {
     std::optional<std::pair<std::int32_t, std::int32_t>> wanted;
     /// The last size KWin refused, not asked for again right away.
     std::optional<std::pair<std::int32_t, std::int32_t>> refused;
+    /// Refusals of the size wanted now. KWin refuses a configuration while
+    /// the outputs it covers are changing, which is exactly what happens when
+    /// a client adds or removes a monitor, so a refusal is tried again.
+    int refusals = 0;
+    /// When to try again; unset while nothing is waiting to be retried.
+    std::optional<Clock::time_point> retry_at;
     kde_output_configuration_v2* configuration = nullptr;
     kde_mode_list_v2* mode_list = nullptr;
 
@@ -69,6 +82,30 @@ struct OutputManagement::Device {
         if (mode_list != nullptr) {
             kde_mode_list_v2_destroy(mode_list);
             mode_list = nullptr;
+        }
+    }
+};
+
+/// What request_layout() asks for, and what was there before it.
+struct OutputManagement::Layout {
+    using Entry = OutputManagement::LayoutEntry;
+
+    /// The outputs the session is to be laid out around, in order.
+    std::vector<std::string> wanted;
+    /// Every output as it was before the first request_layout().
+    std::vector<Entry> before;
+    /// Putting `before` back.
+    bool restoring = false;
+    kde_output_configuration_v2* configuration = nullptr;
+    Clock::time_point started;
+    int refusals = 0;
+    std::optional<Clock::time_point> retry_at;
+
+    void drop_configuration()
+    {
+        if (configuration != nullptr) {
+            kde_output_configuration_v2_destroy(configuration);
+            configuration = nullptr;
         }
     }
 };
@@ -115,16 +152,26 @@ struct OutputManagement::Listeners {
         if (d.step == Device::Step::new_mode || d.step == Device::Step::idle) {
             d.owner->advance(d);
         }
+        // The outputs changed: KWin may have laid the session out by itself
+        // (an output came or went), so the layout is asked for again.
+        d.owner->apply_layout();
     }
 
     static constexpr kde_output_device_v2_listener device_listener{
-        .geometry = ignore_event,
+        .geometry =
+            [](void* data, kde_output_device_v2* /*device*/, std::int32_t x, std::int32_t y, std::int32_t /*width*/,
+               std::int32_t /*height*/, std::int32_t /*subpixel*/, const char* /*make*/, const char* /*model*/,
+               std::int32_t /*transform*/) {
+                device(data).x = x;
+                device(data).y = y;
+            },
         .current_mode = &current_mode,
         .mode = &mode_added,
         .done = &done,
         .scale = ignore_event,
         .edid = ignore_event,
-        .enabled = ignore_event,
+        .enabled = [](void* data, kde_output_device_v2* /*device*/,
+                      std::int32_t enabled) { device(data).enabled = enabled != 0; },
         .uuid = ignore_event,
         .serial_number = ignore_event,
         .eisa_id = ignore_event,
@@ -154,8 +201,22 @@ struct OutputManagement::Listeners {
         .automatic_max_bits_per_color_limit = ignore_event,
         .edr_policy = ignore_event,
         .sharpness = ignore_event,
-        .priority = ignore_event,
+        .priority = [](void* data, kde_output_device_v2* /*device*/,
+                       std::uint32_t priority) { device(data).priority = priority; },
         .auto_brightness = ignore_event,
+    };
+
+    static OutputManagement& management(void* data) noexcept { return *static_cast<OutputManagement*>(data); }
+
+    static constexpr kde_output_configuration_v2_listener layout_listener{
+        .applied =
+            [](void* data, kde_output_configuration_v2* /*configuration*/) { management(data).layout_done(true); },
+        .failed = [](void* data, kde_output_configuration_v2* /*configuration*/) { management(data).layout_done(false); },
+        .failure_reason =
+            [](void* /*data*/, kde_output_configuration_v2* /*configuration*/, const char* reason) {
+                log::debug(log_component, "KWin cannot lay the session's outputs out: {}",
+                           reason != nullptr ? reason : "");
+            },
     };
 
     static constexpr kde_output_configuration_v2_listener configuration_listener{
@@ -203,6 +264,12 @@ OutputManagement::OutputManagement(WaylandConnection& connection, kde_output_man
 
 OutputManagement::~OutputManagement()
 {
+    // A desktop that laid the session out and went without putting it back
+    // would leave the session's screens in the order it chose for a client
+    // that is no longer there.
+    if (layout_) {
+        restore_layout(std::chrono::seconds(1));
+    }
     connection_.set_global_listeners({}, {});
     for (auto& device : devices_) {
         device->drop_configuration();
@@ -270,7 +337,12 @@ void OutputManagement::request_size(std::string_view name, std::int32_t width, s
     if (device == nullptr || !resizable(name) || width <= 0 || height <= 0) {
         return;
     }
-    device->wanted = std::pair{width, height};
+    const auto wanted = std::pair{width, height};
+    if (device->wanted != wanted) {
+        device->refusals = 0;
+        device->retry_at.reset();
+    }
+    device->wanted = wanted;
     if (device->refused == device->wanted) {
         return;
     }
@@ -280,9 +352,186 @@ void OutputManagement::request_size(std::string_view name, std::int32_t width, s
     }
 }
 
+bool OutputManagement::enabled(std::string_view name) const
+{
+    const auto* device = find(name);
+    return device != nullptr && device->enabled;
+}
+
+void OutputManagement::request_layout(std::span<const std::string> outputs)
+{
+    if (outputs.empty()) {
+        return;
+    }
+    if (!layout_) {
+        layout_ = std::make_unique<Layout>();
+        // What the session showed before we laid it out, to put back when the
+        // desktop goes: whoever is at the machine gets their screens as they
+        // were.
+        for (const auto& device : devices_) {
+            layout_->before.push_back(
+                LayoutEntry{device->name, device->enabled, device->x, device->y, device->priority});
+        }
+    }
+    layout_->wanted.assign(outputs.begin(), outputs.end());
+    layout_->restoring = false;
+    layout_->refusals = 0;
+    layout_->retry_at.reset();
+    apply_layout();
+}
+
+void OutputManagement::restore_layout(std::chrono::milliseconds timeout)
+{
+    if (!layout_ || layout_->before.empty()) {
+        layout_.reset();
+        return;
+    }
+    layout_->wanted.clear();
+    layout_->restoring = true;
+    layout_->refusals = 0;
+    layout_->retry_at.reset();
+    apply_layout();
+    const auto deadline = Clock::now() + timeout;
+    while (layout_ && (layout_->configuration != nullptr || layout_->retry_at) && Clock::now() < deadline) {
+        static_cast<void>(connection_.roundtrip(std::chrono::milliseconds(100)));
+        check_timeouts();
+    }
+    layout_.reset();
+}
+
+std::vector<OutputManagement::LayoutEntry> OutputManagement::layout_target() const
+{
+    std::vector<LayoutEntry> target;
+    if (!layout_) {
+        return target;
+    }
+    if (layout_->restoring) {
+        return layout_->before;
+    }
+    // Beside the screens that stay as they are, so that nothing overlaps.
+    std::int32_t x = 0;
+    for (const auto& device : devices_) {
+        if (!device->enabled || std::ranges::find(layout_->wanted, device->name) != layout_->wanted.end()) {
+            continue;
+        }
+        const auto width = device->current != nullptr ? device->current->width : 0;
+        x = std::max(x, device->x + width);
+    }
+    std::uint32_t priority = 1;
+    for (const auto& name : layout_->wanted) {
+        const auto* device = find(name);
+        if (device == nullptr) {
+            return {};  // KWin has not announced it yet: ask again later
+        }
+        const auto width = device->current != nullptr ? device->current->width : 0;
+        target.push_back(LayoutEntry{name, true, x, 0, priority});
+        x += width;
+        ++priority;
+    }
+    // The other screens keep where they are, but come after ours in the
+    // output order: a configuration that gives only some outputs a priority
+    // leaves KWin's own order in place, and the panel stays where it was.
+    for (const auto& device : devices_) {
+        if (!device->enabled || std::ranges::find(layout_->wanted, device->name) != layout_->wanted.end()) {
+            continue;
+        }
+        target.push_back(LayoutEntry{device->name, true, device->x, device->y, priority});
+        ++priority;
+    }
+    return target;
+}
+
+bool OutputManagement::layout_reached() const
+{
+    const auto target = layout_target();
+    if (target.empty()) {
+        return false;
+    }
+    // The order of the priorities is what matters, not their numbers: KWin
+    // numbers them its own way, and comparing the numbers would ask for the
+    // same configuration for ever. The first of them is the primary screen,
+    // which is where the panel and new windows go.
+    bool first = true;
+    std::uint32_t previous = 0;
+    for (const auto& entry : target) {
+        const auto* device = find(entry.name);
+        if (device == nullptr) {
+            return false;
+        }
+        if (device->enabled != entry.enabled || (entry.enabled && (device->x != entry.x || device->y != entry.y))) {
+            return false;
+        }
+        if (entry.priority == 0) {
+            continue;
+        }
+        if (!first && device->priority <= previous) {
+            return false;
+        }
+        previous = device->priority;
+        first = false;
+    }
+    return true;
+}
+
+void OutputManagement::apply_layout()
+{
+    if (!layout_ || layout_->configuration != nullptr || layout_->retry_at) {
+        return;  // one at a time
+    }
+    const auto target = layout_target();
+    if (target.empty() || layout_reached()) {
+        return;
+    }
+    layout_->configuration = kde_output_management_v2_create_configuration(manager_);
+    kde_output_configuration_v2_add_listener(layout_->configuration, &Listeners::layout_listener, this);
+    for (const auto& entry : target) {
+        auto* device = find(entry.name);
+        if (device == nullptr) {
+            continue;
+        }
+        kde_output_configuration_v2_enable(layout_->configuration, device->proxy, entry.enabled ? 1 : 0);
+        if (!entry.enabled) {
+            continue;
+        }
+        kde_output_configuration_v2_position(layout_->configuration, device->proxy, entry.x, entry.y);
+        if (entry.priority != 0) {
+            kde_output_configuration_v2_set_priority(layout_->configuration, device->proxy, entry.priority);
+        }
+    }
+    layout_->started = Clock::now();
+    kde_output_configuration_v2_apply(layout_->configuration);
+    connection_.flush();
+}
+
+void OutputManagement::layout_done(bool applied)
+{
+    if (!layout_) {
+        return;
+    }
+    layout_->drop_configuration();
+    if (!applied) {
+        if (++layout_->refusals < max_refusals) {
+            // Another output was coming or going; asking again once that
+            // settled works.
+            layout_->retry_at = Clock::now() + retry_delay;
+            return;
+        }
+        log::warn(log_component,
+                  "KWin will not lay the session's outputs out (it refuses every configuration while the session is "
+                  "off its seat); the screens keep the order they have");
+        layout_->retry_at.reset();
+        return;
+    }
+    layout_->refusals = 0;
+    log::info(log_component, "the session is laid out around {}",
+              layout_->restoring ? "the screens it had before" : "the screens of this connection");
+}
+
 bool OutputManagement::busy() const
 {
-    return std::ranges::any_of(devices_, [](const auto& d) { return d->step != Device::Step::idle; });
+    return std::ranges::any_of(devices_,
+                               [](const auto& d) { return d->step != Device::Step::idle || d->retry_at.has_value(); }) ||
+           (layout_ && (layout_->configuration != nullptr || layout_->retry_at.has_value()));
 }
 
 void OutputManagement::check_timeouts()
@@ -292,8 +541,27 @@ void OutputManagement::check_timeouts()
             log::warn(log_component, "KWin did not resize output {} in time", device->name);
             device->drop_configuration();
             device->step = Device::Step::idle;
+            device->retry_at.reset();
             device->refused = device->wanted;
+            continue;
         }
+        if (device->step == Device::Step::idle && device->retry_at && Clock::now() >= *device->retry_at) {
+            device->retry_at.reset();
+            advance(*device);
+        }
+    }
+    if (!layout_) {
+        return;
+    }
+    if (layout_->configuration != nullptr && Clock::now() - layout_->started > step_timeout) {
+        log::warn(log_component, "KWin did not lay the session's outputs out in time");
+        layout_->drop_configuration();
+        layout_->retry_at.reset();
+        return;
+    }
+    if (layout_->retry_at && Clock::now() >= *layout_->retry_at) {
+        layout_->retry_at.reset();
+        apply_layout();
     }
 }
 
@@ -341,12 +609,21 @@ void OutputManagement::configuration_done(Device& device, bool applied)
     const auto step = device.step;
     device.drop_configuration();
     if (!applied) {
+        device.step = Device::Step::idle;
+        if (++device.refusals < max_refusals) {
+            // Usually another output was coming or going; asking again once
+            // that settled works.
+            log::debug(log_component, "KWin refused to resize output {}; asking again", device.name);
+            device.retry_at = Clock::now() + retry_delay;
+            return;
+        }
         log::warn(log_component, "KWin refused to resize output {} to {}x{}", device.name,
                   device.wanted ? device.wanted->first : 0, device.wanted ? device.wanted->second : 0);
         device.refused = device.wanted;
-        device.step = Device::Step::idle;
+        device.retry_at.reset();
         return;
     }
+    device.refusals = 0;
     device.step = step == Device::Step::custom_modes ? Device::Step::new_mode : Device::Step::idle;
     advance(device);
 }

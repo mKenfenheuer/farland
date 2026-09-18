@@ -95,7 +95,7 @@ mutter ($version$suffix) $distribution; urgency=medium
     Mutter keeps drawing while the session is not active on its seat
     (RecordVirtual's "keep-rendering-when-inactive", ScreenCast version 5).
 
- -- $(git -C "$fork" log -1 --format='%an <%ae>') $(date -R)
+ -- $(git -C "$fork" log -1 --format='%an <%ae>')  $(date -R)
 
 EOF
 cat "$tree/debian/changelog" >> "$tree/debian/changelog.farland"

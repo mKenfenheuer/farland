@@ -9,7 +9,7 @@
 farland_platform_mutter_dep = dependency('', required: false)
 if farland_platform_portal_dep.found()
   mutter_args = []
-  mutter_deps = [farland_platform_portal_dep]
+  mutter_deps = [farland_platform_portal_dep, farland_platform_logind_dep]
   xkbcommon_dep = dependency('xkbcommon', required: false, include_type: 'system')
   if xkbcommon_dep.found()
     mutter_args += '-DFARLAND_HAVE_XKBCOMMON=1'
@@ -31,7 +31,7 @@ if farland_platform_portal_dep.found()
     link_with: farland_platform_mutter_lib,
     include_directories: farland_inc,
     compile_args: mutter_args,
-    dependencies: farland_platform_portal_dep,
+    dependencies: [farland_platform_portal_dep, farland_platform_logind_dep],
   )
 endif
 
