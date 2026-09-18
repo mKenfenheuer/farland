@@ -37,6 +37,15 @@ What then happens follows `[policy] seat_takeover`:
   no module installed at all.
 - `never`: the login is refused while a client holds the session.
 
+A refused login is refused twice over. PAM keeps whoever is at the screen
+out, and the display manager then gives up the login screen it was showing on
+the seat — which hands the seat back to the very session the client is using.
+farlandd tells the agent how the login went before it lets PAM answer, so the
+agent knows that return is the refusal's doing and not somebody taking the
+session: it puts a login screen back on the seat and the client keeps what it
+has. Without that, the session would go to the screen at the machine although
+nobody was let in.
+
 Nobody is kept out or left waiting by farland going wrong. Without farlandd
 on the bus, with no session of theirs held, or on any error, the module
 returns at once and the login goes ahead — including when farlandd is not

@@ -38,6 +38,18 @@ constexpr std::int32_t min_size = 200;
 /// RDP clients show at most 16 monitors ([MS-RDPBCGR] 2.2.1.3.6).
 constexpr std::size_t max_screens = 16;
 
+/// How long after a refused login at the machine ([policy] seat_takeover) the
+/// seat coming back is that refusal's doing, and not somebody taking the
+/// session: the display manager gives the login screen up as soon as it is
+/// told, and a later return is a new login farlandd asked about again.
+constexpr auto seat_refusal_grace = std::chrono::seconds(10);
+
+/// How long after the login screen has the seat back the client's screen
+/// sizes and layout are asked for again: long enough for KWin to have
+/// described what it did to the outputs while it had the seat, or asking for
+/// a size it already believes we want does nothing.
+constexpr auto seat_return_catch_up = std::chrono::seconds(2);
+
 std::chrono::milliseconds left(Clock::time_point deadline)
 {
     return std::max(std::chrono::milliseconds(1),
@@ -117,6 +129,8 @@ public:
         }
         if (seat_watch_) {
             seat_watch_->process();
+            keep_the_seat_after_a_refusal();
+            catch_up_after_a_refusal();
         }
         service_pending();
     }
@@ -168,6 +182,7 @@ public:
     void request_screen_sizes(std::span<const Size> sizes) override;
     bool set_screen_targets(std::span<const std::optional<platform::Rect>> targets) override;
     void set_held(bool held) override;
+    void seat_takeover_decided(bool allowed) override;
     [[nodiscard]] bool keep_when_released() const override { return !options_.attach; }
 
 private:
@@ -224,6 +239,20 @@ private:
     /// logging in. False when the seat kept the session, so that the screen
     /// there still shows it.
     [[nodiscard]] bool hand_the_seat_a_greeter();
+    /// [policy] seat_takeover: the seat came back right after a login at the
+    /// machine was refused, because the display manager gave up the login
+    /// screen it was showing. The seat gets one back and the client keeps
+    /// the session; without this the return would end the connection, which
+    /// is exactly what the refusal said must not happen.
+    void keep_the_seat_after_a_refusal();
+    /// Asks KWin for the size every screen already wanted. Nothing changed
+    /// for the client, but KWin resizes a virtual output back to its own
+    /// default while the session is on its seat, and only takes a new size
+    /// while it is there.
+    void ask_for_the_screen_sizes_again();
+    /// Puts the client's screen sizes and layout back a moment after the
+    /// seat gave the session up again (keep_the_seat_after_a_refusal()).
+    void catch_up_after_a_refusal();
     /// Lays the session out around this connection's screens, so that the
     /// panel, new windows and the overview are where the client looks.
     void ensure_layout();
@@ -252,6 +281,13 @@ private:
     bool resizable_ = false;
     /// A client holds the desktop (set_held()).
     bool held_ = false;
+    /// A login at the machine was refused just now, and the seat coming back
+    /// until then is the display manager giving its login screen up, not
+    /// somebody taking the session (seat_takeover_decided()).
+    Clock::time_point seat_refused_until_{};
+    /// When to put the client's sizes and layout back after such a return;
+    /// unset when there is nothing to put back.
+    Clock::time_point catch_up_at_{};
     /// The virtual outputs created so far, for names that stay unique.
     std::uint64_t next_virtual_ = 0;
     /// closed() said why, once.
@@ -535,6 +571,68 @@ void PlasmaHeadlessDesktop::set_held(bool held)
     // Where the seat has a login screen, it keeps it, and logging in there
     // brings the session back with its windows.
     log::info(log_component, "no client holds the session: it is the seat's again");
+}
+
+void PlasmaHeadlessDesktop::ask_for_the_screen_sizes_again()
+{
+    if (!virtual_screens_ || outputs_ == nullptr) {
+        return;
+    }
+    for (const auto& screen : screens_) {
+        if (screen.size.first == 0 || screen.size.second == 0 || !outputs_->resizable(screen.output)) {
+            continue;
+        }
+        outputs_->request_size(screen.output,
+                               static_cast<std::int32_t>(std::min<std::uint32_t>(screen.size.first, max_size)),
+                               static_cast<std::int32_t>(std::min<std::uint32_t>(screen.size.second, max_size)));
+    }
+    wayland_->flush();
+}
+
+void PlasmaHeadlessDesktop::seat_takeover_decided(bool allowed)
+{
+    // Every answer settles the last one: a login that is allowed to take the
+    // session over must not be bounced back by an earlier refusal.
+    seat_refused_until_ = allowed ? Clock::time_point{} : Clock::now() + seat_refusal_grace;
+}
+
+void PlasmaHeadlessDesktop::keep_the_seat_after_a_refusal()
+{
+    if (!keeps_rendering() || !seat_watch_->returned_to_the_seat() || Clock::now() >= seat_refused_until_) {
+        return;
+    }
+    seat_refused_until_ = {};  // one return belongs to one refusal
+    if (!hand_the_seat_a_greeter()) {
+        // The screen at the machine would go on showing the session to
+        // whoever was refused, which is worse than the connection ending:
+        // the return stands, and the desktop closes as it did before.
+        return;
+    }
+    seat_watch_->forget_return();
+    // KWin resized the virtual output to its own default and laid the
+    // session out for the seat's screen while it had the seat back, and the
+    // sizes and the layout have to go back. Not now, though: a configuration
+    // in the moment of the return is refused whole ("Atomic modeset test
+    // failed! Permission denied", KWin back on the seat without DRM master
+    // yet), and what KWin did to the outputs has not even been described to
+    // us yet, so asking for a size it already believes we want does nothing.
+    // It waits for the login screen to have the seat and for KWin's own
+    // word on the outputs; off the seat a configuration reaches the virtual
+    // outputs alone (packaging/kwin).
+    catch_up_at_ = Clock::now() + seat_return_catch_up;
+    log::info(log_component, "the login at the machine was refused, so the seat has a login screen again and the "
+                             "client keeps the session");
+}
+
+void PlasmaHeadlessDesktop::catch_up_after_a_refusal()
+{
+    if (catch_up_at_ == Clock::time_point{} || Clock::now() < catch_up_at_) {
+        return;
+    }
+    catch_up_at_ = {};
+    ask_for_the_screen_sizes_again();
+    ensure_layout();
+    log::info(log_component, "the session is laid out for the client's screens again after the seat gave it back");
 }
 
 bool PlasmaHeadlessDesktop::hand_the_seat_a_greeter()

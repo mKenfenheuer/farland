@@ -30,6 +30,12 @@ constexpr std::string_view log_component = "app.gnome";
 /// RDP clients show at most 16 monitors ([MS-RDPBCGR] 2.2.1.3.6).
 constexpr std::size_t max_screens = 16;
 
+/// How long after a refused login at the machine ([policy] seat_takeover) the
+/// seat coming back is that refusal's doing, and not somebody taking the
+/// session: the display manager gives the login screen up as soon as it is
+/// told, and a later return is a new login farlandd asked about again.
+constexpr auto seat_refusal_grace = std::chrono::seconds(10);
+
 class GnomeHeadlessDesktop final : public Desktop {
 public:
     GnomeHeadlessDesktop() = default;
@@ -68,6 +74,7 @@ public:
         ei_->dispatch();
         if (seat_watch_) {
             seat_watch_->process();
+            keep_the_seat_after_a_refusal();
         }
         service_pending();
     }
@@ -114,6 +121,7 @@ public:
     void request_screen_sizes(std::span<const Size> sizes) override;
     bool set_screen_targets(std::span<const std::optional<platform::Rect>> targets) override;
     void set_held(bool held) override;
+    void seat_takeover_decided(bool allowed) override;
     [[nodiscard]] bool keep_when_released() const override { return !options_.attach; }
 
 private:
@@ -149,10 +157,18 @@ private:
     /// Hands the seat a GDM login screen while a client holds the session,
     /// so that the screen at the machine shows neither the session nor what
     /// was last on it, and whoever is there takes it back by logging in.
-    void hand_the_seat_a_greeter();
+    /// False when the seat kept the session, so that the screen there still
+    /// shows it.
+    [[nodiscard]] bool hand_the_seat_a_greeter();
     /// Gives the session back to what was attached before (the seat's
     /// screen), before our monitors go with us.
     void attach_back();
+    /// [policy] seat_takeover: the seat came back right after a login at the
+    /// machine was refused, because the display manager gave up the login
+    /// screen it was showing. The seat gets one back and the client keeps
+    /// the session; without this the return would end the connection, which
+    /// is exactly what the refusal said must not happen.
+    void keep_the_seat_after_a_refusal();
 
     HeadlessOptions options_;
     // Destroyed in reverse order: the clipboard and input before the
@@ -173,6 +189,10 @@ private:
     /// A client holds the desktop (set_held()); until the first one does,
     /// the session stays where it is.
     bool held_ = false;
+    /// A login at the machine was refused just now, and the seat coming back
+    /// until then is the display manager giving its login screen up, not
+    /// somebody taking the session (seat_takeover_decided()).
+    Clock::time_point seat_refused_until_{};
     /// closed() said why, once.
     mutable bool said_why_closed_ = false;
     /// The monitors that were attached before we took the session over (the
@@ -459,7 +479,7 @@ void GnomeHeadlessDesktop::set_held(bool held)
         // and the seat gets a login screen back.
         monitor_layout_.clear();
         ensure_monitor_layout();
-        hand_the_seat_a_greeter();
+        static_cast<void>(hand_the_seat_a_greeter());
         return;
     }
     // Nobody holds it any more. The session goes back to the screen at the
@@ -472,25 +492,55 @@ void GnomeHeadlessDesktop::set_held(bool held)
     log::info(log_component, "no client holds the session: it is the seat's again");
 }
 
-void GnomeHeadlessDesktop::hand_the_seat_a_greeter()
+void GnomeHeadlessDesktop::seat_takeover_decided(bool allowed)
+{
+    // Every answer settles the last one: a login that is allowed to take the
+    // session over must not be bounced back by an earlier refusal.
+    seat_refused_until_ = allowed ? Clock::time_point{} : Clock::now() + seat_refusal_grace;
+}
+
+void GnomeHeadlessDesktop::keep_the_seat_after_a_refusal()
+{
+    if (!keeps_rendering() || !seat_watch_->returned_to_the_seat() || Clock::now() >= seat_refused_until_) {
+        return;
+    }
+    seat_refused_until_ = {};  // one return belongs to one refusal
+    // The seat's own screen came back on with the seat, so the session shows
+    // the client's monitors alone again before the login screen returns,
+    // exactly as it does on the way in (set_held()).
+    monitor_layout_.clear();
+    ensure_monitor_layout();
+    if (!hand_the_seat_a_greeter()) {
+        // The screen at the machine would go on showing the session to
+        // whoever was refused, which is worse than the connection ending:
+        // the return stands, and the desktop closes as it did before.
+        return;
+    }
+    seat_watch_->forget_return();
+    log::info(log_component, "the login at the machine was refused, so the seat has a login screen again and the "
+                             "client keeps the session");
+}
+
+bool GnomeHeadlessDesktop::hand_the_seat_a_greeter()
 {
     if (!keeps_rendering() || seat_watch_ == nullptr) {
-        return;
+        return false;
     }
     if (!seat_watch_->active()) {
         // Something else is on the seat already (a login screen from an
         // earlier connection, or another session): nothing to hand over.
         log::info(log_component, "the seat is not showing this session, so it keeps what it has");
-        return;
+        return true;
     }
     if (auto handed = logind::switch_seat_to_greeter(); !handed) {
         // The seat keeps showing the session; the client still has it.
         log::warn(log_component, "cannot put a login screen on the seat ({}); the screen at the machine keeps showing "
                                  "the session",
                   handed.error().message);
-        return;
+        return false;
     }
     log::info(log_component, "the screen at the machine shows a login screen; logging in there takes the session back");
+    return true;
 }
 
 void GnomeHeadlessDesktop::attach_back()

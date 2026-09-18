@@ -152,6 +152,37 @@ protocol addition, nothing to opt into, and no behaviour change on the seat,
 because it only stops a configuration that cannot touch the seat from being
 thrown away with one that can. Upstream first.
 
+### A refused login hands the seat back, and KWin resizes on the way
+
+[policy] seat_takeover refuses a login at the machine, and the display
+manager then gives up the login screen it was showing — which puts the
+session back on its seat although nobody was let in. The agent puts a login
+screen back (`keep_the_seat_after_a_refusal()`), and the client keeps the
+session. What that costs on Plasma, measured on the test machine:
+
+```
+a client holds the session; the seat shows SDDM's login screen
+a login at the machine is refused, and the seat falls back to the session
+KWin resizes the virtual output to its own 1024x768 and lays the session
+  out for the seat's screen
+the login screen has the seat again
+the client's screen comes back at 1280x800
+```
+
+The sizes have to go back afterwards, and only afterwards. A configuration
+in the moment of the return is refused whole — `Atomic modeset test failed!
+Permission denied`, because KWin is back on the seat without DRM master yet
+— and one sent immediately after the login screen returns does nothing
+either: KWin has not described what it did to the outputs yet, so asking for
+the size it already believes we want changes nothing (`request_size()` has
+nothing to do). It waits for KWin's word on the outputs and then asks again
+(`catch_up_after_a_refusal()`), which is the only window that works, because
+off the seat a configuration reaches the virtual outputs alone
+(`packaging/kwin`).
+
+GNOME needs none of this: Mutter keeps the session laid out for the client's
+monitors across the return, and the layout check after it applies nothing.
+
 ## The test machine
 
 `max@10.1.250.18` (`kubuntu-vm`), Kubuntu 26.04, KWin 6.6.6, SDDM, one seat

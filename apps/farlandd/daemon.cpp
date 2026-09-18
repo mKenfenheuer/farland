@@ -1084,11 +1084,19 @@ void Daemon::Impl::ask_the_seat()
         }
         switch (options.config.policy.seat_takeover) {
         case TakeoverPolicy::always:
+            static_cast<void>(send_to(*session, broker::SeatTakeover{true}));
             seat_gate.resolve(waiting.cookie, true);
             continue;
         case TakeoverPolicy::never:
             log::info(log_component, "session {} of {}: the login at the machine is refused: seat_takeover = \"never\"",
                       session->id, session->account);
+            // Before the login is let go: the seat falls back to this
+            // session the moment the display manager gives its login screen
+            // up, and the agent has to know that is not a takeover.
+            if (!send_to(*session, broker::SeatTakeover{false})) {
+                seat_gate.resolve(waiting.cookie, true);  // the session ended; nobody holds it now
+                continue;
+            }
             seat_gate.resolve(waiting.cookie, false);
             continue;
         case TakeoverPolicy::ask:
@@ -1121,12 +1129,19 @@ void Daemon::Impl::resolve(const ConsentBroker::Resolved& resolved)
         // by itself once they do.
         log::info(log_component, "session {}: the login at the machine may {}take the session back: {}",
                   resolved.session, resolved.allowed ? "" : "not ", resolved.reason);
-        if (resolved.withdraw) {
-            if (Live* session = find(resolved.session); session != nullptr) {
-                static_cast<void>(send_to(*session, broker::ConsentCancel{resolved.connection}));
-            }
+        Live* session = find(resolved.session);
+        // A send_to that fails ends the session, so the second one only goes
+        // out while there is still a session to send it to.
+        const bool cancelled =
+            session == nullptr || !resolved.withdraw || send_to(*session, broker::ConsentCancel{resolved.connection});
+        if (session != nullptr && cancelled) {
+            // Before the login is let go, so that the agent knows what the
+            // seat coming back means: a refused login only gets it back
+            // because the display manager gives its login screen up.
+            static_cast<void>(send_to(*session, broker::SeatTakeover{resolved.allowed}));
         }
-        seat_gate.resolve(found->second, resolved.allowed);
+        // Nobody holds a session that just ended, so that login goes through.
+        seat_gate.resolve(found->second, resolved.allowed || find(resolved.session) == nullptr);
         seat_questions.erase(found);
         return;
     }

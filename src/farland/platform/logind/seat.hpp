@@ -47,6 +47,11 @@ public:
     /// logged in at the machine and took it back, and a client that handed
     /// the seat a login screen has to let go.
     [[nodiscard]] bool returned_to_the_seat() const noexcept { return returned_; }
+    /// The return this reported was not a takeover after all: whoever logged
+    /// in at the machine was refused ([policy] seat_takeover), and the seat
+    /// only fell back to the session because the display manager gave up the
+    /// login screen it was showing. The next return counts again.
+    void forget_return() noexcept { returned_ = false; }
     /// The session is active on its seat now.
     [[nodiscard]] bool active() const noexcept { return active_; }
 

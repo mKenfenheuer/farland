@@ -45,6 +45,7 @@
 /// | ConsentRequest | daemon: ask the user about a takeover       | none                 |
 /// | ConsentCancel  | daemon: take that question back             | none                 |
 /// | ConsentReply   | agent: what the user answered               | none                 |
+/// | SeatTakeover   | daemon: how a login at the machine went     | none                 |
 /// | SessionEnded   | agent, as its last message                  | none                 |
 /// | Stats          | agent, periodically                         | none                 |
 /// | Terminate      | daemon: end the whole session               | none                 |
@@ -58,7 +59,7 @@ namespace farland::server::broker {
 
 /// Bumped on every incompatible change; farlandd and the agent come from one
 /// package, so the daemon simply refuses another version.
-inline constexpr std::uint16_t protocol_version = 3;
+inline constexpr std::uint16_t protocol_version = 4;
 
 /// A per-agent secret farlandd generates when it starts the agent. Together
 /// with the peer's uid (SO_PEERCRED) it ties the socket connection to the
@@ -223,6 +224,17 @@ struct ConsentReply {
     ConsentAnswer answer = ConsentAnswer::allowed;
 };
 
+/// Daemon to agent: what became of a login at the machine ([policy]
+/// seat_takeover), whether the session's user was asked or the policy
+/// decided by itself. farlandd sends it before it lets the login go on, so
+/// the agent knows what a seat coming back means: a refused login leaves the
+/// display manager giving up the login screen it put on the seat, and the
+/// seat falls back to this session for a moment — the agent puts a login
+/// screen back and the client keeps the session.
+struct SeatTakeover {
+    bool allowed = true;
+};
+
 enum class EndReason : std::uint8_t {
     logout = 1,                ///< the user logged out; the compositor exited normally
     desktop_failed = 2,        ///< the compositor or the capture backend died
@@ -262,7 +274,7 @@ struct Terminate {
 };
 
 using Message = std::variant<Hello, Settings, NewConnection, Disconnect, ConsentRequest, ConsentCancel, ConsentReply,
-                             SessionEnded, Stats, Terminate>;
+                             SeatTakeover, SessionEnded, Stats, Terminate>;
 
 enum class Sender : std::uint8_t { daemon, agent };
 

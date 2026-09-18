@@ -99,6 +99,12 @@ public:
     /// client holds it, and gives it back when none does, so that the screen
     /// at the machine never keeps showing what a client took away.
     virtual void set_held(bool held) { static_cast<void>(held); }
+    /// [policy] seat_takeover: somebody logging in at the machine was asked
+    /// about, and this is what came of it. A refusal matters to a desktop
+    /// that took the session from a seat: the display manager gives up the
+    /// login screen it was showing, so the seat falls back to this session
+    /// for a moment, and that must not count as the seat taking it back.
+    virtual void seat_takeover_decided(bool allowed) { static_cast<void>(allowed); }
     /// The desktop's clipboard; null when the backend has none or was not
     /// granted access.
     [[nodiscard]] virtual platform::Clipboard* clipboard() { return nullptr; }

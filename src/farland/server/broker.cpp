@@ -30,6 +30,7 @@ enum class Type : std::uint8_t {
     consent_request = 8,
     consent_cancel = 9,
     consent_reply = 10,
+    seat_takeover = 11,
 };
 
 void write_string(Writer& w, std::string_view text, std::size_t max)
@@ -294,6 +295,12 @@ void encode_body(Writer& w, const ConsentReply& m)
     w.u8(static_cast<std::uint8_t>(m.answer));
 }
 
+void encode_body(Writer& w, const SeatTakeover& m)
+{
+    w.u8(static_cast<std::uint8_t>(Type::seat_takeover));
+    write_flag(w, m.allowed);
+}
+
 void encode_body(Writer& w, const SessionEnded& m)
 {
     w.u8(static_cast<std::uint8_t>(Type::session_ended));
@@ -465,6 +472,11 @@ Result<Message> decode_body(Reader& r)
         FARLAND_TRY(m.answer, read_consent_answer(r));
         return m;
     }
+    case Type::seat_takeover: {
+        SeatTakeover m;
+        FARLAND_TRY(m.allowed, read_flag(r));
+        return m;
+    }
     case Type::session_ended: {
         SessionEnded m;
         const std::size_t reason_offset = r.offset();
@@ -574,7 +586,8 @@ bool may_send(Sender sender, const Message& message) noexcept
     const bool daemon_only = std::holds_alternative<NewConnection>(message) ||
                              std::holds_alternative<Terminate>(message) || std::holds_alternative<Settings>(message) ||
                              std::holds_alternative<ConsentRequest>(message) ||
-                             std::holds_alternative<ConsentCancel>(message);
+                             std::holds_alternative<ConsentCancel>(message) ||
+                             std::holds_alternative<SeatTakeover>(message);
     return sender == Sender::daemon ? daemon_only : !daemon_only;
 }
 

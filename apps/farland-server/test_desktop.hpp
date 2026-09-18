@@ -42,6 +42,10 @@ public:
     /// Ends the desktop, as a logout ends a compositor. Any thread.
     void close() noexcept { closed_ = true; }
 
+    void seat_takeover_decided(bool allowed) override { seat_takeover_allowed_ = allowed; }
+    /// What farlandd last said about a login at the machine, if anything.
+    [[nodiscard]] std::optional<bool> seat_takeover_allowed() const { return seat_takeover_allowed_.load(); }
+
 private:
     class Frames final : public platform::FrameSource {
     public:
@@ -83,6 +87,9 @@ private:
     double pointer_y_ = 0;
     bool button_down_ = false;
     std::atomic<bool> closed_{false};
+    /// farlandd's last word on a login at the machine ([policy]
+    /// seat_takeover); unset until it says something.
+    std::atomic<std::optional<bool>> seat_takeover_allowed_{};
     Frames frames_{*this};
     Input input_{*this};
 };

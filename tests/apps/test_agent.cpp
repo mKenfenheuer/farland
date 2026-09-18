@@ -87,6 +87,7 @@ TEST_CASE("Agent: connections share one desktop; takeover, cookies and Terminate
     std::atomic<std::uint32_t> desktop_width{0};
     std::atomic<std::uint32_t> desktop_height{0};
     std::atomic<unsigned> desktop_fps{0};
+    std::atomic<farland::app::TestDesktop*> made{nullptr};
 
     farland::agent::AgentConfig config;
     config.daemon = std::move(agent_end);
@@ -102,7 +103,10 @@ TEST_CASE("Agent: connections share one desktop; takeover, cookies and Terminate
         desktop_width = request.width;
         desktop_height = request.height;
         desktop_fps = request.frames_per_second;
-        return std::make_unique<farland::app::TestDesktop>(request.width, request.height, request.frames_per_second);
+        auto desktop =
+            std::make_unique<farland::app::TestDesktop>(request.width, request.height, request.frames_per_second);
+        made = desktop.get();
+        return desktop;
     };
     farland::agent::Agent agent(std::move(config));
     std::atomic<bool> stop{false};
@@ -134,6 +138,14 @@ TEST_CASE("Agent: connections share one desktop; takeover, cookies and Terminate
     CHECK(client1.arc_cookie()->logon_id == 7);
     client1.send_keys({0x1E});
     REQUIRE(client1.pump_until([&] { return shows_key(client1, key_a); }));
+
+    // [policy] seat_takeover: a login at the machine that was refused reaches
+    // the desktop, which keeps the seat's login screen instead of ending.
+    REQUIRE(farland::app::send_message(daemon_end.get(), broker::encode(broker::SeatTakeover{false})));
+    REQUIRE(client1.pump_until([&] {
+        auto* desktop = made.load();
+        return desktop != nullptr && desktop->seat_takeover_allowed() == std::optional(false);
+    }));
 
     // Connection 2 takes over: the first ends with ERRINFO_DISCONNECTED_BY_OTHERCONNECTION.
     auto [server2, client2_fd] = socket_pair();

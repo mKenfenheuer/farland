@@ -359,6 +359,15 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
                               config_.logon_id, withdrawn->connection_id);
                     withdraw_prompt();
                 }
+            } else if (const auto* seat = std::get_if<broker::SeatTakeover>(&*message)) {
+                // A refused login leaves the display manager giving up the
+                // login screen on the seat, so the desktop has to know that
+                // the seat coming back now is not somebody taking it.
+                log::info(log_component, "session {}: the login at the machine may {}take the session back",
+                          config_.logon_id, seat->allowed ? "" : "not ");
+                if (desktop_) {
+                    desktop_->seat_takeover_decided(seat->allowed);
+                }
             } else if (const auto* terminate = std::get_if<broker::Terminate>(&*message)) {
                 return finish(terminate->reason, "farlandd ended the session");
             }

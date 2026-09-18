@@ -230,6 +230,13 @@ TEST_CASE("Broker messages round-trip")
         CHECK(reply.answer == answer);
     }
 
+    // How a login at the machine went; a refusal is what the agent acts on.
+    for (const bool allowed : {true, false}) {
+        const auto seat =
+            std::get<broker::SeatTakeover>(broker::decode(broker::encode(broker::SeatTakeover{allowed})).value());
+        CHECK(seat.allowed == allowed);
+    }
+
     // A connection without NLA, summary, cookie or input.
     broker::NewConnection bare;
     bare.connection_id = 9;
@@ -542,6 +549,12 @@ TEST_CASE("Each side may send only its own broker messages, with a descriptor on
     const auto reply = broker::encode(broker::ConsentReply{5, broker::ConsentAnswer::denied});
     CHECK(broker::decode_from(broker::Sender::agent, reply, false).has_value());
     CHECK_FALSE(broker::decode_from(broker::Sender::daemon, reply, false).has_value());
+
+    // Only farlandd says how a login at the machine went.
+    const auto seat = broker::encode(broker::SeatTakeover{false});
+    CHECK(broker::decode_from(broker::Sender::daemon, seat, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::agent, seat, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::daemon, seat, true).has_value());
 }
 
 TEST_CASE("farlandd accepts an agent only after a hello with its token")
