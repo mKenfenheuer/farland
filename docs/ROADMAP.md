@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works (S0, S1).
+**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME and Plasma sessions per user (S0, S1, S3, the GNOME half of S2).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -393,7 +393,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - No dmabuf capture yet: frames come in shared memory, so AVC420 reads them from CPU memory.
   - Tested: unit tests for the keymap (layouts, modifiers, spare keys), pointer mapping, damage, cursor pixels and the launch setup; compositor tests against headless sway 1.11, labwc 0.9.3 and cage 0.2.1 (frames, resizing, cursor positions, key bindings with modifiers, a typed €, a clipboard round trip). Live on Ubuntu 26.04 with FreeRDP 3.31: sway's terminal opened and typed into, resized to the client's window, the clipboard in both directions; labwc's menu at the pointer; cage running foot.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
-- **Status (2026-09-17): S0 and S1 done; the GNOME route of S2 and self-enrolment from S5 work; the Debian package from S5 builds in CI (`packaging/make-deb.sh`) and installs the service.**
+- **Status (2026-09-19): S0, S1 and S3 done; the GNOME route of S2, self-enrolment and `farlandctl sessions`/`terminate` from S5 work; the Debian package from S5 builds in CI (`packaging/make-deb.sh`) and installs the service.**
   - Done:
     - `farlandd` (`apps/farlandd/`):
       - The port, the TLS identity and the credential store.
@@ -439,8 +439,10 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - FreeRDP 3.31 does not announce Set Error Info support, so it shows its generic "logged off" message for takeovers, timeouts and refusals, rather than the precise reason.
   - Fixed after a live run (2026-09-19):
     - Handing the seat back created a **new greeter every time**. `switch_seat_to_greeter()` called GDM's `CreateTransientDisplay` unconditionally, and GDM makes another transient display on each call: four takeover attempts on the test host left four greeter sessions, each with a GNOME Shell of its own, until Mutter stopped answering D-Bus and every later connection died with "the desktop did not start". It now looks for a session of class `greeter` on the seat and activates that one, and only creates a display when the seat has none.
+  - **S3 (Plasma per user through farlandd) is done**, live on Kubuntu 26.04 with KWin 6.6 (2026-09-19): a client authenticates with NLA, farlandd opens a PAM session (type wayland, class user, Remote=yes), the agent starts KWin's virtual backend with `plasma_session` on a private bus, and the desktop comes up at the client's size.
+    - It needs one thing of the account that nothing said out loud: **access to a DRM render node**. KWin casts a screen only with OpenGL compositing, OpenGL needs `/dev/dri/renderD*`, and that node is `root:render` with no world access. logind puts an ACL on it for whoever is logged in at the machine; a farland session is on no seat, so it gets none, and the account has to be in the node's group. Without it KWin falls back to QPainter and answers the cast request with "unsupported compositing type", which says nothing about the cause: the first account tried failed for exactly this, while the developer's own account worked because it was in `render` already. The Plasma backend now looks at the render node when a cast is refused and says so, with the command to fix it.
   - Open:
-    - The Plasma and wlroots backends and their live test (S3, S4).
+    - The wlroots backend served by farlandd (S4) and its live test.
     - `on_local_session = "attach"` live.
     - mstsc and Windows App.
     - The rest of S5: metrics, and packaging beyond the Debian one (rpm, AUR, a container image).

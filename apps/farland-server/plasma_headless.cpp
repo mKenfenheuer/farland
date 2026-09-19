@@ -16,11 +16,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <format>
+#include <grp.h>
 #include <poll.h>
+#include <string>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace farland::app {
 
@@ -37,6 +43,56 @@ constexpr std::int32_t max_size = 8192;
 constexpr std::int32_t min_size = 200;
 /// RDP clients show at most 16 monitors ([MS-RDPBCGR] 2.2.1.3.6).
 constexpr std::size_t max_screens = 16;
+
+/// Why this account has no GPU to composite with, in words an administrator
+/// can act on; empty when a render node opens, which means the trouble is
+/// something else.
+///
+/// KWin needs OpenGL to cast a screen, OpenGL needs a DRM render node, and a
+/// render node is `root:render` with no world access. logind puts an ACL on
+/// it for whoever is logged in **at the machine**; a farland session is on no
+/// seat, so it gets none, and the account has to be in the node's group.
+/// That is invisible from KWin's side, which only says "unsupported
+/// compositing type".
+std::string render_node_trouble(const std::string& wanted)
+{
+    namespace fs = std::filesystem;
+    std::vector<fs::path> nodes;
+    if (!wanted.empty()) {
+        nodes.emplace_back(wanted);
+    } else {
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator("/dev/dri", ec)) {
+            if (entry.path().filename().string().starts_with("renderD")) {
+                nodes.push_back(entry.path());
+            }
+        }
+        std::ranges::sort(nodes);
+    }
+    if (nodes.empty()) {
+        return "this machine has no DRM render node (/dev/dri/renderD*), so KWin cannot composite with OpenGL; "
+               "a virtual machine needs 3D acceleration, such as virgl";
+    }
+    std::string refused;
+    for (const auto& node : nodes) {
+        const int fd = ::open(node.c_str(), O_RDWR | O_CLOEXEC);  // NOLINT(cppcoreguidelines-pro-type-vararg)
+        if (fd >= 0) {
+            ::close(fd);
+            return {};  // one opens; the trouble is elsewhere
+        }
+        if (errno != EACCES && errno != EPERM) {
+            continue;
+        }
+        struct ::stat info{};
+        const group* owner = ::stat(node.c_str(), &info) == 0 ? ::getgrgid(info.st_gid) : nullptr;
+        refused = std::format(
+            "this account cannot open {}: a headless session is on no seat, so logind grants it no access to the "
+            "GPU. Put the account in the '{}' group (usermod -aG {} ACCOUNT) and let it log in again",
+            node.string(), owner != nullptr && owner->gr_name != nullptr ? owner->gr_name : "render",
+            owner != nullptr && owner->gr_name != nullptr ? owner->gr_name : "render");
+    }
+    return refused;
+}
 
 /// How long after a refused login at the machine ([policy] seat_takeover) the
 /// seat coming back is that refusal's doing, and not somebody taking the
@@ -789,6 +845,12 @@ Result<void> PlasmaHeadlessDesktop::start_streams(const HeadlessOptions& options
         }
         if (screen.stream->state() != kwin::ScreencastStream::State::created) {
             log::error(log_component, "KWin cannot cast output {}: {}", screen.output, screen.stream->error());
+            // Almost always the same cause, and one nobody guesses from
+            // "unsupported compositing type": without a render node it can
+            // open, KWin composites with QPainter and casts nothing.
+            if (const std::string why = render_node_trouble(options.render_node); !why.empty()) {
+                log::error(log_component, "{}", why);
+            }
             return fail(Errc::io, "KWin refused the screen cast (it needs OpenGL compositing)");
         }
         portal::PipeWireCaptureOptions capture_options;
