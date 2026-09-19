@@ -68,7 +68,7 @@ The image is not a way to run farlandd: a desktop per user wants PAM, logind, D-
 
 - **Desktops:** `[session] desktop` in `/etc/farland/farland.toml` picks the desktop.
   - `gnome`: GDM starts a headless GNOME session for the user (RemoteDisplayFactory.CreateUserDisplay, as `gnome-headless-session@.service` does). The agent runs in the user's service manager and attaches to its Mutter. GDM must be running.
-  - `plasma`, `sway`, `labwc` and `cage`: farlandd opens a PAM session of its own (service `farland`; pam_systemd registers a remote wayland session with logind), and the agent starts the compositor.
+  - `plasma`, `sway`, `labwc` and `cage`: farlandd opens a PAM session of its own (service `farland`; pam_systemd registers a remote wayland session with logind), and the agent starts the compositor on its headless backend at the client's size. `cage` runs the application in `[session] command`. Tried on Kubuntu 26.04 with KWin 6.6, sway 1.11, labwc 0.9.3 and cage 0.2.1.
   - `test`: the synthetic test pattern, whose frames and typed keys persist between connections.
   - Which compositors a build can start is listed under "Headless desktops" in the `meson setup` summary; the others end the session with an error.
 - **Users:** users enrol themselves once with `farlandctl passwd` (no user name). farlandd asks polkit (`auth_self`) and checks the account password with PAM, then stores the NT hash NLA needs, with the local account, in `/var/lib/farland/users`. Afterwards users log in over RDP with their account name and password. An administrator can instead add entries directly: `farlandctl --file /var/lib/farland/users passwd NAME --local-account ACCOUNT`.
