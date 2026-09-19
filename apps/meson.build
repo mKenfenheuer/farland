@@ -182,6 +182,7 @@ farland_daemon_lib = static_library(
   'farlandd/enrol.cpp',
   'farlandd/launcher.cpp',
   'farlandd/logind.cpp',
+  'farlandd/metrics.cpp',
   'farlandd/registry.cpp',
   'farlandd/session_store.cpp',
   'farlandd/session_view.cpp',

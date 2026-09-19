@@ -371,6 +371,16 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
 - **Operations:**
   - systemd units, the PAM file, D-Bus and polkit policies, and the KWin desktop file.
   - journald structured logging, Prometheus metrics (fps, bitrate, RTT, queue depth).
+    **Metrics are in** (`apps/farlandd/metrics.{hpp,cpp}`): `[metrics] listen` turns on a
+    server that answers `GET /metrics` in the Prometheus text format 0.0.4 and nothing
+    else. It reports how many sessions there are and what state they are in, how many
+    connections, sessions started, sessions ended by reason and refusals by reason, and
+    per session the uptime, idle time, frames, bytes both ways, round trip and the
+    bandwidth auto-detect measured. The daemon loop publishes a snapshot and the scrape
+    renders the last one, the way `SessionView` keeps the D-Bus thread apart. Off unless
+    configured, and the example address is the loopback: it is a listening socket in a
+    process running as root. Tried live on Kubuntu 26.04 through a real session
+    (2026-09-19).
   - Packaging as deb, rpm and an AUR recipe; a container image for the test backend.
 - **Phases:**
   - S0: the broker protocol with descriptor passing, Save Session Info and the ARC verifier, the TOML config, and the local-account column.
@@ -452,7 +462,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - The wlroots backend served by farlandd (S4) and its live test.
     - `on_local_session = "attach"` live.
     - mstsc and Windows App.
-    - The rest of S5: metrics, and packaging beyond the Debian one (rpm, AUR, a container image).
+    - The rest of S5: packaging beyond the Debian one (rpm, AUR, a container image).
     - The agent answers the MCS Connect Initial only once its desktop has started, which takes GDM 10–20 s; FreeRDP needs `/timeout`.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)

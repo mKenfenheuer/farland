@@ -111,6 +111,7 @@ TEST_CASE("An empty farland.toml gives the defaults")
     CHECK(config.audio.playback);
     CHECK(config.audio.microphone);
     CHECK(config.clipboard.enabled);
+    CHECK_FALSE(config.metrics.listen.has_value());
 }
 
 TEST_CASE("The shipped data/farland.toml parses and is the defaults")
@@ -186,6 +187,25 @@ activation_timeout = "90s"
     CHECK(printed.find("graphics.openh264 = \"libopenh264.so.7\"\n") != std::string::npos);
     CHECK(printed.find("clipboard.enabled = false\n") != std::string::npos);
     CHECK(describe(Config{}).find("graphics.render_node = unset\n") != std::string::npos);
+}
+
+TEST_CASE("The metrics address is read and checked")
+{
+    const auto on = parse_config(R"(
+[metrics]
+listen = "127.0.0.1:9128"
+)");
+    REQUIRE(on.has_value());
+    CHECK(on->metrics.listen == "127.0.0.1:9128");
+    CHECK(describe(*on).find("metrics.listen = \"127.0.0.1:9128\"\n") != std::string::npos);
+    CHECK(describe(Config{}).find("metrics.listen = unset\n") != std::string::npos);
+
+    // A bad address is a configuration error, so --check-config finds it
+    // rather than the daemon failing to bind at startup.
+    CHECK_FALSE(parse_config("[metrics]\nlisten = \"127.0.0.1\"\n").has_value());
+    CHECK_FALSE(parse_config("[metrics]\nlisten = \"127.0.0.1:0\"\n").has_value());
+    CHECK_FALSE(parse_config("[metrics]\nlisten = 9128\n").has_value());
+    CHECK_FALSE(parse_config("[metrics]\nlistem = \"127.0.0.1:9128\"\n").has_value());
 }
 
 TEST_CASE("A complete farland.toml parses")

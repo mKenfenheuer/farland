@@ -3,6 +3,8 @@
 
 #include "config.hpp"
 
+#include "metrics.hpp"
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
@@ -503,6 +505,24 @@ std::expected<void, ConfigError> parse_audio(const toml::table& table, AudioSect
     return {};
 }
 
+std::expected<void, ConfigError> parse_metrics(const toml::table& table, MetricsSection& out)
+{
+    if (auto ok = check_keys(table, "metrics", {"listen"}); !ok) {
+        return ok;
+    }
+    if (const auto* node = table.get("listen")) {
+        const auto* value = node->as_string();
+        if (value == nullptr) {
+            return std::unexpected(ConfigError{"[metrics] listen must be a string like \"127.0.0.1:9128\""});
+        }
+        if (auto where = split_listen_address(value->get()); !where) {
+            return std::unexpected(ConfigError{std::format("[metrics] listen: {}", where.error().message())});
+        }
+        out.listen = value->get();
+    }
+    return {};
+}
+
 std::expected<void, ConfigError> parse_camera(const toml::table& table, CameraSection& out)
 {
     if (auto ok = check_keys(table, "camera", {"enabled"}); !ok) {
@@ -561,7 +581,7 @@ std::expected<Config, ConfigError> parse_config(std::string_view text)
 #endif
 
     using Parser = std::expected<void, ConfigError> (*)(const toml::table&, Config&);
-    static constexpr std::array<std::pair<std::string_view, Parser>, 9> sections{{
+    static constexpr std::array<std::pair<std::string_view, Parser>, 10> sections{{
         {"server", [](const toml::table& t, Config& c) { return parse_server(t, c.server); }},
         {"auth", [](const toml::table& t, Config& c) { return parse_auth(t, c.auth); }},
         {"session", [](const toml::table& t, Config& c) { return parse_session(t, c.session); }},
@@ -570,6 +590,7 @@ std::expected<Config, ConfigError> parse_config(std::string_view text)
         {"network", [](const toml::table& t, Config& c) { return parse_network(t, c.network); }},
         {"audio", [](const toml::table& t, Config& c) { return parse_audio(t, c.audio); }},
         {"camera", [](const toml::table& t, Config& c) { return parse_camera(t, c.camera); }},
+        {"metrics", [](const toml::table& t, Config& c) { return parse_metrics(t, c.metrics); }},
         {"clipboard", [](const toml::table& t, Config& c) { return parse_clipboard(t, c.clipboard); }},
     }};
 
@@ -780,6 +801,7 @@ std::string describe(const Config& config)
     line("audio.playback", flag(config.audio.playback));
     line("audio.microphone", flag(config.audio.microphone));
     line("camera.enabled", flag(config.camera.enabled));
+    line("metrics.listen", config.metrics.listen ? quoted(*config.metrics.listen) : std::string("unset"));
     line("clipboard.enabled", flag(config.clipboard.enabled));
     return out;
 }

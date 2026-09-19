@@ -198,6 +198,13 @@ struct AudioSection {
     bool microphone = true;  ///< the client's microphone as a local source (audin)
 };
 
+struct MetricsSection {
+    /// "host:port" to serve the Prometheus metrics on; unset serves none.
+    /// A listening socket in a root daemon, so the example names the
+    /// loopback and nothing opens it by default.
+    std::optional<std::string> listen;
+};
+
 struct CameraSection {
     bool enabled = true;  ///< the client's camera as a local camera (rdpecam)
 };
@@ -215,6 +222,7 @@ struct Config {
     NetworkSection network;
     AudioSection audio;
     CameraSection camera;
+    MetricsSection metrics;
     ClipboardSection clipboard;
 };
 

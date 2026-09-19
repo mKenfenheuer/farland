@@ -20,6 +20,7 @@
 #include "enrol.hpp"
 #include "launcher.hpp"
 #include "logind.hpp"
+#include "metrics.hpp"
 #include "privsep_process.hpp"
 #include "registry.hpp"
 #include "sandbox.hpp"
@@ -39,6 +40,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <format>
 #include <functional>
 #include <mutex>
 #include <netdb.h>
@@ -59,6 +61,28 @@ namespace {
 namespace broker = server::broker;
 using Clock = std::chrono::steady_clock;
 constexpr std::string_view log_component = "daemon";
+
+/// The Set Error Info code a refusal carried, as a name a metrics label can
+/// hold: a handful of values rather than a number a dashboard has to look up.
+[[nodiscard]] std::string errinfo_name(std::uint32_t error_info)
+{
+    switch (error_info) {
+    case proto::errinfo::server_denied_connection:
+        return "denied";
+    case proto::errinfo::server_insufficient_privileges:
+        return "insufficient_privileges";
+    case proto::errinfo::out_of_memory:
+        return "out_of_memory";
+    case proto::errinfo::logon_timeout:
+        return "logon_timeout";
+    case proto::errinfo::idle_timeout:
+        return "idle_timeout";
+    case proto::errinfo::disconnected_by_other_connection:
+        return "disconnected_by_other_connection";
+    default:
+        return std::format("{:#010x}", error_info);
+    }
+}
 /// Clients in pre-authentication at once; more are turned away.
 constexpr int max_preauth_clients = 64;
 /// How long a new session's agent may take to say Hello.
@@ -213,6 +237,8 @@ struct Live {
     Clock::time_point created;
     /// The address of the client connected now, for `farlandctl sessions`.
     std::string peer;
+    /// The agent's last Stats, for the metrics.
+    broker::Stats stats;
     /// The token the agent greets with again after a farlandd restart. The
     /// greeting copy is wiped once used; this one lives as long as the
     /// session, and is what the written-down table holds.
@@ -221,6 +247,10 @@ struct Live {
     /// after this it is given up for lost.
     std::optional<Clock::time_point> reattach_deadline;
     std::optional<Clock::time_point> terminate_sent;
+    /// Why this session was asked to end, as a metrics label. It is set where
+    /// the Terminate is sent, because by the time the agent goes the only
+    /// thing left to see is that it went.
+    std::string end_tag;
 
     Live() = default;
     Live(const Live&) = delete;
@@ -499,7 +529,7 @@ struct Daemon::Impl {
     void refuse(Authenticated client, std::uint32_t error_info, const std::string& reason);
     /// `wait`: take the login session down before returning (at shutdown,
     /// when no detached thread would outlive the process).
-    void end_session(Live& session, const std::string& why, bool wait = false);
+    void end_session(Live& session, const std::string& why, std::string_view tag, bool wait = false);
     void tick();
     /// Writes the sessions down so that they outlive this process.
     void remember_sessions();
@@ -523,6 +553,8 @@ struct Daemon::Impl {
     SessionView session_view;
     /// Where the sessions are written down, so a restart can pick them up.
     std::filesystem::path session_table;
+    Metrics metrics;
+    std::unique_ptr<MetricsServer> metrics_server;
     std::map<std::uint64_t, std::uint64_t> seat_questions;  ///< connection -> cookie
     std::uint64_t next_seat_connection = seat_connection_bit;
     app::ChildLaunch network_launch;
@@ -609,6 +641,13 @@ bool Daemon::Impl::setup()
     agent_listener = std::move(*local);
     session_table = options.state_dir / "sessions";
     recover_sessions();
+    if (config.metrics.listen) {
+        metrics_server = std::make_unique<MetricsServer>(metrics);
+        if (auto started = metrics_server->start(*config.metrics.listen); !started) {
+            log::warn(log_component, "no metrics on {}: {}", *config.metrics.listen, started.error().message());
+            metrics_server.reset();
+        }
+    }
     log::info(log_component, "listening on {}:{} (certificate SHA-256 {}), agents on {}, desktop {}{}",
               config.server.bind, config.server.port, identity->sha256_fingerprint(), socket_path.string(),
               to_string(config.session.desktop), options.no_pam ? ", development mode without PAM" : "");
@@ -813,7 +852,7 @@ void Daemon::Impl::read_agent(Live& session)
     while (true) {
         auto frame = next_frame(session.inbox);
         if (!frame) {
-            end_session(session, "its agent sent a bad frame");
+            end_session(session, "its agent sent a bad frame", "bad_frame");
             return;
         }
         if (!*frame) {
@@ -822,7 +861,7 @@ void Daemon::Impl::read_agent(Live& session)
         auto message = session.link->receive(**frame, false);
         if (!message) {
             log::warn(log_component, "session {}: agent misbehaved: {}", session.id, message.error().message());
-            end_session(session, "its agent misbehaved");
+            end_session(session, "its agent misbehaved", "agent_misbehaved");
             return;
         }
         if (const auto* d = std::get_if<broker::Disconnect>(&*message)) {
@@ -855,10 +894,11 @@ void Daemon::Impl::read_agent(Live& session)
                 next_connection = std::max(next_connection, stats->connection_id + 1);
             }
             registry.update_idle(session.id, stats->connection_id, stats->idle_seconds);
+            session.stats = *stats;
         }
     }
     if (!open) {
-        end_session(session, "its agent is gone");
+        end_session(session, "its agent is gone", "agent_gone");
     }
 }
 
@@ -959,6 +999,7 @@ void Daemon::Impl::start_session(Authenticated client, const std::string& accoun
     const auto& config = options.config;
     auto session = std::make_unique<Live>();
     session->id = registry.create(account, attach, Clock::now());
+    metrics.session_started();
     session->account = account;
     session->user = user;
     session->created = Clock::now();
@@ -1031,7 +1072,7 @@ void Daemon::Impl::start_session(Authenticated client, const std::string& accoun
     if (!started) {
         Live& s = *session;
         live.push_back(std::move(session));
-        end_session(s, "its agent could not be started");
+        end_session(s, "its agent could not be started", "start_failed");
         return;
     }
     session->process = *started;
@@ -1052,7 +1093,7 @@ void Daemon::Impl::handle(Launched launched)
     }
     session->login_session = launched.login_session;
     if (!launched.ok) {
-        end_session(*session, "its agent could not be started in the user's session");
+        end_session(*session, "its agent could not be started in the user's session", "start_failed");
         return;
     }
     log::info(log_component, "session {}: agent unit {} started in login session {}", session->id, session->unit,
@@ -1239,6 +1280,7 @@ void Daemon::Impl::hand_over(Live& session, Authenticated client)
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - client.accepted).count();
     message.elapsed_ms = static_cast<std::uint32_t>(std::clamp<std::int64_t>(elapsed, 0, 3'600'000));
     if (send_to(session, message, client.plain.get())) {
+        metrics.connection();
         session.peer = client.peer;
         log::info(log_component, "{}: connection {} goes to session {} of {}", client.peer, client.id, session.id,
                   session.account);
@@ -1248,6 +1290,7 @@ void Daemon::Impl::hand_over(Live& session, Authenticated client)
 void Daemon::Impl::refuse(Authenticated client, std::uint32_t error_info, const std::string& reason)
 {
     log::warn(log_component, "{}: refused: {}", client.peer, reason);
+    metrics.connection_refused(errinfo_name(error_info));
     // A sandboxed process takes the client as far as Set Error Info can go.
     const std::vector<std::string> args{options.self.string(), "--refuse-child",
                                         "--error-info",        std::to_string(error_info),
@@ -1274,7 +1317,7 @@ void Daemon::Impl::refuse(Authenticated client, std::uint32_t error_info, const 
     }
 }
 
-void Daemon::Impl::end_session(Live& session, const std::string& why, bool wait)
+void Daemon::Impl::end_session(Live& session, const std::string& why, std::string_view tag, bool wait)
 {
     log::info(log_component, "session {} of {}: cleaning up, {}", session.id, session.account, why);
     if (session.waiting) {
@@ -1308,6 +1351,7 @@ void Daemon::Impl::end_session(Live& session, const std::string& why, bool wait)
     } else if (teardown) {
         std::thread(std::move(teardown)).detach();
     }
+    metrics.session_ended(session.end_tag.empty() ? std::string(tag) : session.end_tag);
     registry.remove(session.id);
     const std::uint32_t id = session.id;
     std::erase_if(live, [id](const auto& s) { return s->id == id; });
@@ -1320,7 +1364,7 @@ bool Daemon::Impl::send_to(Live& session, const broker::Message& message, int fd
 {
     if (auto sent = app::send_message(session.agent.get(), broker::encode(message), fd, agent_send_timeout_ms); !sent) {
         log::warn(log_component, "session {}: cannot reach its agent: {}", session.id, sent.error().message());
-        end_session(session, "its agent does not answer");
+        end_session(session, "its agent does not answer", "agent_unreachable");
         return false;
     }
     return true;
@@ -1449,6 +1493,7 @@ void Daemon::Impl::tick()
         log::info(log_component, "session {} of {}: ending it, asked through the control API", session->id,
                   session->account);
         session->terminate_sent = now;
+        session->end_tag = "requested";
         static_cast<void>(send_to(*session, broker::Terminate{broker::EndReason::terminated}));
         registry.set_ending(session->id);
     }
@@ -1469,6 +1514,7 @@ void Daemon::Impl::tick()
             log::info(log_component, "session {} of {}: nobody reconnected within {} s, ending it", session->id,
                       session->account, options.config.policy.disconnected_timeout.count());
             session->terminate_sent = now;
+            session->end_tag = "disconnected_timeout";
             static_cast<void>(send_to(*session, broker::Terminate{broker::EndReason::disconnected_timeout}));
         }
     }
@@ -1479,10 +1525,37 @@ void Daemon::Impl::tick()
             s->reattach_deadline.reset();
             log::info(log_component, "session {} of {}: its agent did not come back after the restart", s->id,
                       s->account);
-            end_session(*s, "the agent did not come back after the restart");
+            end_session(*s, "the agent did not come back after the restart", "not_reattached");
         }
     }
     session_view.publish(describe_sessions(now));
+    if (metrics_server) {
+        std::vector<SessionMetrics> figures;
+        figures.reserve(live.size());
+        for (const auto& s : live) {
+            const auto* state = registry.find(s->id);
+            if (state == nullptr) {
+                continue;
+            }
+            SessionMetrics m;
+            m.id = s->id;
+            m.account = s->account;
+            m.state = state->state == SessionRegistry::State::starting  ? "starting"
+                      : state->state == SessionRegistry::State::running ? "running"
+                                                                        : "ending";
+            m.connected = state->connection != 0;
+            m.uptime_seconds = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::seconds>(now - s->created).count()));
+            m.idle_seconds = state->idle_seconds;
+            m.frames_sent = s->stats.frames_sent;
+            m.bytes_sent = s->stats.bytes_sent;
+            m.bytes_received = s->stats.bytes_received;
+            m.rtt_ms = s->stats.rtt_ms;
+            m.bandwidth_kbps = s->stats.bandwidth_kbps;
+            figures.push_back(std::move(m));
+        }
+        metrics.publish(std::move(figures));
+    }
     std::vector<std::uint32_t> overdue;
     for (auto& s : live) {
         if (s->process > 0) {
@@ -1502,7 +1575,8 @@ void Daemon::Impl::tick()
     }
     for (const std::uint32_t id : overdue) {
         if (Live* session = find(id)) {
-            end_session(*session, session->link ? "its agent did not end in time" : "its agent did not start");
+            end_session(*session, session->link ? "its agent did not end in time" : "its agent did not start",
+                        session->link ? "end_timeout" : "start_timeout");
         }
     }
     std::erase_if(orphans, [](pid_t pid) {
@@ -1544,7 +1618,8 @@ void Daemon::Impl::shutdown()
     for (const std::uint32_t id : unstarted) {
         if (Live* s = find(id)) {
             s->terminate_sent = now;
-            end_session(*s, "farlandd stops", true);
+            s->end_tag = "shutdown";
+            end_session(*s, "farlandd stops", "shutdown", true);
         }
     }
     // Wait only for the ones that are ending. A session that is staying is
@@ -1574,7 +1649,7 @@ void Daemon::Impl::shutdown()
     }
     for (std::size_t i = live.size(); i-- > 0;) {
         if (live[i]->terminate_sent) {
-            end_session(*live[i], "farlandd stops", true);
+            end_session(*live[i], "farlandd stops", "shutdown", true);
         }
     }
     mailbox->close();

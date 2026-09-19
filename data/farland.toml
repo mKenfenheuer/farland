@@ -173,6 +173,14 @@ on_local_session = "separate"
 # uncompressed formats are taken, which is what a client converts to.
 # enabled = true
 
+[metrics]
+# Serve the Prometheus metrics on this address: how many sessions there are
+# and what they are doing, and per session the frames, bytes, round trip and
+# measured bandwidth its agent reports. Unset serves none, which is the
+# default: it is a listening socket in a process running as root, so it is
+# opened on purpose or not at all. Only GET /metrics is answered.
+# listen = "127.0.0.1:9128"
+
 [clipboard]
 # Copy text, HTML, images and files between the client and the desktop
 # (cliprdr), where the desktop has a clipboard. Data is transferred only
