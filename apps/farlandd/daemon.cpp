@@ -90,6 +90,13 @@ constexpr int max_preauth_clients = 64;
 constexpr auto start_timeout = std::chrono::seconds(90);
 /// How long an agent may take to end after Terminate.
 constexpr auto terminate_grace = std::chrono::seconds(15);
+/// How long an agent may say nothing before its session is given up on. The
+/// agent sends Stats every five seconds whatever else is happening, so this
+/// is six missed heartbeats and not a quiet desktop. A session whose agent
+/// has stopped answering is worse than no session: every reconnection is
+/// handed to it, waits out the takeover prompt nobody will answer, and ends
+/// up on a desktop that is not there.
+constexpr auto agent_silence_limit = std::chrono::seconds(30);
 constexpr auto hello_timeout = std::chrono::seconds(10);
 /// A question about somebody logging in at the machine runs under a
 /// connection id of its own, above every id a client will ever have
@@ -240,6 +247,10 @@ struct Live {
     std::string peer;
     /// The agent's last Stats, for the metrics.
     broker::Stats stats;
+    /// When the agent last said anything. It sends Stats every few seconds
+    /// whether or not anything is happening, so silence is not quiet: it is
+    /// an agent that has stopped running.
+    Clock::time_point last_heard;
     /// The token the agent greets with again after a farlandd restart. The
     /// greeting copy is wiped once used; this one lives as long as the
     /// session, and is what the written-down table holds.
@@ -838,6 +849,10 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
         s->inbox = std::move(peer.inbox);
         const bool returning = s->reattach_deadline.has_value();
         s->reattach_deadline.reset();
+        // The heartbeat starts here: before the greeting there is nothing to
+        // have heard, and a session still starting is start_timeout's to
+        // worry about.
+        s->last_heard = Clock::now();
         registry.set_running(s->id);
         log::info(log_component, "session {}: agent {} of {} is {}", s->id,
                   peer.pid ? std::to_string(*peer.pid) : std::string("?"), s->account,
@@ -876,6 +891,7 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
 void Daemon::Impl::read_agent(Live& session)
 {
     const bool open = read_available(session.agent.get(), session.inbox);
+    session.last_heard = Clock::now();
     while (true) {
         auto frame = next_frame(session.inbox);
         if (!frame) {
@@ -1553,6 +1569,23 @@ void Daemon::Impl::tick()
             log::info(log_component, "session {} of {}: its agent did not come back after the restart", s->id,
                       s->account);
             end_session(*s, "the agent did not come back after the restart", "not_reattached");
+        }
+    }
+    // An agent that has gone quiet. Its socket is still open -- the process
+    // is there, it just is not running -- so nothing else notices, and a
+    // client handed to it sees a desktop that never paints.
+    std::vector<std::uint32_t> silent;
+    for (const auto& s : live) {
+        if (s->link && !s->terminate_sent && !s->reattach_deadline && s->last_heard != Clock::time_point{} &&
+            now - s->last_heard > agent_silence_limit) {
+            silent.push_back(s->id);
+        }
+    }
+    for (const std::uint32_t id : silent) {
+        if (Live* s = find(id)) {
+            log::warn(log_component, "session {} of {}: its agent has said nothing for {} s, ending it", s->id,
+                      s->account, std::chrono::duration_cast<std::chrono::seconds>(now - s->last_heard).count());
+            end_session(*s, "its agent stopped answering", "agent_silent");
         }
     }
     session_view.publish(describe_sessions(now));

@@ -63,8 +63,8 @@ LogindResult<std::string> our_session_path(sd_bus* bus)
     portal::detail::BusError error;
     sd_bus_message* reply = nullptr;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): sd-bus's typed call
-    const int r = sd_bus_call_method(bus, login1_service, "/org/freedesktop/login1",
-                                     "org.freedesktop.login1.Manager", "GetSession", error.get(), &reply, "s", id);
+    const int r = sd_bus_call_method(bus, login1_service, "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                     "GetSession", error.get(), &reply, "s", id);
     const portal::detail::MessagePtr owned(reply);
     if (r < 0) {
         return display_session_path(bus);
@@ -150,8 +150,8 @@ LogindResult<void> activate_user_session()
     }
     // Activate asks logind to bring it to the seat; where that is not enough
     // (GNOME 50 on some systems), the seat's own VT switch is.
-    static_cast<void>(sd_bus_call_method(raw, login1_service, path.c_str(), session_interface, "Activate", error.get(),
-                                         nullptr, ""));
+    static_cast<void>(
+        sd_bus_call_method(raw, login1_service, path.c_str(), session_interface, "Activate", error.get(), nullptr, ""));
     for (int attempt = 0; attempt < 2; ++attempt) {
         for (int i = 0; i < 20 && !session_flag(raw, path, "Active"); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -170,33 +170,43 @@ LogindResult<void> activate_user_session()
 
 namespace {
 
-/// A greeter already on `seat_path`, if there is one: its logind object
-/// path. Every display manager leaves the login screen running as a session
-/// of class "greeter" on the seat.
-std::string greeter_on_seat(sd_bus* bus, const std::string& seat_path)
+/// The login screen already running on a seat, if there is one: its logind
+/// object path. Every display manager leaves it as a session of class
+/// "greeter", and it is the thing to switch to rather than make another of.
+///
+/// This asks logind for every session rather than for one seat's, because
+/// nobody here has a seat to ask about: farlandd is a system service with
+/// no logind session at all, and an agent's session is deliberately on no
+/// seat (headless, Remote=yes). Looking the seat up from "our" session
+/// found nothing, every time, and the caller then created a greeter --
+/// which is how a machine ends up with five of them and stops answering.
+std::string greeter_session(sd_bus* bus)
 {
-    if (seat_path.empty()) {
-        return {};
-    }
     portal::detail::BusError error;
     sd_bus_message* reply = nullptr;
-    const int r = sd_bus_get_property(bus, login1_service, seat_path.c_str(), "org.freedesktop.login1.Seat", "Sessions",
-                                      error.get(), &reply, "a(so)");
+    // ListSessions: a(susso) of id, uid, user name, seat, object path.
+    const int r = sd_bus_call_method(bus, login1_service, "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                     "ListSessions", error.get(), &reply, "");
     const portal::detail::MessagePtr owned(reply);
     if (r < 0) {
         return {};
     }
     MessageReader reader(owned.get());
-    if (!reader.enter('a', "(so)")) {
+    if (!reader.enter('a', "(susso)")) {
         return {};
     }
     std::string found;
-    while (found.empty() && reader.enter('r', "so")) {
+    while (found.empty() && reader.enter('r', "susso")) {
         std::string id;
+        std::uint32_t uid = 0;
+        std::string user;
+        std::string seat;
         std::string path;
-        const bool read = reader.string(id) && reader.string(path);
+        const bool read =
+            reader.string(id) && reader.u32(uid) && reader.string(user) && reader.string(seat) && reader.string(path);
         static_cast<void>(reader.exit());
-        if (!read || path.empty()) {
+        // A greeter that is on no seat draws nothing and is no use here.
+        if (!read || path.empty() || seat.empty()) {
             continue;
         }
         portal::detail::BusError class_error;
@@ -229,11 +239,7 @@ LogindResult<void> switch_seat_to_greeter()
     // makes another one every time it is called: four calls leave four
     // greeters, each with a GNOME Shell of its own, until the machine stops
     // answering. Switch to the one that exists instead.
-    std::string seat_path;
-    if (const auto path = our_session_path(raw); path) {
-        seat_path = seat_path_of(raw, *path);
-    }
-    if (const std::string greeter = greeter_on_seat(raw, seat_path); !greeter.empty()) {
+    if (const std::string greeter = greeter_session(raw); !greeter.empty()) {
         portal::detail::BusError error;
         sd_bus_message* reply = nullptr;
         const int r = sd_bus_call_method(raw, login1_service, greeter.c_str(), session_interface, "Activate",
@@ -256,18 +262,22 @@ LogindResult<void> switch_seat_to_greeter()
     if (gdm >= 0) {
         return {};
     }
-    log::debug(log_component, "no greeter from GDM: {}", gdm_error.get()->message != nullptr ? gdm_error.get()->message
-                                                                                            : std::strerror(-gdm));
+    log::debug(log_component, "no greeter from GDM: {}",
+               gdm_error.get()->message != nullptr ? gdm_error.get()->message : std::strerror(-gdm));
     // SDDM and LightDM: the seat object of the seat this session is on.
+    std::string seat_path;
+    if (const auto path = our_session_path(raw); path) {
+        seat_path = seat_path_of(raw, *path);
+    }
     std::string seat = display_manager_seat(seat_path);
     if (seat.empty()) {
         seat = "/org/freedesktop/DisplayManager/Seat0";
     }
     portal::detail::BusError error;
     sd_bus_message* dm_reply = nullptr;
-    const int r = sd_bus_call_method(raw, "org.freedesktop.DisplayManager", seat.c_str(),
-                                     "org.freedesktop.DisplayManager.Seat", "SwitchToGreeter", error.get(), &dm_reply,
-                                     "");
+    const int r =
+        sd_bus_call_method(raw, "org.freedesktop.DisplayManager", seat.c_str(), "org.freedesktop.DisplayManager.Seat",
+                           "SwitchToGreeter", error.get(), &dm_reply, "");
     const portal::detail::MessagePtr dm_owned(dm_reply);
     if (r < 0) {
         return portal::detail::fail_call("SwitchToGreeter", error.get(), r);
