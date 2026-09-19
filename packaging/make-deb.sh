@@ -32,9 +32,13 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT INT TERM
 
 DESTDIR="$stage" meson install -C "$build" --quiet
-# The daemon reads /etc/farland/farland.toml; meson installs it as an
-# example, because a plain `meson install` must not overwrite a live one.
-install -D -m 0644 "$source_dir/data/farland.toml" "$stage/etc/farland/farland.toml"
+# The daemon reads /etc/farland/farland.toml. The package ships the
+# reference next to the documentation rather than into /etc, and postinst
+# copies it in the first time: as a conffile it would change with every
+# release that documents a new key, and dpkg then stops to ask -- which on a
+# non-interactive upgrade fails the whole package and leaves it unconfigured,
+# with the new binaries in place and postinst never run.
+install -D -m 0644 "$source_dir/data/farland.toml" "$stage/usr/share/doc/farland/farland.toml"
 
 # Only farland's own files: a build with tests also installs Catch2's
 # headers, library and pkg-config files from the subproject.
@@ -67,6 +71,7 @@ depends=$(cd "$stage" && dpkg-shlibdeps -O --ignore-missing-info $binaries 2>/de
 rm -rf "$stage/debian"
 [ -n "$depends" ] || depends='libc6'
 
+# /etc/farland/farland.toml is deliberately not here; see above.
 find "$stage/etc" -type f | sed "s|^$stage||" > "$stage/DEBIAN/conffiles"
 size=$(du -ks "$stage" | cut -f1)
 
@@ -98,6 +103,14 @@ set -e
 if [ "$1" = configure ]; then
     mkdir -p /var/lib/farland
     chmod 0700 /var/lib/farland
+    # The administrator's file, created once and never touched again. The
+    # reference with every key and its default stays in
+    # /usr/share/doc/farland/farland.toml.
+    if [ ! -e /etc/farland/farland.toml ]; then
+        mkdir -p /etc/farland
+        cp /usr/share/doc/farland/farland.toml /etc/farland/farland.toml
+        chmod 0644 /etc/farland/farland.toml
+    fi
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload || true
         # The service is the point of the package: headless multi-user
@@ -126,8 +139,14 @@ cat > "$stage/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
 [ ! -d /run/systemd/system ] || systemctl daemon-reload || true
-# The certificate, the credential store and the sessions' state.
-[ "$1" != purge ] || rm -rf /var/lib/farland
+# The certificate, the credential store and the sessions' state, and the
+# configuration postinst created (dpkg does not track it as a conffile, so
+# nothing else would remove it).
+if [ "$1" = purge ]; then
+    rm -rf /var/lib/farland
+    rm -f /etc/farland/farland.toml
+    rmdir /etc/farland 2>/dev/null || true
+fi
 EOF
 
 chmod 0755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"

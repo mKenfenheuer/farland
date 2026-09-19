@@ -270,6 +270,11 @@ int ControlService::Impl::terminate_session(sd_bus_message* m, void* data, sd_bu
         return it != known.end() ? it->account : std::string();
     };
     const std::string target = id != 0 ? owner(id) : wanted;
+    if (id != 0 && target.empty()) {
+        // No session of that id, which is what every caller is told: there
+        // is nothing to be allowed or refused.
+        return sd_bus_reply_method_return(m, "u", std::uint32_t{0});
+    }
     if (caller.empty() || target.empty() || target != caller) {
         if (!self->authorized(m, error, sessions_action)) {
             return sd_bus_error_set(error, "org.farland.Farland1.Error.NotAllowed",
