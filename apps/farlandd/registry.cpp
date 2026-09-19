@@ -58,6 +58,22 @@ std::uint32_t SessionRegistry::create(std::string account, bool attached, Clock:
     return sessions_.back().id;
 }
 
+void SessionRegistry::restore(std::uint32_t id, std::string account, bool attached, Clock::time_point now)
+{
+    if (id == 0 || find(id) != nullptr) {
+        return;
+    }
+    Session session;
+    session.id = id;
+    session.account = std::move(account);
+    session.attached = attached;
+    session.disconnected_since = now;
+    sessions_.push_back(std::move(session));
+    // Ids never come round again, so a session created later cannot collide
+    // with one that survived the restart.
+    next_id_ = std::max(next_id_, id + 1);
+}
+
 void SessionRegistry::set_running(std::uint32_t session)
 {
     if (auto* s = get(session); s != nullptr && s->state == State::starting) {
@@ -95,6 +111,17 @@ void SessionRegistry::update_idle(std::uint32_t session, std::uint64_t connectio
     if (auto* s = get(session); s != nullptr && s->connection == connection && connection != 0) {
         s->idle_seconds = idle_seconds;
     }
+}
+
+void SessionRegistry::adopt_connection(std::uint32_t session, std::uint64_t connection)
+{
+    auto* s = get(session);
+    if (s == nullptr || connection == 0 || s->connection != 0) {
+        return;
+    }
+    s->connection = connection;
+    s->disconnected_since.reset();
+    s->idle_disconnect_sent = false;
 }
 
 void SessionRegistry::set_ending(std::uint32_t session)

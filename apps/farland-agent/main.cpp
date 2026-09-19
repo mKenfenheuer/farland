@@ -210,6 +210,7 @@ int main(int argc, char** argv)
     farland::agent::AgentConfig config;
     try {
         config.daemon = connect_to(options.socket);
+        config.socket_path = options.socket;
     } catch (const std::exception& e) {
         std::cerr << "farland-agent: " << e.what() << "\n";
         return 1;

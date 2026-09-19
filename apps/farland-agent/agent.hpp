@@ -62,6 +62,10 @@ using DesktopFactory = std::function<Result<std::unique_ptr<app::Desktop>>(const
 struct AgentConfig {
     /// Connected to farlandd's agent socket.
     UniqueFd daemon;
+    /// That socket's path, so that the agent can find the next farlandd
+    /// after this one goes away (a restart, which every package upgrade
+    /// does). Empty: the session ends with farlandd, as it used to.
+    std::string socket_path;
     server::broker::Token token{};
     /// The session's number at farlandd; the logon id of its auto-reconnect
     /// cookies ([MS-RDPBCGR] 2.2.4.2).
@@ -72,6 +76,10 @@ struct AgentConfig {
     /// the first connection, replaces these with /etc/farland/farland.toml.
     app::SessionOptions session;
     std::chrono::milliseconds stats_period{5000};
+    /// How long to keep the desktop and its client while looking for
+    /// farlandd again. farlandd waits as long for the agent, so whichever
+    /// gives up first ends the session cleanly.
+    std::chrono::seconds reattach_timeout{120};
     /// Asks the person using the session whether a new connection may take
     /// it over ([policy] takeover); unset: a desktop notification.
     ConsentAsker ask_consent;
@@ -117,6 +125,11 @@ private:
     /// Joins a finished (or stopping) connection and reports it to farlandd.
     void join_connection();
     void send_stats();
+    /// farlandd went away. Keeps the desktop and whatever client is
+    /// connected, and looks for the socket to come back until
+    /// `reattach_timeout`; true when a new farlandd took the greeting.
+    /// False ends the session, as losing farlandd always used to.
+    [[nodiscard]] bool reattach(const std::atomic<bool>& stop);
     server::broker::EndReason finish(server::broker::EndReason reason, std::string detail);
 
     AgentConfig config_;

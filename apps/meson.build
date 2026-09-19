@@ -183,6 +183,7 @@ farland_daemon_lib = static_library(
   'farlandd/launcher.cpp',
   'farlandd/logind.cpp',
   'farlandd/registry.cpp',
+  'farlandd/session_store.cpp',
   'farlandd/session_view.cpp',
   'farlandd/seat_takeover.cpp',
   dependencies: daemon_deps,

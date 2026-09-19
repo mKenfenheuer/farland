@@ -24,6 +24,7 @@
 #include "registry.hpp"
 #include "sandbox.hpp"
 #include "seat_takeover.hpp"
+#include "session_store.hpp"
 #include "session_view.hpp"
 #include "transport.hpp"
 #include "unix_socket.hpp"
@@ -69,6 +70,10 @@ constexpr auto hello_timeout = std::chrono::seconds(10);
 /// connection id of its own, above every id a client will ever have
 /// ([policy] seat_takeover).
 constexpr std::uint64_t seat_connection_bit = std::uint64_t{1} << 63;
+/// How long a session that outlived a restart waits for its agent to come
+/// back before it is given up. The agent tries for as long (agent.cpp), so
+/// whichever notices first ends it cleanly.
+constexpr auto reattach_window = std::chrono::seconds(120);
 
 /// How long an agent may keep farlandd waiting to take a message.
 constexpr int agent_send_timeout_ms = 5000;
@@ -208,6 +213,13 @@ struct Live {
     Clock::time_point created;
     /// The address of the client connected now, for `farlandctl sessions`.
     std::string peer;
+    /// The token the agent greets with again after a farlandd restart. The
+    /// greeting copy is wiped once used; this one lives as long as the
+    /// session, and is what the written-down table holds.
+    broker::Token reattach_token{};
+    /// It outlived a farlandd restart and its agent has not come back yet;
+    /// after this it is given up for lost.
+    std::optional<Clock::time_point> reattach_deadline;
     std::optional<Clock::time_point> terminate_sent;
 
     Live() = default;
@@ -489,6 +501,11 @@ struct Daemon::Impl {
     /// when no detached thread would outlive the process).
     void end_session(Live& session, const std::string& why, bool wait = false);
     void tick();
+    /// Writes the sessions down so that they outlive this process.
+    void remember_sessions();
+    /// Picks up the sessions of a farlandd that went away, whose agents are
+    /// still running; they reconnect and greet with the token they kept.
+    void recover_sessions();
     [[nodiscard]] std::vector<SessionView::Entry> describe_sessions(Clock::time_point now) const;
     void shutdown();
     [[nodiscard]] bool send_to(Live& session, const broker::Message& message, int fd = -1);
@@ -504,6 +521,8 @@ struct Daemon::Impl {
     SeatTakeoverGate seat_gate;
     /// What `farlandctl sessions` and `farlandctl terminate` see and ask for.
     SessionView session_view;
+    /// Where the sessions are written down, so a restart can pick them up.
+    std::filesystem::path session_table;
     std::map<std::uint64_t, std::uint64_t> seat_questions;  ///< connection -> cookie
     std::uint64_t next_seat_connection = seat_connection_bit;
     app::ChildLaunch network_launch;
@@ -588,6 +607,8 @@ bool Daemon::Impl::setup()
         return false;
     }
     agent_listener = std::move(*local);
+    session_table = options.state_dir / "sessions";
+    recover_sessions();
     log::info(log_component, "listening on {}:{} (certificate SHA-256 {}), agents on {}, desktop {}{}",
               config.server.bind, config.server.port, identity->sha256_fingerprint(), socket_path.string(),
               to_string(config.session.desktop), options.no_pam ? ", development mode without PAM" : "");
@@ -739,6 +760,7 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
         if (s->link || s->terminate_sent || peer.uid != expected || !tokens_equal(hello->token, s->token)) {
             continue;
         }
+        s->reattach_token = s->token;
         s->link = std::make_unique<broker::AgentLink>(s->token);
         if (auto accepted = s->link->receive(**frame, false); !accepted) {
             log::warn(log_component, "session {}: agent hello refused: {}", s->id, accepted.error().message());
@@ -748,9 +770,13 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
         secure_zero(s->token);
         s->agent = std::move(peer.fd);
         s->inbox = std::move(peer.inbox);
+        const bool returning = s->reattach_deadline.has_value();
+        s->reattach_deadline.reset();
         registry.set_running(s->id);
-        log::info(log_component, "session {}: agent {} of {} is ready", s->id,
-                  peer.pid ? std::to_string(*peer.pid) : std::string("?"), s->account);
+        log::info(log_component, "session {}: agent {} of {} is {}", s->id,
+                  peer.pid ? std::to_string(*peer.pid) : std::string("?"), s->account,
+                  returning ? "back after the restart" : "ready");
+        remember_sessions();
         // Before any connection: the agent applies it before it starts the
         // desktop, and it does not read /etc itself.
         if (!send_to(*s, settings)) {
@@ -772,7 +798,13 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
         }
         return;
     }
-    log::warn(log_component, "agent hello from uid {} matches no starting session", peer.uid);
+    // Usually an agent of a session that is gone: farlandd was away long
+    // enough for it to be given up, or it was ended while farlandd was down.
+    // Say so, or the agent keeps its desktop and tries again every half
+    // second until its own timeout runs out.
+    log::info(log_component, "agent hello from uid {} matches no session of ours; telling it to stop", peer.uid);
+    static_cast<void>(app::send_message(peer.fd.get(), broker::encode(broker::Terminate{broker::EndReason::terminated}),
+                                        -1, agent_send_timeout_ms));
 }
 
 void Daemon::Impl::read_agent(Live& session)
@@ -815,6 +847,13 @@ void Daemon::Impl::read_agent(Live& session)
             log::info(log_component, "session {} of {} ended: {}", session.id, session.account, ended->detail);
             registry.set_ending(session.id);
         } else if (const auto* stats = std::get_if<broker::Stats>(&*message)) {
+            if (stats->connection_id != 0) {
+                // After a restart the agent still has its client, which this
+                // farlandd never handed over; take its word for it, and keep
+                // later connections from being given the same number.
+                registry.adopt_connection(session.id, stats->connection_id);
+                next_connection = std::max(next_connection, stats->connection_id + 1);
+            }
             registry.update_idle(session.id, stats->connection_id, stats->idle_seconds);
         }
     }
@@ -1272,6 +1311,9 @@ void Daemon::Impl::end_session(Live& session, const std::string& why, bool wait)
     registry.remove(session.id);
     const std::uint32_t id = session.id;
     std::erase_if(live, [id](const auto& s) { return s->id == id; });
+    if (!shutting_down) {
+        remember_sessions();  // it is not coming back
+    }
 }
 
 bool Daemon::Impl::send_to(Live& session, const broker::Message& message, int fd)
@@ -1282,6 +1324,74 @@ bool Daemon::Impl::send_to(Live& session, const broker::Message& message, int fd
         return false;
     }
     return true;
+}
+
+void Daemon::Impl::remember_sessions()
+{
+    std::vector<StoredSession> stored;
+    stored.reserve(live.size());
+    for (const auto& s : live) {
+        // A session that is ending, or whose agent never greeted, has
+        // nothing to come back to.
+        if (s->terminate_sent || !s->link) {
+            continue;
+        }
+        StoredSession entry;
+        entry.id = s->id;
+        entry.account = s->account;
+        entry.uid = static_cast<std::uint32_t>(s->user ? s->user->uid : ::getuid());
+        entry.attached = registry.find(s->id) != nullptr && registry.find(s->id)->attached;
+        entry.gdm = s->gdm;
+        entry.login_session = s->login_session;
+        entry.unit = s->unit;
+        entry.token = s->reattach_token;
+        stored.push_back(std::move(entry));
+    }
+    if (auto saved = save_sessions(session_table, stored); !saved) {
+        log::warn(log_component, "cannot write {}: {}; sessions will not survive a restart", session_table.string(),
+                  saved.error().message());
+    }
+}
+
+void Daemon::Impl::recover_sessions()
+{
+    const auto stored = load_sessions(session_table);
+    if (stored.empty()) {
+        return;
+    }
+    const auto now = Clock::now();
+    std::size_t taken = 0;
+    for (const auto& entry : stored) {
+        auto session = std::make_unique<Live>();
+        session->id = entry.id;
+        session->account = entry.account;
+        session->token = entry.token;
+        session->reattach_token = entry.token;
+        session->gdm = entry.gdm;
+        session->login_session = entry.login_session;
+        session->unit = entry.unit;
+        session->created = now;
+        session->reattach_deadline = now + reattach_window;
+        // The uid decides which process may claim it; the account's own
+        // entry may have changed since, so the stored uid is what counts.
+        session->user = lookup_account(entry.account);
+        if (session->user && session->user->uid != entry.uid) {
+            log::warn(log_component, "session {} of {} changed uid while farlandd was away; not picking it up",
+                      entry.id, entry.account);
+            continue;
+        }
+        if (!session->user) {
+            Account account;
+            account.name = entry.account;
+            account.uid = entry.uid;
+            session->user = account;
+        }
+        registry.restore(entry.id, entry.account, entry.attached, now);
+        live.push_back(std::move(session));
+        ++taken;
+    }
+    log::info(log_component, "{} session{} from before the restart; waiting {} s for their agents", taken,
+              taken == 1 ? "" : "s", std::chrono::duration_cast<std::chrono::seconds>(reattach_window).count());
 }
 
 /// What the control API reports, from the registry and the live sessions.
@@ -1362,6 +1472,16 @@ void Daemon::Impl::tick()
             static_cast<void>(send_to(*session, broker::Terminate{broker::EndReason::disconnected_timeout}));
         }
     }
+    // A session from before the restart whose agent never came back: its
+    // process is gone, or too old to speak to us.
+    for (auto& s : live) {
+        if (s->reattach_deadline && now >= *s->reattach_deadline) {
+            s->reattach_deadline.reset();
+            log::info(log_component, "session {} of {}: its agent did not come back after the restart", s->id,
+                      s->account);
+            end_session(*s, "the agent did not come back after the restart");
+        }
+    }
     session_view.publish(describe_sessions(now));
     std::vector<std::uint32_t> overdue;
     for (auto& s : live) {
@@ -1401,48 +1521,61 @@ Live* Daemon::Impl::find(std::uint32_t id)
 void Daemon::Impl::shutdown()
 {
     seat_gate.release_all();
-    log::info(log_component, "shutting down; ending {} session{}", live.size(), live.size() == 1 ? "" : "s");
     shutting_down = true;
     mailbox->stopping = true;
     listener.reset();
     const auto now = Clock::now();
+    // The sessions stay: the agent owns the desktop and the client's socket,
+    // and reconnects to whichever farlandd is here next. Written down first,
+    // because after this the daemon knows nothing.
+    remember_sessions();
+    std::size_t kept = 0;
     std::vector<std::uint32_t> unstarted;
     for (auto& s : live) {
         if (s->link && s->agent.valid()) {
-            s->terminate_sent = now;
-            static_cast<void>(app::send_message(s->agent.get(),
-                                                broker::encode(broker::Terminate{broker::EndReason::terminated}), -1,
-                                                agent_send_timeout_ms));
+            ++kept;
         } else {
+            // Nothing to come back to: no agent ever greeted.
             unstarted.push_back(s->id);
         }
     }
+    log::info(log_component, "shutting down; {} session{} left running for the next farlandd, {} ended", kept,
+              kept == 1 ? "" : "s", unstarted.size());
     for (const std::uint32_t id : unstarted) {
         if (Live* s = find(id)) {
+            s->terminate_sent = now;
             end_session(*s, "farlandd stops", true);
         }
     }
+    // Wait only for the ones that are ending. A session that is staying is
+    // left untouched: closing its socket is all it needs to start looking
+    // for the next farlandd.
+    const auto ending = [this] {
+        return std::ranges::any_of(live, [](const auto& s) { return s->terminate_sent.has_value(); });
+    };
     const auto deadline = Clock::now() + std::chrono::seconds(10);
-    while (!live.empty() && Clock::now() < deadline) {
+    while (ending() && Clock::now() < deadline) {
         std::vector<pollfd> fds;
+        std::vector<std::uint32_t> ids;
         for (const auto& s : live) {
-            fds.push_back(pollfd{s->agent.get(), POLLIN, 0});
-        }
-        ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 250);
-        std::vector<std::uint32_t> ready;
-        for (std::size_t i = 0; i < live.size(); ++i) {
-            if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-                ready.push_back(live[i]->id);
+            if (s->terminate_sent) {
+                fds.push_back(pollfd{s->agent.get(), POLLIN, 0});
+                ids.push_back(s->id);
             }
         }
-        for (const std::uint32_t id : ready) {
-            if (Live* s = find(id)) {
-                read_agent(*s);
+        ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 250);
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                if (Live* s = find(ids[i])) {
+                    read_agent(*s);
+                }
             }
         }
     }
-    while (!live.empty()) {
-        end_session(*live.front(), "farlandd stops", true);
+    for (std::size_t i = live.size(); i-- > 0;) {
+        if (live[i]->terminate_sent) {
+            end_session(*live[i], "farlandd stops", true);
+        }
     }
     mailbox->close();
     agent_listener.reset();

@@ -16,9 +16,16 @@ RuntimeDirectoryMode=0755
 StateDirectory=farland
 StateDirectoryMode=0700
 Restart=on-failure
-# farlandd ends its sessions itself on SIGTERM; the network processes follow.
-# Sessions from PAM live in their own logind scopes.
-KillMode=mixed
+# Only farlandd itself is signalled. Its sessions outlive it on purpose
+# (docs/ROADMAP.md M7): the agent keeps the desktop and reconnects to the
+# next farlandd, and the network process goes on relaying its client's
+# stream meanwhile, so an upgrade does not disconnect anybody. With
+# KillMode=mixed the rest of the cgroup is killed and the client's TLS
+# connection dies with it, even though the session itself would have
+# survived. Nothing is left behind for good: a network process ends with its
+# client or its agent, and an agent that finds no farlandd gives its session
+# up after two minutes.
+KillMode=process
 TimeoutStopSec=30
 
 [Install]

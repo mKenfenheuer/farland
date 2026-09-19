@@ -18,9 +18,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
+#include <optional>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 
 namespace farland::agent {
@@ -293,9 +297,9 @@ void Agent::apply(const broker::Settings& settings)
 
 broker::EndReason Agent::run(const std::atomic<bool>& stop)
 {
-    const bool greeted = send(broker::Hello{broker::protocol_version, config_.token});
-    secure_zero(config_.token);
-    if (!greeted) {
+    // The token is kept, not wiped: it is what the next farlandd recognises
+    // this session by after a restart. It goes in the destructor.
+    if (!send(broker::Hello{broker::protocol_version, config_.token})) {
         return broker::EndReason::error;
     }
     log::info(log_component, "session {}: ready", config_.logon_id);
@@ -316,6 +320,9 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
         const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(next_stats - Clock::now()).count();
         ::poll(fds.data(), static_cast<nfds_t>(fds.size()), static_cast<int>(std::clamp<std::int64_t>(wait, 0, 250)));
 
+        if (daemon_gone_ && !reattach(stop)) {
+            return finish(broker::EndReason::error, "farlandd went away");
+        }
         if ((fds[1].revents & POLLIN) != 0) {
             std::array<char, 16> drain{};
             while (::read(wake_read_.get(), drain.data(), drain.size()) > 0) {
@@ -334,6 +341,9 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
                 app::receive_message(config_.daemon.get(), broker::max_message_size, daemon_message_timeout_ms);
             if (!received || !*received) {
                 daemon_gone_ = true;
+                if (reattach(stop)) {
+                    continue;  // a new farlandd has the session
+                }
                 return finish(broker::EndReason::error, "farlandd closed the connection");
             }
             auto message = broker::decode_from(broker::Sender::daemon, (*received)->frame, (*received)->fd.valid());
@@ -386,6 +396,77 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
             next_stats = Clock::now() + config_.stats_period;
         }
     }
+}
+
+namespace {
+
+/// Connects to farlandd's agent socket, or nothing when it is not there
+/// (which is the usual answer while farlandd is restarting).
+std::optional<UniqueFd> connect_agent_socket(const std::string& path)
+{
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(address.sun_path)) {
+        return std::nullopt;
+    }
+    std::memcpy(static_cast<void*>(address.sun_path), path.data(), path.size());
+    UniqueFd fd(::socket(AF_UNIX, SOCK_STREAM, 0));
+    if (!fd.valid()) {
+        return std::nullopt;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API takes a generic sockaddr
+    if (::connect(fd.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        return std::nullopt;
+    }
+    app::prepare_socket(fd.get());
+    return fd;
+}
+
+}  // namespace
+
+bool Agent::reattach(const std::atomic<bool>& stop)
+{
+    // Nothing to come back to without a desktop, and nowhere to look
+    // without the socket's path (an agent started the old way).
+    if (config_.socket_path.empty() || !desktop_ || config_.reattach_timeout.count() <= 0) {
+        return false;
+    }
+    log::warn(log_component, "session {}: farlandd is gone; keeping the desktop and looking for it for {} s",
+              config_.logon_id, config_.reattach_timeout.count());
+    config_.daemon.reset();
+    const auto deadline = Clock::now() + config_.reattach_timeout;
+    while (!stop.load() && Clock::now() < deadline) {
+        // The session goes on meanwhile: the client's socket is ours, not
+        // farlandd's, so whoever is connected notices nothing.
+        if (current_ && current_->finished.load()) {
+            join_connection();
+        }
+        if (desktop_) {
+            desktop_->dispatch();
+            if (desktop_->closed()) {
+                log::info(log_component, "session {}: the desktop ended while farlandd was away", config_.logon_id);
+                return false;
+            }
+        }
+        if (auto fd = connect_agent_socket(config_.socket_path)) {
+            config_.daemon = std::move(*fd);
+            daemon_gone_ = false;
+            if (send(broker::Hello{broker::protocol_version, config_.token})) {
+                log::info(log_component, "session {}: farlandd is back and has the session again", config_.logon_id);
+                // Whoever is connected has to be reported again: the new
+                // farlandd knows the session but not its connection.
+                if (current_) {
+                    send_stats();
+                }
+                return true;
+            }
+            config_.daemon.reset();
+            daemon_gone_ = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    log::warn(log_component, "session {}: farlandd did not come back", config_.logon_id);
+    return false;
 }
 
 bool Agent::on_new_connection(broker::NewConnection message, UniqueFd fd)

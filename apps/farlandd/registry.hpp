@@ -78,6 +78,10 @@ public:
 
     /// A new session, starting; returns its id (never 0).
     std::uint32_t create(std::string account, bool attached, Clock::time_point now);
+    /// A session that outlived a farlandd restart, with the id it had. Its
+    /// agent has yet to come back, so it starts as `starting` and
+    /// disconnected, like a new one. Ignored when `id` is taken or 0.
+    void restore(std::uint32_t id, std::string account, bool attached, Clock::time_point now);
     /// Its agent greeted farlandd.
     void set_running(std::uint32_t session);
     /// `connection` now goes to `session`; returns the connection it
@@ -89,6 +93,12 @@ public:
     void disconnected(std::uint32_t session, std::uint64_t connection, Clock::time_point now);
     /// The agent's Stats for its current connection.
     void update_idle(std::uint32_t session, std::uint64_t connection, std::uint32_t idle_seconds);
+    /// A connection the registry does not know about, which its agent says
+    /// it is serving: after a farlandd restart the agent still has the
+    /// client, and without this the session would look disconnected and be
+    /// ended by `disconnected_timeout`. Does nothing when the session
+    /// already has a connection.
+    void adopt_connection(std::uint32_t session, std::uint64_t connection);
     void set_ending(std::uint32_t session);
     void remove(std::uint32_t session);
 
