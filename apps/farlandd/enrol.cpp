@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
 #include <optional>
+#include <string>
 #include <thread>
 
 #if defined(FARLAND_HAVE_LIBSYSTEMD) && defined(FARLAND_HAVE_PAM)
@@ -99,7 +101,10 @@ bool check_account_password(const std::string& account, std::string_view passwor
 }
 
 struct ControlService::Impl {
-    Impl(std::filesystem::path store, SeatTakeoverGate* gate) : store_path(std::move(store)), seat(gate) {}
+    Impl(std::filesystem::path store, SeatTakeoverGate* gate, SessionView* view)
+        : store_path(std::move(store)), seat(gate), sessions(view)
+    {
+    }
     ~Impl()
     {
         stop = true;
@@ -120,13 +125,23 @@ struct ControlService::Impl {
     /// login go ahead?
     static int seat_takeover_pending(sd_bus_message* m, void* data, sd_bus_error* error);
     static int await_seat_takeover(sd_bus_message* m, void* data, sd_bus_error* error);
-    [[nodiscard]] bool authorized(sd_bus_message* m, sd_bus_error* error) const;
+    /// farlandctl sessions and farlandctl terminate.
+    static int list_sessions(sd_bus_message* m, void* data, sd_bus_error* error);
+    static int terminate_session(sd_bus_message* m, void* data, sd_bus_error* error);
+    [[nodiscard]] bool authorized(sd_bus_message* m, sd_bus_error* error) const
+    {
+        return authorized(m, error, enrol_action);
+    }
+    [[nodiscard]] bool authorized(sd_bus_message* m, sd_bus_error* error, std::string_view action) const;
+    /// The account the caller is logged in as, empty when it cannot be told.
+    [[nodiscard]] static std::string caller_account(sd_bus_message* m);
     /// Only root asks about a login at the machine: the PAM module runs
     /// there, and an answer of "no" keeps somebody out.
     [[nodiscard]] static bool from_root(sd_bus_message* m);
 
     std::filesystem::path store_path;
     SeatTakeoverGate* seat = nullptr;
+    SessionView* sessions = nullptr;
     sd_bus* bus = nullptr;
     sd_bus_slot* slot = nullptr;
     std::thread thread;
@@ -144,13 +159,22 @@ constexpr sd_bus_vtable control_vtable[] = {  // NOLINT(cppcoreguidelines-avoid-
     SD_BUS_METHOD("SeatTakeoverPending", "s", "bt", ControlService::Impl::seat_takeover_pending, 0),
     // AwaitSeatTakeover(t cookie, u timeout_ms) -> b allowed; waits.
     SD_BUS_METHOD("AwaitSeatTakeover", "tu", "b", ControlService::Impl::await_seat_takeover, 0),
+    // ListSessions() -> a(usssbbsttu): id, account, state, desktop, attached,
+    // connected, peer, age, disconnected, idle. A caller who may not manage
+    // other people's sessions sees only their own.
+    SD_BUS_METHOD("ListSessions", "", "a(usssbbsttu)", ControlService::Impl::list_sessions,
+                  SD_BUS_VTABLE_UNPRIVILEGED),
+    // TerminateSession(u id, s account) -> u ended. One of the two is given:
+    // an id, or an account whose every session ends.
+    SD_BUS_METHOD("TerminateSession", "us", "u", ControlService::Impl::terminate_session,
+                  SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END,
 };
 // clang-format on
 
 }  // namespace
 
-bool ControlService::Impl::authorized(sd_bus_message* m, sd_bus_error* error) const
+bool ControlService::Impl::authorized(sd_bus_message* m, sd_bus_error* error, std::string_view action) const
 {
     // polkit CheckAuthorization(subject, action_id, details, flags, cancellation_id)
     // with the caller's unique bus name as subject; flag 1 allows user
@@ -160,7 +184,7 @@ bool ControlService::Impl::authorized(sd_bus_message* m, sd_bus_error* error) co
     const int rc = sd_bus_call_method(bus, "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
                                       "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization", error, &reply,
                                       "(sa{sv})sa{ss}us", "system-bus-name", 1, "name", "s", sender,
-                                      enrol_action.data(), 0, std::uint32_t{1}, "");
+                                      std::string(action).c_str(), 0, std::uint32_t{1}, "");
     if (rc < 0) {
         sd_bus_message_unref(reply);
         return false;
@@ -171,6 +195,92 @@ bool ControlService::Impl::authorized(sd_bus_message* m, sd_bus_error* error) co
                     sd_bus_message_read(reply, "bb", &is_authorized, &is_challenge) >= 0 && is_authorized != 0;
     sd_bus_message_unref(reply);
     return ok;
+}
+
+std::string ControlService::Impl::caller_account(sd_bus_message* m)
+{
+    sd_bus_creds* creds = nullptr;
+    uid_t uid = 0;
+    const bool have_uid = sd_bus_query_sender_creds(m, SD_BUS_CREDS_EUID | SD_BUS_CREDS_AUGMENT, &creds) >= 0 &&
+                          sd_bus_creds_get_euid(creds, &uid) >= 0;
+    sd_bus_creds_unref(creds);
+    if (!have_uid) {
+        return {};
+    }
+    const passwd* entry = getpwuid(uid);
+    return entry != nullptr && entry->pw_name != nullptr ? std::string(entry->pw_name) : std::string();
+}
+
+int ControlService::Impl::list_sessions(sd_bus_message* m, void* data, sd_bus_error* error)
+{
+    auto* self = static_cast<Impl*>(data);
+    const auto sessions = self->sessions != nullptr ? self->sessions->list() : std::vector<SessionView::Entry>();
+    // Anyone may see their own sessions; anything else needs the action.
+    const std::string caller = caller_account(m);
+    const bool any = self->authorized(m, error, sessions_action);
+    sd_bus_error_free(error);  // a refusal here is not an error, it is a narrower view
+
+    sd_bus_message* reply = nullptr;
+    if (int rc = sd_bus_message_new_method_return(m, &reply); rc < 0) {
+        return rc;
+    }
+    int rc = sd_bus_message_open_container(reply, 'a', "(usssbbsttu)");
+    for (const auto& s : sessions) {
+        if (rc < 0) {
+            break;
+        }
+        if (!any && (caller.empty() || s.account != caller)) {
+            continue;
+        }
+        rc = sd_bus_message_append(reply, "(usssbbsttu)", s.id, s.account.c_str(), s.state.c_str(), s.desktop.c_str(),
+                                   s.attached ? 1 : 0, s.connected ? 1 : 0, s.peer.c_str(), s.age_seconds,
+                                   s.disconnected_seconds, s.idle_seconds);
+    }
+    if (rc >= 0) {
+        rc = sd_bus_message_close_container(reply);
+    }
+    if (rc >= 0) {
+        rc = sd_bus_send(nullptr, reply, nullptr);
+    }
+    sd_bus_message_unref(reply);
+    return rc;
+}
+
+int ControlService::Impl::terminate_session(sd_bus_message* m, void* data, sd_bus_error* error)
+{
+    auto* self = static_cast<Impl*>(data);
+    std::uint32_t id = 0;
+    const char* account = nullptr;
+    if (int rc = sd_bus_message_read(m, "us", &id, &account); rc < 0) {
+        return rc;
+    }
+    const std::string wanted = account != nullptr ? account : "";
+    if (id == 0 && wanted.empty()) {
+        return sd_bus_error_set(error, "org.farland.Farland1.Error.InvalidArgument", "give a session id or an account");
+    }
+    if (self->sessions == nullptr) {
+        return sd_bus_reply_method_return(m, "u", std::uint32_t{0});
+    }
+    // Ending one's own session needs nothing; ending anybody else's needs
+    // the action.
+    const std::string caller = caller_account(m);
+    const auto known = self->sessions->list();
+    const auto owner = [&known](std::uint32_t session) {
+        const auto it = std::ranges::find(known, session, &SessionView::Entry::id);
+        return it != known.end() ? it->account : std::string();
+    };
+    const std::string target = id != 0 ? owner(id) : wanted;
+    if (caller.empty() || target.empty() || target != caller) {
+        if (!self->authorized(m, error, sessions_action)) {
+            return sd_bus_error_set(error, "org.farland.Farland1.Error.NotAllowed",
+                                    "not allowed to end another account's session");
+        }
+    }
+    const std::size_t asked =
+        id != 0 ? (self->sessions->request_terminate(id) ? 1U : 0U) : self->sessions->request_terminate_account(wanted);
+    log::info(log_component, "control: ending {} session(s) for {}", asked,
+              id != 0 ? std::format("id {}", id) : wanted);
+    return sd_bus_reply_method_return(m, "u", static_cast<std::uint32_t>(asked));
 }
 
 bool ControlService::Impl::from_root(sd_bus_message* m)
@@ -265,8 +375,8 @@ int ControlService::Impl::enrol_self(sd_bus_message* m, void* data, sd_bus_error
     return sd_bus_reply_method_return(m, "");
 }
 
-ControlService::ControlService(std::filesystem::path credential_store, SeatTakeoverGate* seat)
-    : impl_(std::make_unique<Impl>(std::move(credential_store), seat))
+ControlService::ControlService(std::filesystem::path credential_store, SeatTakeoverGate* seat, SessionView* sessions)
+    : impl_(std::make_unique<Impl>(std::move(credential_store), seat, sessions))
 {
 }
 
@@ -317,7 +427,8 @@ struct ControlService::Impl {
     std::filesystem::path store;
 };
 
-ControlService::ControlService(std::filesystem::path credential_store, SeatTakeoverGate* /*seat*/)
+ControlService::ControlService(std::filesystem::path credential_store, SeatTakeoverGate* /*seat*/,
+                               SessionView* /*sessions*/)
     : impl_(std::make_unique<Impl>(Impl{std::move(credential_store)}))
 {
 }

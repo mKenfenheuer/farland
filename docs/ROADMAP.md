@@ -417,6 +417,8 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - Auto-reconnect: `server::Connection` passes on the client's ARC cookie and sends Save Session Info. The agent checks the cookie against the session's `arc::Secret` and rotates it on every activation. NLA stays authoritative; a mismatch is logged.
     - Self-enrolment: `farlandctl passwd` calls `org.farland.Farland1.EnrolSelf` on the system bus. farlandd asks polkit (`enrol-self`, auth_self; farlandctl starts pkttyagent), checks the account password with PAM and stores the NT hash with the account.
     - `data/`: `farlandd.service`, the PAM file, the D-Bus and polkit policies, an example `farland.toml`.
+    - `farlandctl sessions` and `farlandctl terminate` (S5): two more methods on the control API, `ListSessions` and `TerminateSession`. The questions arrive on the D-Bus thread and the answers live in the daemon's loop, so a `SessionView` sits between them: the loop publishes a snapshot of its registry after every turn, and a request to end a session waits there until the loop picks it up (no I/O, no clock, tested on its own). Anyone may list and end their **own** sessions; anything else needs the polkit action `org.farland.Farland1.manage-sessions` (auth_admin), and a caller without it sees only their own in the listing rather than an error. `terminate` takes a session id or `--user USER` for every session of an account, and ends them the way a policy timeout does (broker `Terminate`, EndReason `terminated`).
+    - **Upgrading restarts the daemon.** The package used to run only `systemctl enable --now`, which does nothing to a service that is already running: an upgrade left the old `farlandd` talking the broker protocol to new agents on disk. That is silent until the protocol changes, and then every session fails to start with no useful message. `postinst` now runs `try-restart` as well. Sessions still do not survive it (below).
   - Tested:
     - Unit tests for the registry and policies, the launcher's command lines and environments, and self-enrolment's store update.
     - The agent in process against a scripted farlandd: handover, takeover, cookies, Terminate, logout, and the takeover question with an asker of the test's own.
@@ -434,12 +436,14 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
   - Differences from the plan:
     - GDM 50.0 has no `preauthenticated-user` for `CreateRemoteDisplay`: it only starts a greeter there. farlandd uses `CreateUserDisplay`, which logs the user in through `gdm-autologin`.
     - FreeRDP 3.31 does not announce Set Error Info support, so it shows its generic "logged off" message for takeovers, timeouts and refusals, rather than the precise reason.
+  - Fixed after a live run (2026-09-19):
+    - Handing the seat back created a **new greeter every time**. `switch_seat_to_greeter()` called GDM's `CreateTransientDisplay` unconditionally, and GDM makes another transient display on each call: four takeover attempts on the test host left four greeter sessions, each with a GNOME Shell of its own, until Mutter stopped answering D-Bus and every later connection died with "the desktop did not start". It now looks for a session of class `greeter` on the seat and activates that one, and only creates a display when the seat has none.
   - Open:
     - The Plasma and wlroots backends and their live test (S3, S4).
     - `on_local_session = "attach"` live.
     - mstsc and Windows App.
-    - The rest of S5: `farlandctl sessions` and `terminate`, metrics, packaging.
-    - Sessions do not survive a farlandd restart.
+    - The rest of S5: metrics, and packaging beyond the Debian one (rpm, AUR, a container image).
+    - Sessions do not survive a farlandd restart, which now matters more: every package upgrade restarts the daemon and so disconnects everyone.
     - The agent answers the MCS Connect Initial only once its desktop has started, which takes GDM 10–20 s; FreeRDP needs `/timeout`.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)

@@ -7,6 +7,7 @@ unit_test_sources += files(
   'test_consent.cpp',
   'test_daemon_config.cpp',
   'test_launcher.cpp',
+  'test_session_view.cpp',
   'test_registry.cpp',
   'test_seat_takeover.cpp',
   'test_unix_socket.cpp',

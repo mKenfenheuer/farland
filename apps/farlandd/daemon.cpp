@@ -24,6 +24,7 @@
 #include "registry.hpp"
 #include "sandbox.hpp"
 #include "seat_takeover.hpp"
+#include "session_view.hpp"
 #include "transport.hpp"
 #include "unix_socket.hpp"
 
@@ -205,6 +206,8 @@ struct Live {
     /// ([policy] takeover).
     std::optional<Authenticated> asking;
     Clock::time_point created;
+    /// The address of the client connected now, for `farlandctl sessions`.
+    std::string peer;
     std::optional<Clock::time_point> terminate_sent;
 
     Live() = default;
@@ -486,6 +489,7 @@ struct Daemon::Impl {
     /// when no detached thread would outlive the process).
     void end_session(Live& session, const std::string& why, bool wait = false);
     void tick();
+    [[nodiscard]] std::vector<SessionView::Entry> describe_sessions(Clock::time_point now) const;
     void shutdown();
     [[nodiscard]] bool send_to(Live& session, const broker::Message& message, int fd = -1);
     Live* find(std::uint32_t id);
@@ -498,6 +502,8 @@ struct Daemon::Impl {
     /// [policy] seat_takeover: the logins at the machine being asked about,
     /// by the connection id their question runs under.
     SeatTakeoverGate seat_gate;
+    /// What `farlandctl sessions` and `farlandctl terminate` see and ask for.
+    SessionView session_view;
     std::map<std::uint64_t, std::uint64_t> seat_questions;  ///< connection -> cookie
     std::uint64_t next_seat_connection = seat_connection_bit;
     app::ChildLaunch network_launch;
@@ -562,7 +568,7 @@ bool Daemon::Impl::setup()
     preauth.activation_timeout = settings.activation_seconds;
 
     if (!options.no_pam) {
-        control = std::make_unique<ControlService>(config.auth.credential_store, &seat_gate);
+        control = std::make_unique<ControlService>(config.auth.credential_store, &seat_gate, &session_view);
         if (auto started = control->start(); !started) {
             log::warn(log_component, "no self-enrolment over D-Bus: {}", started.error().message());
             control.reset();
@@ -792,6 +798,9 @@ void Daemon::Impl::read_agent(Live& session)
                       d->error_info != 0 ? std::format(" (error info {:#x})", d->error_info) : std::string());
             registry.disconnected(session.id, d->connection_id, Clock::now());
             const auto* state = registry.find(session.id);
+            if (state != nullptr && state->connection == 0) {
+                session.peer.clear();
+            }
             if (state != nullptr && state->connection == 0 && !state->attached) {
                 // Whoever was asked has left; the question falls away.
                 for (auto& resolved : consent.released(session.id)) {
@@ -1191,6 +1200,7 @@ void Daemon::Impl::hand_over(Live& session, Authenticated client)
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - client.accepted).count();
     message.elapsed_ms = static_cast<std::uint32_t>(std::clamp<std::int64_t>(elapsed, 0, 3'600'000));
     if (send_to(session, message, client.plain.get())) {
+        session.peer = client.peer;
         log::info(log_component, "{}: connection {} goes to session {} of {}", client.peer, client.id, session.id,
                   session.account);
     }
@@ -1274,10 +1284,64 @@ bool Daemon::Impl::send_to(Live& session, const broker::Message& message, int fd
     return true;
 }
 
+/// What the control API reports, from the registry and the live sessions.
+std::vector<SessionView::Entry> Daemon::Impl::describe_sessions(Clock::time_point now) const
+{
+    const auto seconds = [](Clock::duration d) {
+        return static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::seconds>(d).count()));
+    };
+    std::vector<SessionView::Entry> out;
+    out.reserve(registry.sessions().size());
+    for (const auto& s : registry.sessions()) {
+        SessionView::Entry entry;
+        entry.id = s.id;
+        entry.account = s.account;
+        switch (s.state) {
+        case SessionRegistry::State::starting:
+            entry.state = "starting";
+            break;
+        case SessionRegistry::State::running:
+            entry.state = "running";
+            break;
+        case SessionRegistry::State::ending:
+            entry.state = "ending";
+            break;
+        }
+        entry.attached = s.attached;
+        entry.connected = s.connection != 0;
+        entry.idle_seconds = s.idle_seconds;
+        entry.disconnected_seconds = s.disconnected_since ? seconds(now - *s.disconnected_since) : 0;
+        entry.desktop = to_string(options.config.session.desktop);
+        for (const auto& l : live) {
+            if (l->id != s.id) {
+                continue;
+            }
+            entry.age_seconds = seconds(now - l->created);
+            entry.peer = l->peer;
+            break;
+        }
+        out.push_back(std::move(entry));
+    }
+    return out;
+}
+
 void Daemon::Impl::tick()
 {
     const auto now = Clock::now();
     ask_the_seat();
+    // Sessions somebody asked to end through the control API.
+    for (const std::uint32_t id : session_view.take_terminations()) {
+        Live* session = find(id);
+        if (session == nullptr) {
+            continue;  // it went away between the snapshot and here
+        }
+        log::info(log_component, "session {} of {}: ending it, asked through the control API", session->id,
+                  session->account);
+        session->terminate_sent = now;
+        static_cast<void>(send_to(*session, broker::Terminate{broker::EndReason::terminated}));
+        registry.set_ending(session->id);
+    }
     for (auto& resolved : consent.due(now)) {
         resolutions.push_back(std::move(resolved));
     }
@@ -1298,6 +1362,7 @@ void Daemon::Impl::tick()
             static_cast<void>(send_to(*session, broker::Terminate{broker::EndReason::disconnected_timeout}));
         }
     }
+    session_view.publish(describe_sessions(now));
     std::vector<std::uint32_t> overdue;
     for (auto& s : live) {
         if (s->process > 0) {

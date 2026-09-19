@@ -168,6 +168,52 @@ LogindResult<void> activate_user_session()
     return fail(PortalErrc::failed, "the session stays off its seat, so the desktop is not drawn");
 }
 
+namespace {
+
+/// A greeter already on `seat_path`, if there is one: its logind object
+/// path. Every display manager leaves the login screen running as a session
+/// of class "greeter" on the seat.
+std::string greeter_on_seat(sd_bus* bus, const std::string& seat_path)
+{
+    if (seat_path.empty()) {
+        return {};
+    }
+    portal::detail::BusError error;
+    sd_bus_message* reply = nullptr;
+    const int r = sd_bus_get_property(bus, login1_service, seat_path.c_str(), "org.freedesktop.login1.Seat", "Sessions",
+                                      error.get(), &reply, "a(so)");
+    const portal::detail::MessagePtr owned(reply);
+    if (r < 0) {
+        return {};
+    }
+    MessageReader reader(owned.get());
+    if (!reader.enter('a', "(so)")) {
+        return {};
+    }
+    std::string found;
+    while (found.empty() && reader.enter('r', "so")) {
+        std::string id;
+        std::string path;
+        const bool read = reader.string(id) && reader.string(path);
+        static_cast<void>(reader.exit());
+        if (!read || path.empty()) {
+            continue;
+        }
+        portal::detail::BusError class_error;
+        char* session_class = nullptr;
+        const int got = sd_bus_get_property_string(bus, login1_service, path.c_str(), session_interface, "Class",
+                                                   class_error.get(), &session_class);
+        if (got >= 0 && session_class != nullptr && std::string_view(session_class) == "greeter") {
+            found = path;
+        }
+        ::free(session_class);  // NOLINT(cppcoreguidelines-no-malloc): sd-bus allocates it
+    }
+    static_cast<void>(reader.exit());
+    return found;
+}
+
+}  // namespace
+
 LogindResult<void> switch_seat_to_greeter()
 {
     // The display manager's factory lives on the system bus; its policy lets
@@ -178,6 +224,29 @@ LogindResult<void> switch_seat_to_greeter()
         return fail(PortalErrc::unavailable, std::format("cannot connect to the system bus: {}", std::strerror(-r)));
     }
     const portal::detail::BusPtr system_bus(raw);
+
+    // A login screen is usually already there, and GDM's CreateTransientDisplay
+    // makes another one every time it is called: four calls leave four
+    // greeters, each with a GNOME Shell of its own, until the machine stops
+    // answering. Switch to the one that exists instead.
+    std::string seat_path;
+    if (const auto path = our_session_path(raw); path) {
+        seat_path = seat_path_of(raw, *path);
+    }
+    if (const std::string greeter = greeter_on_seat(raw, seat_path); !greeter.empty()) {
+        portal::detail::BusError error;
+        sd_bus_message* reply = nullptr;
+        const int r = sd_bus_call_method(raw, login1_service, greeter.c_str(), session_interface, "Activate",
+                                         error.get(), &reply, "");
+        const portal::detail::MessagePtr owned(reply);
+        if (r >= 0) {
+            log::debug(log_component, "the seat already shows a greeter ({}), switching to it", greeter);
+            return {};
+        }
+        log::debug(log_component, "cannot switch to the greeter on the seat: {}",
+                   error.get()->message != nullptr ? error.get()->message : std::strerror(-r));
+    }
+
     portal::detail::BusError gdm_error;
     sd_bus_message* reply = nullptr;
     const int gdm = sd_bus_call_method(raw, "org.gnome.DisplayManager", "/org/gnome/DisplayManager/LocalDisplayFactory",
@@ -190,10 +259,7 @@ LogindResult<void> switch_seat_to_greeter()
     log::debug(log_component, "no greeter from GDM: {}", gdm_error.get()->message != nullptr ? gdm_error.get()->message
                                                                                             : std::strerror(-gdm));
     // SDDM and LightDM: the seat object of the seat this session is on.
-    std::string seat;
-    if (const auto path = our_session_path(raw); path) {
-        seat = display_manager_seat(seat_path_of(raw, *path));
-    }
+    std::string seat = display_manager_seat(seat_path);
     if (seat.empty()) {
         seat = "/org/freedesktop/DisplayManager/Seat0";
     }

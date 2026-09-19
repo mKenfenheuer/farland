@@ -103,6 +103,12 @@ if [ "$1" = configure ]; then
         # The service is the point of the package: headless multi-user
         # sessions on port 3389. Enrol users with farlandctl.
         systemctl enable --now farlandd.service || true
+        # An upgrade leaves the old daemon running beside the new agents on
+        # disk, and the two speak the broker protocol to each other: restart
+        # it so that both ends are this version. Sessions do not survive a
+        # restart yet (docs/ROADMAP.md M7), so this disconnects whoever is
+        # connected -- which an upgrade does anyway, less predictably.
+        systemctl try-restart farlandd.service || true
     fi
 fi
 EOF

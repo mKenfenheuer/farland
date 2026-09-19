@@ -6,6 +6,7 @@
 #include <farland/base/error.hpp>
 
 #include "seat_takeover.hpp"
+#include "session_view.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -31,6 +32,9 @@ inline constexpr std::string_view bus_name = "org.farland.Farland1";
 inline constexpr std::string_view object_path = "/org/farland/Farland1";
 inline constexpr std::string_view interface_name = "org.farland.Farland1";
 inline constexpr std::string_view enrol_action = "org.farland.Farland1.enrol-self";
+/// Listing and ending sessions: a user may see and end their own, and an
+/// administrator anybody's (org.farland.Farland1.policy).
+inline constexpr std::string_view sessions_action = "org.farland.Farland1.manage-sessions";
 /// The longest a login at the machine is ever held while the client that
 /// has the session is asked ([policy] seat_takeover), whatever the caller
 /// asks for: nobody waits at a login screen for farland.
@@ -50,8 +54,10 @@ inline constexpr std::chrono::seconds max_seat_takeover_wait{300};
 class ControlService {
 public:
     /// `seat`: the gate the display manager's PAM module asks through;
-    /// null leaves those methods answering "nothing holds it".
-    ControlService(std::filesystem::path credential_store, SeatTakeoverGate* seat);
+    /// null leaves those methods answering "nothing holds it". `sessions`:
+    /// what ListSessions and TerminateSession work on; null leaves them
+    /// answering with nothing.
+    ControlService(std::filesystem::path credential_store, SeatTakeoverGate* seat, SessionView* sessions = nullptr);
     ControlService(const ControlService&) = delete;
     ControlService& operator=(const ControlService&) = delete;
     ControlService(ControlService&&) = delete;
