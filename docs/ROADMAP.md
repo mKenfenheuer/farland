@@ -54,7 +54,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - The X.224, MCS/GCC, capability (share), input, planar and connection fuzz targets exist.
 - **Not tested yet:** mstsc, Windows App and FreeRDP 2.
 
-### M2: NLA (~4 weeks): done except Kerberos
+### M2: NLA (~4 weeks): done
 - **CredSSP acceptor**, TSRequest v2–6:
   - pubKeyAuth using the nonce hash (v5+) or pubKey+1 (v2–4), bound to the PKCS#1 key.
   - Sends `errorCode` TSRequests on failure, with correct NTSTATUS values.
@@ -71,7 +71,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
   - The whole client matrix connects with NLA.
   - A wrong password shows the client's native "logon failure" message.
   - Fuzz targets for TSRequest and NTLM run nightly.
-- **Status: done except Kerberos.** The Kerberos acceptor moves to M7, where the other authentication modes are. SPNEGO is done: it negotiates NTLM, including the mechListMIC exchange.
+- **Status: done.** SPNEGO negotiates NTLM, including the mechListMIC exchange. The Kerberos acceptor moved to M7, where the other authentication modes are, and is done there.
 - **Differences from the plan:**
   - Privilege separation relays the decrypted stream over a socket pair. It does not hand over the socket and TLS session, because a TLS session cannot move between processes without kernel TLS.
   - The network process switches to `nobody` when started as root. On Linux it runs under Landlock and a seccomp allowlist.
