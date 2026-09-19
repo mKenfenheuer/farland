@@ -406,7 +406,7 @@ std::expected<void, ConfigError> parse_graphics(const toml::table& table, Graphi
 {
     if (auto ok = check_keys(table, "graphics",
                              {"gfx_codec", "bitmap_codec", "h264_encoder", "openh264", "render_node", "zero_copy",
-                              "clearcodec", "refine", "frames_per_second"});
+                              "clearcodec", "refine", "video_regions", "lossless_still", "frames_per_second"});
         !ok) {
         return ok;
     }
@@ -450,7 +450,8 @@ std::expected<void, ConfigError> parse_graphics(const toml::table& table, Graphi
         out.render_node = std::move(*path);
     }
     for (auto [key, field] : {std::pair{"zero_copy", &out.zero_copy}, std::pair{"clearcodec", &out.clearcodec},
-                              std::pair{"refine", &out.refine}}) {
+                              std::pair{"refine", &out.refine}, std::pair{"video_regions", &out.video_regions},
+                              std::pair{"lossless_still", &out.lossless_still}}) {
         if (const auto* node = table.get(key)) {
             auto value = get_bool(*node, std::format("[graphics] {}", key));
             if (!value) {
@@ -502,6 +503,21 @@ std::expected<void, ConfigError> parse_audio(const toml::table& table, AudioSect
     return {};
 }
 
+std::expected<void, ConfigError> parse_camera(const toml::table& table, CameraSection& out)
+{
+    if (auto ok = check_keys(table, "camera", {"enabled"}); !ok) {
+        return ok;
+    }
+    if (const auto* node = table.get("enabled")) {
+        auto value = get_bool(*node, "[camera] enabled");
+        if (!value) {
+            return std::unexpected(std::move(value).error());
+        }
+        out.enabled = *value;
+    }
+    return {};
+}
+
 std::expected<void, ConfigError> parse_clipboard(const toml::table& table, ClipboardSection& out)
 {
     if (auto ok = check_keys(table, "clipboard", {"enabled"}); !ok) {
@@ -545,7 +561,7 @@ std::expected<Config, ConfigError> parse_config(std::string_view text)
 #endif
 
     using Parser = std::expected<void, ConfigError> (*)(const toml::table&, Config&);
-    static constexpr std::array<std::pair<std::string_view, Parser>, 8> sections{{
+    static constexpr std::array<std::pair<std::string_view, Parser>, 9> sections{{
         {"server", [](const toml::table& t, Config& c) { return parse_server(t, c.server); }},
         {"auth", [](const toml::table& t, Config& c) { return parse_auth(t, c.auth); }},
         {"session", [](const toml::table& t, Config& c) { return parse_session(t, c.session); }},
@@ -553,6 +569,7 @@ std::expected<Config, ConfigError> parse_config(std::string_view text)
         {"graphics", [](const toml::table& t, Config& c) { return parse_graphics(t, c.graphics); }},
         {"network", [](const toml::table& t, Config& c) { return parse_network(t, c.network); }},
         {"audio", [](const toml::table& t, Config& c) { return parse_audio(t, c.audio); }},
+        {"camera", [](const toml::table& t, Config& c) { return parse_camera(t, c.camera); }},
         {"clipboard", [](const toml::table& t, Config& c) { return parse_clipboard(t, c.clipboard); }},
     }};
 
@@ -756,10 +773,13 @@ std::string describe(const Config& config)
     line("graphics.zero_copy", flag(config.graphics.zero_copy));
     line("graphics.clearcodec", flag(config.graphics.clearcodec));
     line("graphics.refine", flag(config.graphics.refine));
+    line("graphics.video_regions", flag(config.graphics.video_regions));
+    line("graphics.lossless_still", flag(config.graphics.lossless_still));
     line("graphics.frames_per_second", std::to_string(config.graphics.frames_per_second));
     line("network.autodetect", quoted(to_string(config.network.autodetect)));
     line("audio.playback", flag(config.audio.playback));
     line("audio.microphone", flag(config.audio.microphone));
+    line("camera.enabled", flag(config.camera.enabled));
     line("clipboard.enabled", flag(config.clipboard.enabled));
     return out;
 }

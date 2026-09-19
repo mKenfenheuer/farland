@@ -5,6 +5,7 @@ unit_test_sources += files(
   'test_audio_playback.cpp',
   'test_autodetect.cpp',
   'test_broker.cpp',
+  'test_camera.cpp',
   'test_clipboard_bridge.cpp',
   'test_clipboard_files.cpp',
   'test_compositor.cpp',

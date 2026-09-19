@@ -8,6 +8,7 @@ app_sources = files(
   'farland-server/sandbox.cpp',
   'farland-server/session.cpp',
   'farland-server/session_audio.cpp',
+  'farland-server/session_camera.cpp',
   'farland-server/transport.cpp',
   'farland-server/unix_socket.cpp',
 )

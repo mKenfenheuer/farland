@@ -80,6 +80,8 @@ struct SessionOptions {
     /// client's microphone becomes a local audio source (audin).
     bool audio = true;
     bool microphone = true;
+    /// The client's camera becomes a local camera (rdpecam).
+    bool camera = true;
     /// Seconds a client may take from TCP accept to an active connection.
     unsigned activation_timeout = 30;
     /// Network characteristics detection for clients that support it. It

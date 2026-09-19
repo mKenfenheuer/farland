@@ -164,6 +164,15 @@ on_local_session = "separate"
 # Offer the client's microphone to the desktop as a local source (audin).
 # microphone = true
 
+[camera]
+# Offer the client's camera to the desktop as a local camera (rdpecam), for
+# video calls inside the session. It appears in the user's PipeWire as
+# "farland-camera" while the client streams, so applications that use
+# PipeWire (browsers, anything on the portal's Camera interface) list it;
+# those that insist on a /dev/video node do not see it. Only the
+# uncompressed formats are taken, which is what a client converts to.
+# enabled = true
+
 [clipboard]
 # Copy text, HTML, images and files between the client and the desktop
 # (cliprdr), where the desktop has a clipboard. Data is transferred only

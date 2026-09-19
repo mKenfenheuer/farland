@@ -134,6 +134,7 @@ void usage()
                  "                        once it stands still\n"
                  "  --no-audio            do not play the desktop's audio on the client (rdpsnd)\n"
                  "  --no-microphone       do not offer the client's microphone as a local audio source (audin)\n"
+                 "  --no-camera           do not offer the client's camera as a local camera (rdpecam)\n"
                  "  --autodetect MODE     network auto-detect for clients that support it: full (default;\n"
                  "                        also measures before licensing), continuous (only once connected) or off\n"
                  "  --max-sessions N      concurrent connections (default 4)\n"
@@ -229,6 +230,8 @@ bool parse_options(std::span<char*> args, Options& options)
             options.session.audio = false;
         } else if (arg == "--no-microphone") {
             options.session.microphone = false;
+        } else if (arg == "--no-camera") {
+            options.session.camera = false;
         } else if (arg == "--autodetect") {
             const auto mode = value();
             if (mode == "full") {

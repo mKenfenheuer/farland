@@ -280,8 +280,11 @@ void Agent::apply(const broker::Settings& settings)
     session.zero_copy = settings.zero_copy;
     session.clearcodec = settings.clearcodec;
     session.refine = settings.refine;
+    session.video_regions = settings.video_regions;
+    session.lossless_still = settings.lossless_still;
     session.audio = settings.audio;
     session.microphone = settings.microphone;
+    session.camera = settings.camera;
     session.clipboard = settings.clipboard;
     session.autodetect = settings.autodetect;
     session.activation_timeout = settings.activation_seconds;

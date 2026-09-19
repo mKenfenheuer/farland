@@ -436,8 +436,11 @@ broker::Settings settings_of(const Config& config)
     settings.zero_copy = config.graphics.zero_copy;
     settings.clearcodec = config.graphics.clearcodec;
     settings.refine = config.graphics.refine;
+    settings.video_regions = config.graphics.video_regions;
+    settings.lossless_still = config.graphics.lossless_still;
     settings.audio = config.audio.playback;
     settings.microphone = config.audio.microphone;
+    settings.camera = config.camera.enabled;
     settings.clipboard = config.clipboard.enabled;
     settings.autodetect = autodetect_of(config.network.autodetect);
     settings.activation_seconds = static_cast<std::uint32_t>(config.policy.activation_timeout.count());

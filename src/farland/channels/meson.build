@@ -3,7 +3,7 @@
 
 # Virtual channels (docs/PLAN.md §3.1), sans-IO: static channel framing, the
 # drdynvc multiplexer, the Graphics Pipeline (RDPGFX), Display Control, touch and
-# pen input (RDPEI) and the clipboard (cliprdr).
+# pen input (RDPEI), the camera (RDPECAM) and the clipboard (cliprdr).
 farland_channels_lib = static_library(
   'farland-channels',
   'audin.cpp',
@@ -13,6 +13,7 @@ farland_channels_lib = static_library(
   'disp.cpp',
   'drdynvc.cpp',
   'dvc_server.cpp',
+  'rdpecam.cpp',
   'rdpei.cpp',
   'rdpei_server.cpp',
   'rdpgfx.cpp',

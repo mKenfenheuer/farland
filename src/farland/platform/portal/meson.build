@@ -19,13 +19,15 @@ sd_bus_dep = dependency('libsystemd', 'basu', required: portal_opt, include_type
 libei_dep = dependency('libei-1.0', version: '>= 1.1', required: portal_opt, include_type: 'system')
 pipewire_dep = dependency('libpipewire-0.3', version: '>= 1.0', required: portal_opt, include_type: 'system')
 
-# Session audio (the default sink's monitor and a virtual microphone) needs
-# only PipeWire, so it also works without the rest of the portal backend.
+# Session audio (the default sink's monitor and a virtual microphone) and the
+# virtual camera need only PipeWire, so they also work without the rest of the
+# portal backend.
 farland_pipewire_audio_dep = dependency('', required: false)
 if pipewire_dep.found()
   farland_pipewire_audio_lib = static_library(
     'farland-pipewire-audio',
     'pipewire_audio.cpp',
+    'pipewire_camera.cpp',
     include_directories: farland_inc,
     dependencies: [farland_audio_dep, pipewire_dep],
   )

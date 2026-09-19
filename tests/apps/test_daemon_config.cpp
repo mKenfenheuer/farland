@@ -102,6 +102,9 @@ TEST_CASE("An empty farland.toml gives the defaults")
     CHECK_FALSE(config.graphics.render_node.has_value());
     CHECK(config.graphics.zero_copy);
     CHECK(config.graphics.clearcodec);
+    CHECK(config.graphics.video_regions);
+    CHECK(config.graphics.lossless_still);
+    CHECK(config.camera.enabled);
     CHECK(config.graphics.refine);
     CHECK(config.graphics.frames_per_second == 30);
     CHECK(config.network.autodetect == AutoDetect::full);
@@ -132,6 +135,8 @@ render_node = "/dev/dri/renderD129"
 zero_copy = false
 clearcodec = false
 refine = false
+video_regions = false
+lossless_still = false
 frames_per_second = 60
 
 [network]
@@ -158,6 +163,8 @@ activation_timeout = "90s"
     CHECK(config.graphics.render_node == std::filesystem::path("/dev/dri/renderD129"));
     CHECK_FALSE(config.graphics.zero_copy);
     CHECK_FALSE(config.graphics.clearcodec);
+    CHECK_FALSE(config.graphics.video_regions);
+    CHECK_FALSE(config.graphics.lossless_still);
     CHECK_FALSE(config.graphics.refine);
     CHECK(config.graphics.frames_per_second == 60);
     CHECK(config.network.autodetect == AutoDetect::off);

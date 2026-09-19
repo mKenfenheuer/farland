@@ -64,7 +64,7 @@ void usage()
                  "  --fps N               frame rate (default 30)\n"
                  "  --gfx-codec CODEC     progressive, planar, avc420 or avc444 (default progressive)\n"
                  "  --render-node PATH    DRM render node for the compositor and H.264\n"
-                 "  --no-audio, --no-microphone, --no-clipboard\n"
+                 "  --no-audio, --no-microphone, --no-camera, --no-clipboard\n"
                  "  --log-level LEVEL     trace, debug, info, warn, error (default info)\n"
                  "  -- COMMAND...         cage: the application to run\n";
 }
@@ -110,6 +110,8 @@ bool parse(std::span<char*> args, Options& options)
             options.session.audio = false;
         } else if (arg == "--no-microphone") {
             options.session.microphone = false;
+        } else if (arg == "--no-camera") {
+            options.session.camera = false;
         } else if (arg == "--no-clipboard") {
             options.session.clipboard = false;
         } else if (arg == "--log-level") {

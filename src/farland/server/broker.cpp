@@ -229,7 +229,8 @@ void encode_body(Writer& w, const Settings& m)
     w.u8(m.h264_backend ? static_cast<std::uint8_t>(*m.h264_backend) : 0);
     write_string(w, m.openh264_library, max_settings_path);
     write_string(w, m.render_node, max_settings_path);
-    for (const bool flag : {m.zero_copy, m.clearcodec, m.refine, m.audio, m.microphone, m.clipboard}) {
+    for (const bool flag : {m.zero_copy, m.clearcodec, m.refine, m.video_regions, m.lossless_still, m.audio,
+                            m.microphone, m.camera, m.clipboard}) {
         write_flag(w, flag);
     }
     w.u8(static_cast<std::uint8_t>(m.autodetect));
@@ -395,7 +396,8 @@ Result<Message> decode_settings(Reader& r)
     }
     FARLAND_TRY(m.openh264_library, read_string(r, max_settings_path));
     FARLAND_TRY(m.render_node, read_string(r, max_settings_path));
-    for (bool* flag : {&m.zero_copy, &m.clearcodec, &m.refine, &m.audio, &m.microphone, &m.clipboard}) {
+    for (bool* flag : {&m.zero_copy, &m.clearcodec, &m.refine, &m.video_regions, &m.lossless_still, &m.audio,
+                       &m.microphone, &m.camera, &m.clipboard}) {
         FARLAND_TRY(*flag, read_flag(r));
     }
     FARLAND_TRY(m.autodetect, read_enum(r, AutoDetectMode::full, "unknown auto-detect mode"));
@@ -563,12 +565,14 @@ std::string describe(const Settings& settings)
     const auto on_off = [](bool value) { return value ? "on" : "off"; };
     std::string out =
         std::format("gfx {}, bitmap {}, h264 {}, {} fps, autodetect {}, zero-copy {}, clearcodec {}, refine {}, "
-                    "audio {}, microphone {}, clipboard {}, activation {} s",
+                    "video regions {}, lossless still {}, audio {}, microphone {}, camera {}, clipboard {}, "
+                    "activation {} s",
                     name_of(settings.gfx_codec), name_of(settings.bitmap_codec),
                     settings.h264_backend ? video::to_string(*settings.h264_backend) : std::string_view("auto"),
                     settings.frames_per_second, name_of(settings.autodetect), on_off(settings.zero_copy),
-                    on_off(settings.clearcodec), on_off(settings.refine), on_off(settings.audio),
-                    on_off(settings.microphone), on_off(settings.clipboard), settings.activation_seconds);
+                    on_off(settings.clearcodec), on_off(settings.refine), on_off(settings.video_regions),
+                    on_off(settings.lossless_still), on_off(settings.audio), on_off(settings.microphone),
+                    on_off(settings.camera), on_off(settings.clipboard), settings.activation_seconds);
     if (!settings.render_node.empty()) {
         out += ", render node " + settings.render_node;
     }

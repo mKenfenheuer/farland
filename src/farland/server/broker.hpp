@@ -107,8 +107,14 @@ struct Settings {
     bool zero_copy = true;
     bool clearcodec = true;
     bool refine = true;
+    /// Progressive surfaces: H.264 for the tiles that keep changing, and a
+    /// lossless copy of what stands still.
+    bool video_regions = true;
+    bool lossless_still = true;
     bool audio = true;
     bool microphone = true;
+    /// The client's camera as a local camera (rdpecam).
+    bool camera = true;
     bool clipboard = true;
     AutoDetectMode autodetect = AutoDetectMode::full;
     /// Seconds from the TCP connection to an active RDP connection, which

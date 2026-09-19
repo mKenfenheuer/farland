@@ -9,6 +9,7 @@ farland_server_lib = static_library(
   'audio_playback.cpp',
   'autodetect.cpp',
   'broker.cpp',
+  'camera.cpp',
   'clipboard_bridge.cpp',
   'clipboard_files.cpp',
   'compositor.cpp',

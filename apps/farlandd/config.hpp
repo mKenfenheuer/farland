@@ -182,6 +182,10 @@ struct GraphicsSection {
     /// first passes refined while the picture stands still.
     bool clearcodec = true;
     bool refine = true;
+    /// Progressive surfaces: tiles that keep changing go through H.264, and a
+    /// picture that stands still is sent once more losslessly.
+    bool video_regions = true;
+    bool lossless_still = true;
     unsigned frames_per_second = 30;
 };
 
@@ -192,6 +196,10 @@ struct NetworkSection {
 struct AudioSection {
     bool playback = true;    ///< the desktop's output on the client (rdpsnd)
     bool microphone = true;  ///< the client's microphone as a local source (audin)
+};
+
+struct CameraSection {
+    bool enabled = true;  ///< the client's camera as a local camera (rdpecam)
 };
 
 struct ClipboardSection {
@@ -206,6 +214,7 @@ struct Config {
     GraphicsSection graphics;
     NetworkSection network;
     AudioSection audio;
+    CameraSection camera;
     ClipboardSection clipboard;
 };
 

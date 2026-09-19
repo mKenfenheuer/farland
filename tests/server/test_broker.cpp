@@ -165,7 +165,9 @@ TEST_CASE("Broker messages round-trip")
     settings.render_node = "/dev/dri/renderD129";
     settings.zero_copy = false;
     settings.refine = false;
+    settings.video_regions = false;
     settings.microphone = false;
+    settings.camera = false;
     settings.autodetect = farland::server::AutoDetectMode::off;
     settings.activation_seconds = 90;
     const auto settings_frame = broker::encode(settings);
@@ -181,6 +183,9 @@ TEST_CASE("Broker messages round-trip")
     CHECK_FALSE(decoded_settings.refine);
     CHECK(decoded_settings.audio);
     CHECK_FALSE(decoded_settings.microphone);
+    CHECK_FALSE(decoded_settings.video_regions);
+    CHECK(decoded_settings.lossless_still);
+    CHECK_FALSE(decoded_settings.camera);
     CHECK(decoded_settings.clipboard);
     CHECK(decoded_settings.autodetect == farland::server::AutoDetectMode::off);
     CHECK(decoded_settings.activation_seconds == 90);
@@ -488,8 +493,10 @@ TEST_CASE("Malformed broker messages are rejected")
         w.u8(0);     // its value
         w.u16le(0);  // openh264
         w.u16le(0);  // render node
-        for (int i = 0; i < 6; ++i) {
-            w.u8(1);  // zero-copy, clearcodec, refine, audio, microphone, clipboard
+        for (int i = 0; i < 9; ++i) {
+            // zero-copy, clearcodec, refine, video regions, lossless still,
+            // audio, microphone, camera, clipboard
+            w.u8(1);
         }
         w.u8(2);  // auto-detect: full
     };

@@ -22,6 +22,7 @@ fuzz_targets = {
   'pointer': farland_proto_dep,
   'privsep': farland_server_dep,
   'progressive': farland_codec_dep,
+  'rdpecam': farland_server_dep,
   'rdpei': farland_channels_dep,
   'rdpgfx': farland_channels_dep,
   'rdpsnd': farland_channels_dep,

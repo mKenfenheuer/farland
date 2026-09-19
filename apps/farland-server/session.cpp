@@ -21,6 +21,7 @@
 #include <farland/server/touch_input.hpp>
 
 #include "session_audio.hpp"
+#include "session_camera.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -174,11 +175,16 @@ public:
                 audio_->service(connection_->network().bandwidth_kbps);
                 pump();
             }
+            if (running_ && camera_) {
+                camera_->service();
+                pump();
+            }
         }
         if (translator_) {
             translator_->release_all();  // never leave keys held on the shared desktop
         }
-        audio_.reset();  // the capture and the microphone source go at once
+        camera_.reset();  // the local camera goes with the session
+        audio_.reset();   // the capture and the microphone source go at once
         if (desktop_ != nullptr) {
             // The producers get their buffers back, and the next session
             // starts from CPU frames.
@@ -745,6 +751,9 @@ private:
             if (audio_ && audio_->handle(*event)) {
                 continue;
             }
+            if (camera_ && camera_->handle(*event)) {
+                continue;
+            }
             std::visit(
                 [this](const auto& e) {
                     using T = std::decay_t<decltype(e)>;
@@ -755,6 +764,10 @@ private:
                         start_display_control();
                         if (audio_) {
                             audio_->dynamic_channels_ready(*dvc_);
+                        }
+                        if (options_.camera) {
+                            camera_.emplace(peer_);
+                            camera_->dynamic_channels_ready(*dvc_);
                         }
                     } else if constexpr (std::is_same_v<T, channels::dvc_event::ChannelOpened>) {
                         log::info(log_component, "{}: dynamic channel {} '{}' open", peer_, e.id, e.name);
@@ -1518,6 +1531,7 @@ private:
     server::OutputLayout output_;
     server::Compositor compositor_;
     std::optional<server::DisplayControl> display_;  // after dvc_, which it uses
+    std::optional<SessionCamera> camera_;            // uses dvc_, so before it
     std::optional<SessionAudio> audio_;              // last: it uses dvc_
 };
 
