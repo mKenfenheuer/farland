@@ -124,7 +124,12 @@ public:
         std::string reason;
     };
 
-    explicit QualityController(Config config);
+    /// `initial_bandwidth_kbps` is what connect-time auto-detect measured,
+    /// where the client answered it. Without it the ladder starts at its
+    /// best tier and finds the link by congesting it -- which the first
+    /// frame pays for, and the first frame is the whole screen. With it the
+    /// ladder starts where the link already is.
+    explicit QualityController(Config config, std::optional<std::uint32_t> initial_bandwidth_kbps = std::nullopt);
 
     /// Feeds a sample (calls between sample intervals are ignored). Returns
     /// the new tier when it changes.

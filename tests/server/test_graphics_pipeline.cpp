@@ -15,6 +15,7 @@
 #include <farland/codec/zgfx.hpp>
 #include <farland/server/display_layout.hpp>
 #include <farland/server/graphics_pipeline.hpp>
+#include <farland/server/quality_controller.hpp>
 #include <farland/server/test_pattern.hpp>
 
 #include <catch2/catch_approx.hpp>

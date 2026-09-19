@@ -868,8 +868,10 @@ private:
                                              .refine = options_.refine,
                                              .video_regions = options_.video_regions,
                                              .lossless_still = options_.lossless_still});
-        // Congestion control starts at the best tier; its encoder settings
-        // go in before the encoders exist.
+        // The ladder starts where connect-time auto-detect says the link
+        // is, not at the best tier: the first frame is the whole screen and
+        // is the one a person watches arrive. Its encoder settings go in
+        // before the encoders exist.
         server::QualityController::Config quality;
         quality.width = output_.width;
         quality.height = output_.height;
@@ -880,7 +882,7 @@ private:
         quality.min_bitrate_kbps = options_.h264_min_bitrate_kbps;
         quality.max_bitrate_kbps = options_.h264_max_bitrate_kbps;
         quality.target_bitrate_kbps = options_.h264_bitrate_kbps;
-        quality_.emplace(quality);
+        quality_.emplace(quality, connection_->network().bandwidth_kbps);
         apply_tier(quality_->tier());
     }
 

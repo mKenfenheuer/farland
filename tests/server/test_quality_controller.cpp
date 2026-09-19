@@ -80,6 +80,42 @@ QualityController::Config config_default()
 
 }  // namespace
 
+TEST_CASE("Quality: a slow link starts the ladder where the link is")
+{
+    // The first frame is the whole screen, and on a slow link it is the one
+    // frame a person watches arrive. Starting at the best tier encodes it
+    // for a link nobody has measured and discovers the truth a second later,
+    // by which time it has painted from the top down.
+    QualityController::Config config;
+    config.width = 1920;
+    config.height = 1080;
+    config.fps = 30;
+
+    const QualityController unmeasured(config);
+    CHECK(unmeasured.tier().level == 0);
+
+    SECTION("a measured slow link starts lower")
+    {
+        // 2 Mbit/s: tier 0 budgets far more than that at 1080p30.
+        const QualityController slow(config, 2000U);
+        CHECK(slow.tier().level > 0);
+        // And the tier it picks is one the link can actually carry.
+        CHECK(slow.tier().budget_kbps <= 2000);
+    }
+
+    SECTION("a fast link still starts at the best tier")
+    {
+        const QualityController fast(config, 200'000U);
+        CHECK(fast.tier().level == 0);
+    }
+
+    SECTION("no measurement leaves the old behaviour alone")
+    {
+        const QualityController none(config, std::nullopt);
+        CHECK(none.tier().level == 0);
+    }
+}
+
 TEST_CASE("Tiers honour a configured bitrate floor, ceiling and target", "[server][quality]")
 {
     QualityController::Config config;

@@ -86,12 +86,23 @@ QualityTier QualityController::make_tier(unsigned level, const Config& config,
     return tier;
 }
 
-QualityController::QualityController(Config config)
+QualityController::QualityController(Config config, std::optional<std::uint32_t> initial_bandwidth_kbps)
     : config_(config), tier_(make_tier(0, config_)), upshift_wait_(config_.upshift_wait)
 {
     config_.downshift_samples = std::max(config_.downshift_samples, 1U);
     for (unsigned level = 0; level < tier_count; ++level) {
         budgets_.at(level) = make_tier(level, config_).budget_kbps;
+    }
+    // The first frame is the whole screen, and on a slow link it is the one
+    // frame a person actually watches arrive. Starting at the best tier
+    // encodes it for a link nobody has measured yet and then discovers the
+    // truth a second later, by which time the picture has painted from the
+    // top down. Where auto-detect has already answered, start there instead.
+    if (initial_bandwidth_kbps) {
+        const unsigned level = fitting_level(*initial_bandwidth_kbps);
+        if (level > 0) {
+            tier_ = make_tier(level, config_, initial_bandwidth_kbps);
+        }
     }
 }
 
