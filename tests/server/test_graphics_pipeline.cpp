@@ -17,6 +17,7 @@
 #include <farland/server/graphics_pipeline.hpp>
 #include <farland/server/test_pattern.hpp>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -814,7 +815,11 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
     start_channels(client, channels);
     gfx::GfxServerConfig config;
     config.avc420 = config.avc444 = config.avc444v2 = false;
-    GraphicsPipeline pipeline(channels, width, height, config);  // Progressive with ClearCodec and refinement
+    // Progressive with ClearCodec and refinement. direct_tiles is 0 so that
+    // this small surface takes the coarse-first ladder, which is what this
+    // test is about; the direct pass has a test of its own.
+    GraphicsPipeline pipeline(channels, width, height, config, TileCodec::progressive, {},
+                              farland::server::PipelineOptions{.direct_tiles = 0});
     const auto id = establish(client, channels, pipeline);
 
     // The first column of tiles shows black strokes on white, like text; the
@@ -845,16 +850,31 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
     Bytes clear_pixels(pixels.size());
     std::vector<gfx::Rect16> clear_rects;
     std::size_t clear_regions = 0;
+    std::size_t planar_tiles = 0;
     const auto receive = [&](std::uint32_t frame_id) {
         for (const auto& pdu : client.take_gfx(id)) {
             if (const auto* w1 = std::get_if<gfx::WireToSurface1>(&pdu)) {
-                REQUIRE(w1->codec_id == gfx::codec::clearcodec);
                 const auto r = w1->dest_rect;
                 const auto out = std::span(clear_pixels).subspan(((std::size_t{r.top} * width) + r.left) * 4);
-                REQUIRE(clear_decoder.decode(w1->bitmap_data, r.width(), r.height(), out, std::size_t{width} * 4)
-                            .has_value());
+                if (w1->codec_id == gfx::codec::planar) {
+                    // The lossless pass over a tile that stands still.
+                    Bytes decoded(std::size_t{r.width()} * r.height() * 4);
+                    REQUIRE(farland::codec::planar::decode(w1->bitmap_data, r.width(), r.height(),
+                                                           farland::codec::planar::Orientation::top_down, decoded)
+                                .has_value());
+                    for (std::uint32_t row = 0; row < r.height(); ++row) {
+                        std::copy_n(decoded.begin() + static_cast<std::ptrdiff_t>(std::size_t{row} * r.width() * 4),
+                                    std::size_t{r.width()} * 4,
+                                    out.begin() + static_cast<std::ptrdiff_t>(std::size_t{row} * width * 4));
+                    }
+                    ++planar_tiles;
+                } else {
+                    REQUIRE(w1->codec_id == gfx::codec::clearcodec);
+                    REQUIRE(clear_decoder.decode(w1->bitmap_data, r.width(), r.height(), out, std::size_t{width} * 4)
+                                .has_value());
+                    ++clear_regions;
+                }
                 clear_rects.push_back(r);
-                ++clear_regions;
             } else if (const auto* w2 = std::get_if<gfx::WireToSurface2>(&pdu)) {
                 REQUIRE(w2->codec_id == gfx::codec::progressive);
                 REQUIRE(progressive_decoder.decode(w2->bitmap_data, frame_id).has_value());
@@ -883,34 +903,27 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
     CHECK(pipeline.has_pending_refinement());
     const Bytes coarse = composite();
 
-    // Nothing changes: frames of refinement only, until all is at full quality.
+    // Nothing changes: frames of refinement only, until every tile is at full
+    // quality and the lossless pass has made the still picture exact.
     int refinements = 0;
     while (pipeline.has_pending_refinement() && refinements < 50) {
         const auto frame_id = pipeline.send_frame(frame);
         REQUIRE(frame_id.has_value());
         clear_regions = 0;
         receive(*frame_id);
-        CHECK(clear_regions == 0);
+        CHECK(clear_regions == 0);  // the text tiles were exact from the start
         ++refinements;
     }
     CHECK_FALSE(pipeline.has_pending_refinement());
     CHECK(refinements > 0);
+    CHECK(planar_tiles == 4);                             // the four Progressive tiles, not the two text ones
     CHECK_FALSE(pipeline.send_frame(frame).has_value());  // and then nothing
 
     const Bytes fine = composite();
     CHECK(psnr(view(fine), frame) > psnr(view(coarse), frame));
-    CHECK(psnr(view(fine), frame) >= 38.0);
-    // ClearCodec is lossless.
-    bool text_exact = true;
-    for (std::uint32_t y = 0; y < height; ++y) {
-        for (std::uint32_t x = 0; x < GraphicsPipeline::tile_size; ++x) {
-            for (std::size_t c = 0; c < 3; ++c) {
-                const auto at = (((std::size_t{y} * width) + x) * 4) + c;
-                text_exact = text_exact && fine[at] == pixels[at];
-            }
-        }
-    }
-    CHECK(text_exact);
+    // A picture that stands still ends up exact: ClearCodec for the text,
+    // the lossless pass for what Progressive left quantized.
+    CHECK(fine == pixels);
 }
 
 TEST_CASE("GFX: frames without a picture refine what a desktop standing still left coarse")
@@ -920,7 +933,8 @@ TEST_CASE("GFX: frames without a picture refine what a desktop standing still le
     start_channels(client, channels);
     gfx::GfxServerConfig config;
     config.avc420 = config.avc444 = config.avc444v2 = false;
-    GraphicsPipeline pipeline(channels, width, height, config);  // Progressive with refinement
+    GraphicsPipeline pipeline(channels, width, height, config, TileCodec::progressive, {},
+                              farland::server::PipelineOptions{.direct_tiles = 0});
     const auto id = establish(client, channels, pipeline);
 
     // A gradient with a colour per pixel, like a photo: every tile goes out
@@ -938,11 +952,28 @@ TEST_CASE("GFX: frames without a picture refine what a desktop standing still le
     const farland::codec::ImageView frame{pixels, width, height, std::size_t{width} * 4};
 
     auto decoder = farland::codec::progressive::Decoder::create(width, height).value();
+    Bytes overlay(std::size_t{width} * height * 4);  // what the lossless pass painted over it
+    std::vector<gfx::Rect16> overlay_rects;
     const auto receive = [&](std::uint32_t frame_id) {
         std::size_t streams = 0;
         for (const auto& pdu : client.take_gfx(id)) {
             if (const auto* w2 = std::get_if<gfx::WireToSurface2>(&pdu)) {
                 REQUIRE(decoder.decode(w2->bitmap_data, frame_id).has_value());
+                ++streams;
+            } else if (const auto* w1 = std::get_if<gfx::WireToSurface1>(&pdu)) {
+                REQUIRE(w1->codec_id == gfx::codec::planar);
+                const auto r = w1->dest_rect;
+                Bytes decoded(std::size_t{r.width()} * r.height() * 4);
+                REQUIRE(farland::codec::planar::decode(w1->bitmap_data, r.width(), r.height(),
+                                                       farland::codec::planar::Orientation::top_down, decoded)
+                            .has_value());
+                for (std::uint32_t row = 0; row < r.height(); ++row) {
+                    std::copy_n(decoded.begin() + static_cast<std::ptrdiff_t>(std::size_t{row} * r.width() * 4),
+                                std::size_t{r.width()} * 4,
+                                overlay.begin() +
+                                    static_cast<std::ptrdiff_t>(((std::size_t{r.top + row} * width) + r.left) * 4));
+                }
+                overlay_rects.push_back(r);
                 ++streams;
             }
         }
@@ -959,24 +990,37 @@ TEST_CASE("GFX: frames without a picture refine what a desktop standing still le
     // session opens frames with no picture in them at all: the refinement
     // has to go out in those.
     int refinements = 0;
+    int carried = 0;
     while (pipeline.has_pending_refinement() && refinements < 50) {
         pipeline.begin_frame();
-        const auto frame_id = pipeline.end_frame();
-        REQUIRE(frame_id.has_value());
-        CHECK(receive(*frame_id) > 0);
+        // A tick can carry nothing: a tile that just reached full quality has
+        // to stand still for still_frames before its lossless copy goes out,
+        // and the counters only run while frames are asked for.
+        if (const auto frame_id = pipeline.end_frame()) {
+            carried += receive(*frame_id) > 0 ? 1 : 0;
+        }
         ++refinements;
     }
+    CHECK(carried > 0);
     CHECK_FALSE(pipeline.has_pending_refinement());
     CHECK(refinements > 0);
     pipeline.begin_frame();
     CHECK_FALSE(pipeline.end_frame().has_value());  // and then nothing
 
-    const Bytes fine(decoder.image().data.begin(), decoder.image().data.end());
+    Bytes fine(decoder.image().data.begin(), decoder.image().data.end());
     const auto view = [](const Bytes& image) {
         return farland::codec::ImageView{image, width, height, std::size_t{width} * 4};
     };
     CHECK(psnr(view(fine), frame) > psnr(view(coarse), frame));
-    CHECK(psnr(view(fine), frame) >= 38.0);
+    // And the lossless pass then made the whole still picture exact.
+    CHECK(overlay_rects.size() == 6);
+    for (const auto& r : overlay_rects) {
+        for (std::uint32_t y = r.top; y < r.bottom; ++y) {
+            const auto at = static_cast<std::ptrdiff_t>(((std::size_t{y} * width) + r.left) * 4);
+            std::copy_n(overlay.begin() + at, std::size_t{r.width()} * 4, fine.begin() + at);
+        }
+    }
+    CHECK(fine == pixels);
 }
 
 TEST_CASE("GFX: deferred AVC444 chroma goes out while the desktop stands still")
@@ -1122,4 +1166,258 @@ TEST_CASE("GFX: a surface per screen, black surfaces around letterboxed pictures
     REQUIRE(pipeline.screen_count() == 1);
     farland::server::TestPattern big(640, 480);
     CHECK(pipeline.send_frame(big.render(0)).has_value());
+}
+
+namespace {
+
+// A surface with more tiles than PipelineOptions::direct_tiles, so that a
+// whole repaint takes the coarse-first ladder and a small change does not.
+constexpr std::uint16_t big_width = 320;
+constexpr std::uint16_t big_height = 256;
+constexpr std::uint32_t big_tiles_x = 5;
+
+/// A gradient with mild noise: far too many colours for ClearCodec, so every
+/// tile is a job for Progressive or H.264.
+Bytes noisy_gradient(std::uint32_t seed)
+{
+    Bytes pixels(std::size_t{big_width} * big_height * 4);
+    std::uint32_t state = seed | 1U;
+    for (std::uint32_t y = 0; y < big_height; ++y) {
+        for (std::uint32_t x = 0; x < big_width; ++x) {
+            state = (state * 1664525U) + 1013904223U;
+            const std::uint32_t n = (state >> 24U) % 7U;
+            const auto at = ((std::size_t{y} * big_width) + x) * 4;
+            pixels[at] = static_cast<std::byte>((x + n) & 0xFFU);
+            pixels[at + 1] = static_cast<std::byte>(((y * 2U) + n) & 0xFFU);
+            pixels[at + 2] = static_cast<std::byte>((x + y + n) & 0xFFU);
+            pixels[at + 3] = std::byte{0xFF};
+        }
+    }
+    return pixels;
+}
+
+farland::codec::ImageView big_view(const Bytes& pixels)
+{
+    return {pixels, big_width, big_height, std::size_t{big_width} * 4};
+}
+
+/// Repaints the tiles in [tx0, tx1) x [ty0, ty1) with the same kind of
+/// picture the surface already holds, shifted by `step`: what a window that
+/// scrolls or animates puts there, not white noise, so that quality figures
+/// before and after are about the codec and not about the content.
+void repaint_tiles(Bytes& pixels, std::uint32_t tx0, std::uint32_t ty0, std::uint32_t tx1, std::uint32_t ty1,
+                   std::uint32_t step)
+{
+    std::uint32_t state = (step * 2654435761U) | 1U;
+    for (std::uint32_t y = ty0 * 64; y < std::min<std::uint32_t>(ty1 * 64, big_height); ++y) {
+        for (std::uint32_t x = tx0 * 64; x < std::min<std::uint32_t>(tx1 * 64, big_width); ++x) {
+            state = (state * 1664525U) + 1013904223U;
+            const std::uint32_t n = (state >> 24U) % 7U;
+            // Thin strokes on a light ground, as text and a caret are: the
+            // detail a coarse first pass smears and a full-quality pass keeps.
+            // The ground shifts per pixel, so the tile has far too many
+            // colours for ClearCodec.
+            const bool ink = (((x + step) / 2U) + (y / 3U)) % 4U == 0;
+            const std::uint32_t base = ink ? 20U : 225U;
+            const auto at = ((std::size_t{y} * big_width) + x) * 4;
+            pixels[at] = static_cast<std::byte>((base + n) & 0xFFU);
+            pixels[at + 1] = static_cast<std::byte>((base + n + (y % 5U)) & 0xFFU);
+            pixels[at + 2] = static_cast<std::byte>((base + n + (x % 5U)) & 0xFFU);
+        }
+    }
+}
+
+/// PSNR over one rectangle of two big-surface pictures.
+double psnr_rect(const farland::codec::ImageView& a, const farland::codec::ImageView& b, std::uint32_t x0,
+                 std::uint32_t y0, std::uint32_t w, std::uint32_t h)
+{
+    double sum = 0;
+    for (std::uint32_t y = y0; y < y0 + h; ++y) {
+        for (std::uint32_t x = x0; x < x0 + w; ++x) {
+            for (std::size_t c = 0; c < 3; ++c) {
+                const double d = std::to_integer<int>(a.data[(y * a.stride) + (x * 4) + c]) -
+                                 std::to_integer<int>(b.data[(y * b.stride) + (x * 4) + c]);
+                sum += d * d;
+            }
+        }
+    }
+    const double mse = sum / (static_cast<double>(w) * h * 3);
+    return mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
+}
+
+}  // namespace
+
+TEST_CASE("GFX: a small change goes out sharp at once instead of coarse and refined")
+{
+    // Two pipelines side by side on the same pictures, one that gives small
+    // damage the direct full-quality pass and one that does not. The lossless
+    // pass is off in both, so the Progressive surface the decoder holds is
+    // exactly what the client shows and the two passes can be compared.
+    struct Side {
+        Client client;
+        DynamicChannels channels{client.sink()};
+        std::optional<GraphicsPipeline> pipeline;
+        std::uint32_t id = 0;
+        std::optional<farland::codec::progressive::Decoder> decoder;
+
+        explicit Side(std::uint32_t direct_tiles)
+        {
+            start_channels(client, channels);
+            gfx::GfxServerConfig config;
+            config.avc420 = config.avc444 = config.avc444v2 = false;
+            // ClearCodec off too: the point is which Progressive pass a tile gets.
+            pipeline.emplace(channels, big_width, big_height, config, TileCodec::progressive,
+                             farland::server::H264Factory{},
+                             farland::server::PipelineOptions{
+                                 .clearcodec = false, .direct_tiles = direct_tiles, .lossless_still = false});
+            id = establish(client, channels, *pipeline);
+            decoder = farland::codec::progressive::Decoder::create(big_width, big_height).value();
+        }
+
+        void send(const Bytes& pixels)
+        {
+            const auto frame_id = pipeline->send_frame(big_view(pixels));
+            if (!frame_id) {
+                return;  // nothing left to send
+            }
+            for (const auto& pdu : client.take_gfx(id)) {
+                const auto* w2 = std::get_if<gfx::WireToSurface2>(&pdu);
+                REQUIRE((w2 != nullptr || !std::holds_alternative<gfx::WireToSurface1>(pdu)));
+                if (w2 != nullptr) {
+                    REQUIRE(decoder->decode(w2->bitmap_data, *frame_id).has_value());
+                }
+            }
+        }
+        [[nodiscard]] double tile_psnr(const Bytes& pixels) const
+        {
+            return psnr_rect(big_view(pixels), decoder->image(), 0, 0, 64, 64);
+        }
+        void settle(const Bytes& pixels)
+        {
+            for (int n = 0; n < 16 && pipeline->has_pending_refinement(); ++n) {
+                send(pixels);
+            }
+        }
+    };
+
+    Side direct(4);  // one changed tile is small damage
+    Side ladder(0);  // never direct: always coarse first
+
+    // A whole repaint: 20 tiles, more than direct_tiles, so both take the
+    // coarse-first ladder. Then both refine until the picture is complete.
+    Bytes pixels = noisy_gradient(3);
+    direct.send(pixels);
+    ladder.send(pixels);
+    CHECK(direct.pipeline->has_pending_refinement());
+    CHECK(ladder.pipeline->has_pending_refinement());
+    direct.settle(pixels);
+    ladder.settle(pixels);
+    // Refined to the end, both hold the same picture.
+    CHECK(direct.tile_psnr(pixels) == Catch::Approx(ladder.tile_psnr(pixels)));
+
+    // A caret blinks: one tile changes, then stands still again. What the eye
+    // sees is the frame right after the change, and that is where the two
+    // differ -- the ladder starts that tile over at its coarsest stage, the
+    // direct pass sends it at full quality at once.
+    for (std::uint32_t blink = 1; blink <= 3; ++blink) {
+        repaint_tiles(pixels, 0, 0, 1, 1, blink);
+        direct.send(pixels);
+        ladder.send(pixels);
+        const double sharp = direct.tile_psnr(pixels);
+        const double coarse = ladder.tile_psnr(pixels);
+        INFO("blink " << blink << ": direct " << sharp << " dB, coarse-first " << coarse << " dB");
+        // The ladder smears the strokes until its upgrades arrive; the direct
+        // pass has them right away.
+        CHECK(sharp > coarse + 10.0);
+        CHECK(sharp >= 30.0);
+        CHECK(coarse < 25.0);
+        // Between blinks the ladder catches up, so the next blink starts level.
+        direct.settle(pixels);
+        ladder.settle(pixels);
+    }
+}
+
+TEST_CASE("GFX: tiles that keep changing go through H.264 on the Progressive surface")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    gfx::GfxServerConfig config;
+    config.avc420 = true;
+    config.avc444 = config.avc444v2 = false;
+    GraphicsPipeline pipeline(
+        channels, big_width, big_height, config, TileCodec::progressive, stub_factory,
+        farland::server::PipelineOptions{
+            .clearcodec = false, .direct_tiles = 0, .min_video_tiles = 6, .video_idle_frames = 3});
+    const auto id = establish_with(client, channels, pipeline, gfx::make_capability_set(gfx::cap_version::v10_7, 0));
+    CHECK(pipeline.codec() == TileCodec::progressive);
+
+    struct Seen {
+        std::vector<gfx::Rect16> avc;
+        std::size_t progressive_streams = 0;
+        std::size_t exact_tiles = 0;
+    };
+    const auto receive = [&] {
+        Seen seen;
+        for (const auto& pdu : client.take_gfx(id)) {
+            if (const auto* w1 = std::get_if<gfx::WireToSurface1>(&pdu)) {
+                if (w1->codec_id == gfx::codec::planar) {
+                    ++seen.exact_tiles;  // the lossless pass over a still tile
+                    continue;
+                }
+                REQUIRE(w1->codec_id == gfx::codec::avc420);
+                const auto stream = farland::codec::avc::decode_avc420(w1->bitmap_data).value();
+                for (const auto& region : stream.regions) {
+                    seen.avc.push_back({region.rect.left, region.rect.top, region.rect.right, region.rect.bottom});
+                }
+            } else if (std::holds_alternative<gfx::WireToSurface2>(pdu)) {
+                ++seen.progressive_streams;
+            }
+        }
+        return seen;
+    };
+
+    Bytes pixels = noisy_gradient(5);
+    auto frame_id = pipeline.send_frame(big_view(pixels));
+    REQUIRE(frame_id.has_value());
+    CHECK(receive().avc.empty());  // the first repaint is not motion yet
+
+    // Six tiles repaint every frame: after a few frames they count as moving
+    // picture and H.264 takes them, while the rest stays Progressive.
+    std::size_t avc_frames = 0;
+    std::vector<gfx::Rect16> last;
+    for (std::uint32_t n = 0; n < 8; ++n) {
+        repaint_tiles(pixels, 0, 0, 3, 2, 200 + n);
+        frame_id = pipeline.send_frame(big_view(pixels));
+        REQUIRE(frame_id.has_value());
+        const auto seen = receive();
+        if (!seen.avc.empty()) {
+            ++avc_frames;
+            last = seen.avc;
+        }
+    }
+    CHECK(avc_frames >= 4);
+    CHECK(same_rects(last, {{0, 0, 64, 64},
+                            {64, 0, 128, 64},
+                            {128, 0, 192, 64},
+                            {0, 64, 64, 128},
+                            {64, 64, 128, 128},
+                            {128, 64, 192, 128}}));
+
+    // The video stops: the tiles cool down, go back to Progressive and end up
+    // exact again, and the H.264 encoder is dropped.
+    std::size_t progressive_after = 0;
+    std::size_t exact_after = 0;
+    for (std::uint32_t n = 0; n < 40; ++n) {
+        pipeline.begin_frame();
+        pipeline.add_frame(0, big_view(pixels));
+        if (pipeline.end_frame()) {
+            const auto seen = receive();
+            CHECK(seen.avc.empty());
+            progressive_after += seen.progressive_streams;
+            exact_after += seen.exact_tiles;
+        }
+    }
+    CHECK(progressive_after > 0);
+    CHECK(exact_after >= 6);  // at least the six tiles H.264 had been painting
 }

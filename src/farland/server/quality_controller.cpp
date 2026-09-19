@@ -67,6 +67,7 @@ QualityTier QualityController::make_tier(unsigned level, const Config& config,
     }
     tier.h264.mode = video::RateControl::Mode::constant_quality;
     tier.h264.quality = rung.crf;
+    cap /= std::max(config.pictures_per_frame, 1U);
     tier.h264.max_bitrate_kbps = std::clamp(static_cast<std::uint32_t>(cap), min_cap_kbps, video::max_bitrate_kbps);
     return tier;
 }

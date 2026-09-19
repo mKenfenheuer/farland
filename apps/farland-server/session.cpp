@@ -825,8 +825,12 @@ private:
         }
         channels::rdpgfx::GfxServerConfig config;
         const bool avc444 = options_.gfx_codec == server::TileCodec::avc444;
-        // AVC444 falls back to AVC420 for clients without it (8.1).
-        config.avc420 = options_.gfx_codec == server::TileCodec::avc420 || avc444;
+        const bool progressive = options_.gfx_codec == server::TileCodec::progressive;
+        // AVC444 falls back to AVC420 for clients without it (8.1). A
+        // Progressive surface takes AVC420 too, for the tiles that keep
+        // changing (server::PipelineOptions::video_regions).
+        config.avc420 =
+            options_.gfx_codec == server::TileCodec::avc420 || avc444 || (progressive && options_.video_regions);
         config.avc444 = config.avc444v2 = avc444;
         server::H264Factory make_h264;
         if (config.avc420) {
@@ -843,13 +847,19 @@ private:
             };
         }
         gfx_.emplace(*dvc_, output_, config, options_.gfx_codec, std::move(make_h264),
-                     server::PipelineOptions{.clearcodec = options_.clearcodec, .refine = options_.refine});
+                     server::PipelineOptions{.clearcodec = options_.clearcodec,
+                                             .refine = options_.refine,
+                                             .video_regions = options_.video_regions,
+                                             .lossless_still = options_.lossless_still});
         // Congestion control starts at the best tier; its encoder settings
         // go in before the encoders exist.
         server::QualityController::Config quality;
         quality.width = output_.width;
         quality.height = output_.height;
         quality.fps = options_.frames_per_second;
+        // AVC444 puts two H.264 pictures on the wire for every frame, so the
+        // encoder's per-second cap has to be half the session's budget.
+        quality.pictures_per_frame = avc444 ? 2U : 1U;
         quality_.emplace(quality);
         apply_tier(quality_->tier());
     }

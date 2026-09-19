@@ -70,6 +70,12 @@ struct SessionOptions {
     /// coarse first passes refined while the picture stands still.
     bool clearcodec = true;
     bool refine = true;
+    /// Progressive surfaces: tiles that keep changing and hold too many
+    /// colours for ClearCodec go through H.264 on the same surface.
+    bool video_regions = true;
+    /// Progressive surfaces: a still picture is sent once more losslessly,
+    /// so that what stands still ends up free of quantization artefacts.
+    bool lossless_still = true;
     /// Audio: the desktop's output plays on the client (rdpsnd), and the
     /// client's microphone becomes a local audio source (audin).
     bool audio = true;

@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-14):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 is in progress. M7's multi-session daemon works (S0, S1).
+**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works (S0, S1).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -218,17 +218,53 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
       - The NVENC API 12.0 and CUDA are loaded at runtime from the driver (520 or newer), so building needs no NVIDIA SDK or CUDA toolkit. The API declarations are checked against NVIDIA's header.
       - CUDA on driver 595 cannot import dmabufs. So the dmabuf goes through EGL and OpenGL into a texture registered with CUDA, and a small kernel converts it to NV12, bit-identical to the CPU conversion.
       - Measured on an RTX 3090 (driver 595): 4K30 from tiled dmabufs costs 1.07 ms of CPU per frame (3.2% of one core) at 10 ms latency with the P4 preset. Through CPU memory it costs 16 ms (48%).
-    - Mixed mode on Progressive surfaces (`--no-clearcodec`, `--no-refine` switch it off):
-      - Every changed 64x64 tile is classified by counting its colours, stopping at the 49th. Tiles with few colours (text, UI) go through ClearCodec, one region per run of adjacent tiles in a row; the rest go through Progressive, coarse first.
-      - A frame's leftover bytes (16 KB per frame) refine the Progressive tiles that did not change. Frames keep coming while refinement is pending, and stop once everything is at full quality.
-      - Tiles that switch to ClearCodec, and areas moved by a scroll, drop their Progressive refinement, so no upgrade paints over them.
+    - Mixed mode on Progressive surfaces, with the codec chosen per tile from how that tile behaves over time (`--no-clearcodec`, `--no-refine`, `--no-video-regions`, `--no-lossless-still` switch the parts off):
+      - Every changed 64x64 tile is classified by counting its colours, stopping at the 49th, and by a motion counter (+2 for a frame that changed it, -1 for one that did not, capped at 12).
+      - Tiles with few colours (text, UI) go through ClearCodec, one region per run of adjacent tiles in a row.
+      - Tiles from a motion count of 8 (four frames of change in a row) that hold too many colours for ClearCodec are moving picture and go through H.264 on the same surface: one AVC420 picture of the whole surface whose regionRects list only those tiles, so ClearCodec and Progressive pixels elsewhere are never painted over, an IDR included. The encoder is made when the first video region appears and dropped again after 90 frames without one; tiles that stop moving are marked changed at once and come back sharp through Progressive or ClearCodec. The Progressive refinement of those tiles is discarded, so no upgrade paints over the H.264 pixels.
+      - Damage of at most 12 tiles skips the coarse first pass: those tiles go out at full Progressive quality in one TILE_FIRST (`Encoder::Pass::direct`, bit-identical to a single-pass tile) and owe no upgrade. A caret, a spinner or a clock repaints the same few tiles over and over, and the coarse-first ladder never caught up with it, so exactly what the eye rests on stayed at the quality of a first pass. Tiles that are already hot keep the ladder, which costs less per frame.
+      - The rest goes through Progressive, coarse first. A frame's leftover bytes (16 KB per frame) refine the Progressive tiles that did not change. Frames keep coming while refinement is pending.
+      - Lossless convergence: once a Progressive tile is at full quality and has stood still for three frames, it goes out once more as lossless planar (48 KB per frame, round-robin over the surface), so a desktop that stands still ends up pixel-exact instead of keeping the quantization noise of its tier. ClearCodec tiles are exact already and are skipped. Frames keep coming until every still tile is exact, and stop there.
+      - Tiles that switch to ClearCodec, to H.264 or to the lossless pass, and areas moved by a scroll, drop their Progressive refinement, so no upgrade paints over them.
+    - Rate control accounts for the two pictures per AVC444 frame: `QualityController::Config::pictures_per_frame` halves the encoder's VBV cap, since both views go through one encoder at the session's nominal frame rate and would otherwise produce twice the tier's budget.
+    - The exit benchmark (`benchmarks/bench_codecs.cpp`, `meson compile -C build bench-codecs`): bitrate, CPU, latency and PSNR per codec over a generated content corpus (a dense page of text from a 16-glyph alphabet, a UI, a photo, a mixed desktop, and a video sequence), and the "text at 2 Mbit/s" check. The corpus is generated, so the numbers are reproducible without sample files. Measured on Kubuntu 26.04, GCC 15, one core of a 4-core VM, 1920x1080, release build, for a whole frame repainted at once:
+
+      | corpus | codec | KB/frame | kbit/s at 30 fps | CPU ms | latency | PSNR | over glyphs |
+      | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+      | text | ClearCodec | 322.5 | 79251 | 36.1 | 36 ms | exact | exact |
+      | text | Progressive `quant_default` | 1013.3 | 249018 | 35.0 | 35 ms | 40.1 | 35.3 |
+      | text | Progressive refined | 1055.6 | 259432 | 365.2 | 1567 ms | 40.1 | 35.3 |
+      | ui | ClearCodec | 40.5 | 9942 | 11.4 | 11 ms | exact | exact |
+      | ui | Progressive `quant_default` | 124.9 | 30700 | 20.6 | 21 ms | 49.8 | 37.3 |
+      | ui | Progressive refined | 156.0 | 38328 | 142.7 | 200 ms | 49.8 | 37.3 |
+      | photo | planar (lossless) | 6076.0 | 1493237 | 44.0 | 44 ms | exact | - |
+      | photo | Progressive `quant_default` | 337.9 | 83045 | 35.1 | 35 ms | 39.4 | - |
+      | photo | Progressive `quant_highest` | 1559.4 | 383230 | 78.3 | 78 ms | 44.6 | - |
+      | photo | Progressive refined | 384.0 | 94381 | 263.2 | 667 ms | 39.4 | - |
+      | photo (30 frames of motion) | AVC420, OpenH264, 6 Mbit/s cap | 19.0 | 4663 | 13.0 | 21 ms | - | - |
+      | photo (30 frames of motion) | AVC420, OpenH264, 2 Mbit/s cap | 8.2 | 2013 | 9.9 | 20 ms | - | - |
+      | mixed desktop | ClearCodec | 761.3 | 187086 | 28.9 | 29 ms | exact | exact |
+      | mixed desktop | Progressive `quant_default` | 160.1 | 39337 | 22.0 | 22 ms | 46.2 | 37.3 |
+      | mixed desktop (30 frames of motion) | AVC420, 6 Mbit/s cap | 3.9 | 968 | 7.5 | 17 ms | - | - |
+
+      Reading it: a whole frame repainted 30 times a second is the worst case and nothing but H.264 fits a link; what a desktop actually sends is a few changed tiles per frame. The refined Progressive row shows what the coarse-first ladder costs in time: a full-frame repaint of a photo needs 21 frames (667 ms) of upgrades before the picture is complete, which is exactly why small damage now skips the ladder. ClearCodec is pixel-exact on text and UI at a quarter of the bytes of Progressive, and Progressive is an order of magnitude smaller than either lossless codec on a photo.
+    - **Text at 2 Mbit/s: met.** Typing into a full page of text (three 64x64 tiles repainted per frame) costs 1978 bytes per frame, 475 kbit/s at 30 fps, and is pixel-exact: ClearCodec, which is where mixed mode sends text tiles. Repainting the whole page at once costs 322 KB, so a full-page repaint takes about 1.3 s of a 2 Mbit/s link; it stays exact and happens once, not per frame. Progressive on the same page reaches 35.3 dB over the glyphs, which is what ClearCodec exists to avoid.
   - Open:
-    - AVC444, ClearCodec and Progressive refinement against mstsc and Windows App.
-    - Video regions through H.264 on the same surface as ClearCodec and Progressive (only whole-surface AVC so far).
-    - The exit benchmarks: bitrate, CPU and latency per codec on a content corpus, and text at 2 Mbit/s.
-    - Rate control does not yet account for the two pictures per AVC444 frame.
-    - Zero-copy covers AVC420 only; AVC444 would need the 4:4:4 split on the GPU.
-  - Tested: FreeRDP 3 answers every auto-detect request. mstsc and Windows App are not tested with auto-detect yet, and no tier change has been seen on a real slow link (only in simulated traces).
+    - AVC444, ClearCodec, Progressive refinement, the H.264 video regions and the lossless pass against mstsc and Windows App.
+    - Zero-copy covers AVC420 only; AVC444 would need the 4:4:4 split on the GPU, and the mixed-mode video regions read pixels because the classifier needs them.
+  - Tested:
+    - FreeRDP 3 answers every auto-detect request. mstsc and Windows App are not tested with auto-detect yet, and no tier change has been seen on a real slow link (only in simulated traces).
+    - Live on Kubuntu 26.04 (2026-09-19), `--headless plasma` at 1280x800 with a 960x540 video (`ffplay -f lavfi testsrc2`) playing in it, one FreeRDP 3.31 client, the same picture for each run:
+
+      | pipeline | while the video runs | desktop at rest |
+      | --- | ---: | ---: |
+      | mixed mode (the default) | 3.5 Mbit/s, peak 4.3 | 1 kbit/s |
+      | `--no-video-regions` | 4.4 Mbit/s, peak 4.8 | 1 kbit/s |
+      | `--no-video-regions --no-lossless-still --no-refine` | 14–16 Mbit/s | 1 kbit/s |
+
+      H.264 takes the video tiles and saves about a fifth of the bytes against Progressive alone, while the clock in the corner of the picture stays sharp through ClearCodec, and the checkerboard in it shows the 4:2:0 chroma of the H.264 region and nothing else: the codecs composite on one surface without painting over each other. At rest the pipeline goes quiet at 1 kbit/s once the lossless pass has made the picture exact, which is what it is for.
+    - Live on Ubuntu 26.04 (GNOME 50) with `--headless gnome` and the same video: the session comes up, the picture renders and the frame rate holds 30 fps.
+    - **Ubuntu's and Kubuntu's `freerdp3` package is built with `WITH_GFX_H264=OFF`**, so it advertises RDPGFX_CAPS_FLAG_AVC_DISABLED and no AVC path can be exercised against it. The live AVC runs above used a FreeRDP 3.31 built from source with `-DWITH_GFX_H264=ON -DWITH_OPENH264=ON`, started with `/gfx:AVC444` (plain `/gfx` leaves AVC off).
 
 ### M6: Channels (~7 weeks)
 - **disp (MS-RDPEDISP):** dynamic resize and **multi-monitor**. Virtual monitors come from Mutter `RecordVirtual`, the KWin virtual output or the portal `VIRTUAL` source; otherwise letterboxing.
@@ -248,6 +284,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - Optional: **rdpecam** as a PipeWire virtual camera; **ainput**.
 - **Exit:** clipboard works in both directions for text, images and files; audio stays in sync (under 100 ms) and the microphone works from Windows App and FreeRDP.
 - **Status: all four channels implemented and tried with FreeRDP; the exit needs mstsc and Windows App, the portal clipboard on a live desktop, and a real touch device.**
+- **The optional channels are not implemented.** `rdpecam` ([MS-RDPECAM]) carries the client's camera as H.264 or MJPEG, and farland has no decoder for either: it would need a runtime-loaded one (the same problem AAC has in rdpsnd), so it is left for phase 3 together with the other decode-side work. `ainput` is FreeRDP's own channel and adds nothing the RDP input paths do not already carry.
 - **Status of disp: implemented.**
   - Done:
     - The [MS-RDPEDISP] codec (`channels/disp`): the capabilities and monitor layout PDUs with every field (orientation, desktop and device scale, physical size), decoded strictly (the header length, MonitorLayoutSize 40, 1 to MaxNumMonitors monitors that fill the PDU), with a fuzz target that also runs the server's validation.

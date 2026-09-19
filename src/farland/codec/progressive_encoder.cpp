@@ -273,11 +273,11 @@ void Encoder::transform(const rfx::Planes& planes)
     }
 }
 
-void Encoder::code_components(std::size_t level, Block& out)
+void Encoder::code_components(std::size_t level, std::uint8_t stage, Block& out)
 {
     const rfx::Layout& layout = options_.reduce_extrapolate ? rfx::extrapolate_layout : rfx::standard_layout;
     out.quant = ladder_.at(level);
-    out.quality = 0;  // quality stage 0 (refinement), or the only table
+    out.quality = stage;  // the quality stage, or 0 for the only table
     out.data.clear();
     for (std::size_t c = 0; c < 3; ++c) {
         rfx::Coefficients& quantized = quantized_->at(c);
@@ -286,9 +286,10 @@ void Encoder::code_components(std::size_t level, Block& out)
         rfx::Coefficients& coeffs = *scratch_;
         coeffs = quantized;
         if (options_.refine) {
-            // Extra quantization of stage 0 ([MS-RDPEGFX] 3.1.8.1.3), toward
-            // zero; LL3 has none (stages_valid).
-            const rfx::Quant extra = extra_shift(out.quant, 0);
+            // Extra quantization of the tile's stage ([MS-RDPEGFX] 3.1.8.1.3),
+            // toward zero; LL3 has none (stages_valid), and the last stage
+            // drops nothing, which is what a direct pass sends.
+            const rfx::Quant extra = extra_shift(out.quant, stage);
             for (std::size_t b = 0; b < rfx::band_count; ++b) {
                 const std::uint32_t shift = extra.bands.at(b);
                 if (shift == 0) {
@@ -308,7 +309,7 @@ void Encoder::code_components(std::size_t level, Block& out)
     }
 }
 
-Encoder::Block Encoder::encode_tile(const ImageView& image, std::uint32_t tx, std::uint32_t ty)
+Encoder::Block Encoder::encode_tile(const ImageView& image, std::uint32_t tx, std::uint32_t ty, std::uint8_t stage)
 {
     Block out;
     out.x_idx = static_cast<std::uint16_t>(tx);
@@ -324,7 +325,7 @@ Encoder::Block Encoder::encode_tile(const ImageView& image, std::uint32_t tx, st
     };
     transform(*planes_);
     for (std::size_t level = 0; level < ladder_.size(); ++level) {
-        code_components(level, out);
+        code_components(level, stage, out);
         if (fits(out)) {
             return out;
         }
@@ -351,7 +352,7 @@ Encoder::Block Encoder::encode_tile(const ImageView& image, std::uint32_t tx, st
     planes_->cb.fill(flat.cb);
     planes_->cr.fill(flat.cr);
     transform(*planes_);
-    code_components(0, out);
+    code_components(0, stage, out);
     out.flat = true;
     FARLAND_ASSERT(fits(out));
     return out;
@@ -631,7 +632,7 @@ std::vector<std::vector<std::byte>> Encoder::write_streams(const std::vector<Gro
     return streams;
 }
 
-std::vector<std::vector<std::byte>> Encoder::encode(const ImageView& image, std::span<const Rect> damage)
+std::vector<std::vector<std::byte>> Encoder::encode(const ImageView& image, std::span<const Rect> damage, Pass pass)
 {
     FARLAND_ASSERT(image.width == width_ && image.height == height_);
     FARLAND_ASSERT(image.stride >= std::size_t{width_} * 4);
@@ -650,12 +651,19 @@ std::vector<std::vector<std::byte>> Encoder::encode(const ImageView& image, std:
             if (!selected_[i]) {
                 continue;
             }
-            blocks.push_back(encode_tile(image, tx, ty));
+            // The last stage drops no bits, so a direct pass sends what a
+            // single pass would and owes no upgrade.
+            const std::uint8_t stage = pass == Pass::direct ? full_quality_stage : 0;
+            blocks.push_back(encode_tile(image, tx, ty, stage));
             if (!options_.refine) {
                 continue;
             }
             // A new first pass replaces whatever refinement was pending.
             const Block& b = blocks.back();
+            if (pass == Pass::direct) {
+                drop_state(i);
+                continue;
+            }
             if (b.flat) {
                 drop_state(i);
                 continue;

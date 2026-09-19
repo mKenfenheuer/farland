@@ -69,6 +69,34 @@ struct PipelineOptions {
     std::size_t upgrade_budget = std::size_t{16} * 1024;
     /// A tile with at most this many colours counts as text or UI (at most 64).
     std::uint32_t max_clear_colours = 48;
+    /// Damage of at most this many tiles skips the coarse first pass and goes
+    /// out at full Progressive quality at once. A caret, a spinner or a clock
+    /// repaints the same few tiles over and over, and the coarse-first ladder
+    /// never catches up with it: what the eye rests on would stay at the
+    /// quality of a TILE_FIRST pass. Nothing is refined afterwards, so these
+    /// bytes are paid once. 0 turns it off.
+    std::uint32_t direct_tiles = 12;
+    /// Tiles that keep changing (a video, an animation) and hold too many
+    /// colours for ClearCodec go through H.264 on the same surface, listed as
+    /// the regions of an AVC420 picture; the rest of the surface stays
+    /// ClearCodec and Progressive. Needs an H264Factory and a client that
+    /// takes AVC420.
+    bool video_regions = true;
+    /// Fewest changing tiles before H.264 takes them over. Below this the
+    /// direct full-quality pass is both sharper and cheaper.
+    std::uint32_t min_video_tiles = 6;
+    /// Frames of H.264 without a video tile before the encoder is dropped and
+    /// its tiles go back to Progressive and ClearCodec.
+    std::uint32_t video_idle_frames = 90;
+    /// Once a Progressive tile is at full quality and has stood still for
+    /// `still_frames` frames, it goes out once more as lossless planar, so
+    /// that a desktop that stands still ends up pixel-exact instead of
+    /// keeping the quantization noise of the last tier. Tiles that came from
+    /// ClearCodec are exact already and are skipped.
+    bool lossless_still = true;
+    std::uint32_t still_frames = 3;
+    /// Bytes per frame the lossless pass may spend, after the upgrades.
+    std::size_t lossless_budget = std::size_t{48} * 1024;
     /// Let clients that allow it scale down pictures larger than their place
     /// (MapSurfaceToScaledOutput, [MS-RDPEGFX] 2.2.2.22); otherwise the
     /// caller scales them.
@@ -215,6 +243,32 @@ private:
         /// already; end_frame() refines the others.
         bool in_frame = false;
         std::vector<bool> dirty;
+
+        // Mixed mode on a Progressive surface: how each tile behaves over
+        // time decides which codec it gets.
+        /// How busy each tile is: +2 for a frame that changed it, -1 for one
+        /// that did not, capped at motion_max. A video saturates it in a few
+        /// frames; a caret blinking once a second never leaves zero.
+        std::vector<std::uint8_t> motion;
+        /// Frames since the tile last changed, capped (only the threshold matters).
+        std::vector<std::uint8_t> still;
+        /// The client holds this tile's exact pixels (ClearCodec, planar, or
+        /// the lossless pass): nothing more is owed for it.
+        std::vector<bool> exact;
+        /// The client's pixels for this tile came from H.264 last: when it
+        /// stops moving it is sent again, sharp, by Progressive or ClearCodec.
+        std::vector<bool> from_video;
+        /// H.264 for the changing tiles of a Progressive surface. It codes
+        /// the whole surface, but only the video tiles are listed as regions,
+        /// so it never paints over ClearCodec or Progressive pixels.
+        std::unique_ptr<video::H264Encoder> video;
+        std::optional<codec::Yuv420Frame> video_yuv;
+        /// No encoder could be made: do not try again for this surface.
+        bool video_unavailable = false;
+        std::uint32_t video_idle = 0;
+        /// Where the lossless pass carries on, so a small budget serves every
+        /// tile in turn.
+        std::size_t exact_cursor = 0;
     };
 
     void drain_gfx();
@@ -237,15 +291,40 @@ private:
     /// One AVC444 or AVC444v2 WireToSurface1 ([MS-RDPEGFX] 2.2.4.5, 2.2.4.6);
     /// the encoder picks the views and regions.
     void send_avc444_frame(Screen& s, const codec::ImageView& frame, const TileList& tiles);
-    void send_planar_tile(Screen& s, const codec::ImageView& frame, std::uint32_t tx, std::uint32_t ty);
+    /// One lossless planar tile; returns the bytes of its stream.
+    std::size_t send_planar_tile(Screen& s, const codec::ImageView& frame, std::uint32_t tx, std::uint32_t ty);
     /// A tile with at most options_.max_clear_colours colours: text or UI.
     [[nodiscard]] bool few_colours(const Screen& s, const codec::ImageView& frame, std::uint32_t tx,
                                    std::uint32_t ty) const;
     /// `area` of `frame` as one ClearCodec WireToSurface1; returns its size.
     std::size_t send_clear(Screen& s, const codec::ImageView& frame, const codec::progressive::Rect& area);
     /// TILE_UPGRADE passes for the tiles not in `changed`, within what is left
-    /// of options_.upgrade_budget after `used` bytes.
-    void send_upgrades(Screen& s, const TileList& changed, std::size_t used);
+    /// of options_.upgrade_budget after `used` bytes. Returns the bytes it spent.
+    std::size_t send_upgrades(Screen& s, const TileList& changed, std::size_t used);
+    /// Ages the per-tile motion and stillness counters by one frame:
+    /// `changed` moved, the rest stood still.
+    static void age_tiles(Screen& s, const TileList& changed);
+    /// The changing tiles H.264 should take over, among `changed`; `few` says
+    /// for each of them whether it has few enough colours for ClearCodec.
+    /// Empty when mixed video is off, there are too few of them, or no
+    /// encoder can be made.
+    [[nodiscard]] TileList video_tiles(Screen& s, const TileList& changed, std::span<const char> few) const;
+    /// One AVC420 picture of the whole surface listing only `tiles` as its
+    /// regions: the client copies those and leaves the rest of the surface
+    /// alone. Returns the bytes it spent, 0 when nothing went out.
+    std::size_t send_video_tiles(Screen& s, const codec::ImageView& frame, const TileList& tiles);
+    /// Creates (or keeps) the mixed-mode H.264 encoder; false when there is none.
+    bool ensure_video_encoder(Screen& s);
+    /// Sends still Progressive tiles once more as lossless planar, within
+    /// `budget` bytes, so that a picture that stands still becomes exact.
+    /// `frame` is what the client has, tile for tile (s.previous does).
+    void send_exact(Screen& s, const codec::ImageView& frame, std::size_t budget);
+    /// A tile still owes the client an exact copy.
+    [[nodiscard]] bool exact_pending(const Screen& s) const noexcept;
+    /// Marks the tiles H.264 painted that stopped moving as changed, so that
+    /// they go out again through Progressive or ClearCodec; `all` takes every
+    /// one of them (the encoder is going away). True when it marked any.
+    static bool reclaim_video_tiles(Screen& s, bool all);
     /// What a screen that got no picture in the open frame still owes the
     /// client: Progressive upgrades, or the AVC444 chroma held back earlier.
     void refine_still_screen(Screen& s);

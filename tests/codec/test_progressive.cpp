@@ -100,9 +100,10 @@ double psnr(const ImageView& a, const ImageView& b)
 /// Encodes `damage` of `image` and decodes the streams into `decoder`.
 std::vector<std::vector<std::byte>> round_trip(progressive::Encoder& encoder, progressive::Decoder& decoder,
                                                const ImageView& image, std::span<const Rect> damage,
-                                               std::uint32_t frame_id, std::size_t max_bytes)
+                                               std::uint32_t frame_id, std::size_t max_bytes,
+                                               progressive::Encoder::Pass pass = progressive::Encoder::Pass::refined)
 {
-    auto streams = encoder.encode(image, damage);
+    auto streams = encoder.encode(image, damage, pass);
     for (const auto& stream : streams) {
         CHECK(stream.size() <= max_bytes);
         const auto result = decoder.decode(stream, frame_id);
@@ -953,6 +954,42 @@ TEST_CASE("Refinement converges to the single-pass picture bit for bit", "[codec
     CHECK(quality.back() > quality.front());
     CHECK(quality.back() >= 40.0);
     CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+}
+
+TEST_CASE("A direct pass is the single-pass picture at once and owes no upgrade", "[codec][progressive]")
+{
+    const Image img = natural_image(320, 200);
+    const auto target =
+        single_pass_pixels(img.view(), {.quant = progressive::quant_highest, .reduce_extrapolate = true});
+    const std::array full{Rect{.x = 0, .y = 0, .width = 320, .height = 200}};
+
+    progressive::Encoder encoder(320, 200, refine_options);
+    auto decoder = progressive::Decoder::create(320, 200);
+    REQUIRE(decoder.has_value());
+    const auto streams = round_trip(encoder, *decoder, img.view(), full, 1, progressive::default_max_bytes,
+                                    progressive::Encoder::Pass::direct);
+    REQUIRE(!streams.empty());
+    // Nothing is left to refine, and the client already has what a refined
+    // encoder would have reached only after every upgrade.
+    CHECK(encoder.pending_tiles() == 0);
+    CHECK(encoder.tile_stage(0, 0) == progressive::full_quality_stage);
+    CHECK(encoder.upgrade(std::size_t{1} << 20).empty());
+    CHECK(pixels_of(*decoder) == target);
+
+    // A refined first pass of the same picture is coarser and leaves work behind.
+    progressive::Encoder coarse_encoder(320, 200, refine_options);
+    auto coarse_decoder = progressive::Decoder::create(320, 200);
+    REQUIRE(coarse_decoder.has_value());
+    static_cast<void>(round_trip(coarse_encoder, *coarse_decoder, img.view(), full, 1, progressive::default_max_bytes));
+    CHECK(coarse_encoder.pending_tiles() == 20);
+    CHECK(psnr(img.view(), decoder->image()) > psnr(img.view(), coarse_decoder->image()));
+
+    // A tile that changes again after a direct pass starts over normally.
+    Image moved = natural_image(320, 200, 9);
+    const std::array corner{Rect{.x = 0, .y = 0, .width = 64, .height = 64}};
+    static_cast<void>(encoder.encode(moved.view(), corner));
+    CHECK(encoder.pending_tiles() == 1);
+    CHECK(encoder.tile_stage(0, 0) == 0);
 }
 
 TEST_CASE("Upgrades stay within the budget and raise quality stage by stage", "[codec][progressive]")

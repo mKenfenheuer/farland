@@ -129,6 +129,9 @@ void usage()
                  "  --no-clearcodec       Progressive surfaces: no ClearCodec for text and UI tiles\n"
                  "  --no-refine           Progressive surfaces: every tile at full quality at once, no\n"
                  "                        refinement passes\n"
+                 "  --no-video-regions    Progressive surfaces: no H.264 for the tiles that keep changing\n"
+                 "  --no-lossless-still   Progressive surfaces: do not resend a still picture losslessly\n"
+                 "                        once it stands still\n"
                  "  --no-audio            do not play the desktop's audio on the client (rdpsnd)\n"
                  "  --no-microphone       do not offer the client's microphone as a local audio source (audin)\n"
                  "  --autodetect MODE     network auto-detect for clients that support it: full (default;\n"
@@ -218,6 +221,10 @@ bool parse_options(std::span<char*> args, Options& options)
             options.session.clearcodec = false;
         } else if (arg == "--no-refine") {
             options.session.refine = false;
+        } else if (arg == "--no-video-regions") {
+            options.session.video_regions = false;
+        } else if (arg == "--no-lossless-still") {
+            options.session.lossless_still = false;
         } else if (arg == "--no-audio") {
             options.session.audio = false;
         } else if (arg == "--no-microphone") {

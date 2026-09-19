@@ -161,11 +161,24 @@ public:
     Encoder& operator=(Encoder&&) noexcept;
     ~Encoder();
 
+    /// How the first pass of a tile is coded while refinement is on.
+    enum class Pass : std::uint8_t {
+        /// TILE_FIRST at quality_stages[0]; upgrade() raises it from there.
+        refined,
+        /// TILE_FIRST at full quality, the same coefficients a single pass
+        /// sends, and nothing left to upgrade. For damage small enough that
+        /// the bytes do not matter: a caret, a spinner or a clock changes
+        /// the same tile over and over, and would otherwise never leave the
+        /// coarsest stage, which is exactly where the eye rests.
+        direct,
+    };
+
     /// Encodes the 64 x 64 tiles of `image` that intersect `damage` (surface
     /// coordinates, clipped to the surface) into complete streams, one per
     /// WIRE_TO_SURFACE_2 PDU. No damage gives no streams. `image` must match
     /// the surface size (asserted).
-    [[nodiscard]] std::vector<std::vector<std::byte>> encode(const ImageView& image, std::span<const Rect> damage);
+    [[nodiscard]] std::vector<std::vector<std::byte>> encode(const ImageView& image, std::span<const Rect> damage,
+                                                             Pass pass = Pass::refined);
 
     /// Refinement: TILE_UPGRADE blocks for the tiles that intersect `area`
     /// and are below full quality, in streams like encode()'s whose sizes
@@ -205,9 +218,10 @@ private:
 
     /// Marks the tiles that intersect `rects` in selected_; returns how many.
     std::size_t select(std::span<const Rect> rects);
-    [[nodiscard]] Block encode_tile(const ImageView& image, std::uint32_t tx, std::uint32_t ty);
+    /// Codes one tile at quality stage `stage` (0 unless refinement is on).
+    [[nodiscard]] Block encode_tile(const ImageView& image, std::uint32_t tx, std::uint32_t ty, std::uint8_t stage = 0);
     void transform(const rfx::Planes& planes);
-    void code_components(std::size_t level, Block& out);
+    void code_components(std::size_t level, std::uint8_t stage, Block& out);
     [[nodiscard]] Block encode_upgrade(const TileState& state, std::uint32_t index, std::uint8_t to) const;
     [[nodiscard]] std::size_t stream_overhead(std::size_t quant_tables, bool sync) const noexcept;
     [[nodiscard]] std::size_t stream_size(const Group& group, bool sync) const noexcept;

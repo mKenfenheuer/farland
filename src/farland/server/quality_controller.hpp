@@ -64,6 +64,12 @@ public:
         std::uint32_t width = 1920;
         std::uint32_t height = 1080;
         unsigned fps = 30;
+        /// H.264 pictures the session puts on the wire for every frame: one,
+        /// or two for AVC444, which sends a luma and a chroma view through
+        /// the same encoder. The encoder budgets each picture against its
+        /// nominal frame rate, so with two views its cap has to be half the
+        /// tier's, or the stream comes out at twice the budget.
+        unsigned pictures_per_frame = 1;
 
         Clock::duration sample_interval = std::chrono::milliseconds(500);
         unsigned downshift_samples = 2;
