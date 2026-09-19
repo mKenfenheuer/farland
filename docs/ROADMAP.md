@@ -382,6 +382,15 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     process running as root. Tried live on Kubuntu 26.04 through a real session
     (2026-09-19).
   - Packaging as deb, rpm and an AUR recipe; a container image for the test backend.
+    **All four are in.** `packaging/make-deb.sh` (deb, built and installed by CI on every
+    push), `packaging/farland.spec` with `packaging/make-rpm.sh` (rpm, built and installed in
+    a Fedora 42 container), `packaging/aur/` (`farland-git`, since there is no tagged release
+    yet) and `packaging/container/Containerfile` (farland-server on the test desktop, built
+    and connected to with FreeRDP). The deb and the rpm both keep the reference
+    configuration in `/usr/share/farland/farland.toml` and copy it into `/etc` only when
+    it is not there, so an upgrade never touches the administrator's file and never stops
+    to ask; the AUR recipe follows Arch's convention instead and enables nothing, printing
+    what to run.
 - **Phases:**
   - S0: the broker protocol with descriptor passing, Save Session Info and the ARC verifier, the TOML config, and the local-account column.
   - S1 (done): farlandd and the agent through farland's own PAM, with the test pattern. Two users; reconnecting resumes. Tested with `--no-pam` in the unit tests and as root on the GNOME test host (not in a CI container with `pam_permit`).
@@ -403,7 +412,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - No dmabuf capture yet: frames come in shared memory, so AVC420 reads them from CPU memory.
   - Tested: unit tests for the keymap (layouts, modifiers, spare keys), pointer mapping, damage, cursor pixels and the launch setup; compositor tests against headless sway 1.11, labwc 0.9.3 and cage 0.2.1 (frames, resizing, cursor positions, key bindings with modifiers, a typed €, a clipboard round trip). Live on Ubuntu 26.04 with FreeRDP 3.31: sway's terminal opened and typed into, resized to the client's window, the clipboard in both directions; labwc's menu at the pointer; cage running foot.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
-- **Status (2026-09-19): S0, S1 and S3 done; the GNOME route of S2, self-enrolment and `farlandctl sessions`/`terminate` from S5 work; the Debian package from S5 builds in CI (`packaging/make-deb.sh`) and installs the service.**
+- **Status (2026-09-19): S0, S1, S3 and S5 done; the GNOME route of S2 works. S5 in full: policies, the control API with polkit, self-enrolment, `farlandctl sessions`/`terminate`, Prometheus metrics, the systemd units, and packaging as deb (built and installed by CI), rpm, an AUR recipe and a container image. Kerberos, the last thing S5 names, is still open.**
   - Done:
     - `farlandd` (`apps/farlandd/`):
       - The port, the TLS identity and the credential store.
@@ -436,7 +445,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
       - The agent's first Stats after reattaching tells farlandd which connection it is serving, so a session that has a client does not look disconnected and get ended by `disconnected_timeout`.
       - `KillMode=process` in the unit. This was the last piece and not an obvious one: with `KillMode=mixed` systemd kills the rest of the cgroup, which includes the network process holding the client's TLS connection — the session survived and the client was dropped anyway. Nothing lingers: a network process ends with its client or its agent, and an agent that finds no farlandd gives up after two minutes.
       - Tried on Kubuntu 26.04 both ways: `kill -TERM` and back by hand, and a real `dpkg -i` (which runs `try-restart`). In both the session kept its id and its desktop, and in the upgrade the client stayed connected throughout.
-    - **The configuration is no longer a conffile.** `/etc/farland/farland.toml` used to be shipped into `/etc` and listed in `DEBIAN/conffiles`. It documents every key, so it changes with almost every release, and dpkg then stops to ask which version to keep — which on a non-interactive upgrade (`dpkg -i` with no terminal) fails the package and leaves it **unpacked but not configured**: the new binaries are in place, `postinst` never ran, and the service still runs the old one. The reference now goes to `/usr/share/doc/farland/farland.toml`, `postinst` copies it to `/etc/farland/farland.toml` only when that does not exist, and `postrm purge` removes it. An administrator's file is never touched and no prompt ever appears.
+    - **The configuration is no longer a conffile.** `/etc/farland/farland.toml` used to be shipped into `/etc` and listed in `DEBIAN/conffiles`. It documents every key, so it changes with almost every release, and dpkg then stops to ask which version to keep — which on a non-interactive upgrade (`dpkg -i` with no terminal) fails the package and leaves it **unpacked but not configured**: the new binaries are in place, `postinst` never ran, and the service still runs the old one. The reference is the one meson installs at `/usr/share/farland/farland.toml` — not under `doc/`, because an install with `--nodocs` would leave it out and there would be nothing to copy — and `postinst` copies it to `/etc/farland/farland.toml` only when that does not exist, and `postrm purge` removes it. An administrator's file is never touched and no prompt ever appears.
   - Tested:
     - Unit tests for the registry and policies, the launcher's command lines and environments, and self-enrolment's store update.
     - The agent in process against a scripted farlandd: handover, takeover, cookies, Terminate, logout, and the takeover question with an asker of the test's own.
@@ -462,7 +471,6 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - The wlroots backend served by farlandd (S4) and its live test.
     - `on_local_session = "attach"` live.
     - mstsc and Windows App.
-    - The rest of S5: packaging beyond the Debian one (rpm, AUR, a container image).
     - The agent answers the MCS Connect Initial only once its desktop has started, which takes GDM 10–20 s; FreeRDP needs `/timeout`.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)

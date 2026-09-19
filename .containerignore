@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# What packaging/container/Containerfile does not need in its context: a
+# build directory of a host with a different libc is both large and useless
+# inside the image.
+.git
+build
+build-*
+subprojects/*/
+!subprojects/*.wrap
+!subprojects/packagefiles
+packaging/kwin
+packaging/mutter
+*.deb
+*.rpm

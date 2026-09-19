@@ -20,5 +20,10 @@ if host_machine.system() == 'linux'
   install_data('pam/farland', install_dir: get_option('sysconfdir') / 'pam.d')
   install_data('dbus/org.farland.Farland1.conf', install_dir: dbus_dir)
   install_data('polkit/org.farland.Farland1.policy', install_dir: polkit_dir)
-  install_data('farland.toml', install_dir: get_option('datadir') / 'doc' / 'farland' / 'examples')
+  # The reference configuration with every key and its default, which the
+  # packages copy to /etc/farland/farland.toml the first time they are
+  # installed. Not under doc/: an install with --nodocs (every Fedora
+  # container image, and plenty of servers) would leave it out, and then
+  # there is nothing to copy and no configuration at all.
+  install_data('farland.toml', install_dir: get_option('datadir') / 'farland')
 endif

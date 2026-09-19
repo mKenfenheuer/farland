@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# farland-server with the synthetic test desktop, in an image: something to
+# point a client at without installing anything. It serves the test pattern
+# -- colour bars, a bouncing square, a crosshair on the pointer, the keys
+# pressed -- so the protocol can be tried end to end without a compositor,
+# a GPU, a seat or a login.
+#
+#   podman build -t farland -f packaging/container/Containerfile .
+#   podman run --rm -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret farland
+#   xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:ignore /gfx:progressive
+#
+# It is not a way to run the multi-session daemon: farlandd wants PAM,
+# logind and D-Bus, and a desktop per user, which is a host's job.
+
+FROM docker.io/library/ubuntu:26.04 AS build
+
+# The same dependencies CI installs, from the same script, so the image and
+# CI cannot drift apart.
+COPY ci/install-deps.sh /tmp/install-deps.sh
+RUN sh /tmp/install-deps.sh && rm -rf /var/lib/apt/lists/*
+
+COPY . /src
+WORKDIR /src
+# The image carries farland-server and farlandctl, so Catch2 and the test
+# binaries are pure build time here. Everything else is the build the
+# packages are made from.
+RUN meson setup build --prefix=/usr --sysconfdir=/etc --buildtype=release -Dwerror=true -Dtests=disabled \
+    && meson compile -C build \
+    && DESTDIR=/stage meson install -C build --quiet
+
+FROM docker.io/library/ubuntu:26.04
+
+# Only what farland-server itself links -- `ldd` on the built binary, not
+# a guess: no compositor, no portal, no PipeWire daemon. The test
+# desktop needs none of them.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3t64 libsystemd0 libei1 libpipewire-0.3-0 \
+        libgbm1 libegl1 libva2 libva-drm2 libwayland-client0 libxkbcommon0 \
+        libpam0g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /stage/usr/bin/farland-server /usr/bin/farland-server
+COPY --from=build /stage/usr/bin/farlandctl /usr/bin/farlandctl
+COPY packaging/container/entrypoint.sh /usr/local/bin/entrypoint
+# A checkout on a file system without the executable bit still has to
+# build, and the check below fails the build if the runtime libraries
+# ever fall behind what the binaries want.
+RUN chmod 0755 /usr/local/bin/entrypoint \
+    && for binary in /usr/bin/farland-server /usr/bin/farlandctl; do \
+        ldd "$binary" | grep 'not found' && { echo "$binary: missing libraries above" >&2; exit 1; }; \
+    done; true
+
+# farland-server drops the network process to an unprivileged user when it
+# runs as root, but nothing here needs root at all, so it does not start as
+# root either. The user file, the certificate and the key live in its home.
+RUN useradd --create-home --home-dir /var/lib/farland --shell /usr/sbin/nologin farland
+USER farland
+ENV HOME=/var/lib/farland XDG_CONFIG_HOME=/var/lib/farland/config
+WORKDIR /var/lib/farland
+
+EXPOSE 3389
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

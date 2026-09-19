@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# Arch packages do not enable or start services, and do not write into /etc
+# behind the administrator's back, so this only says what to do. The Debian
+# and RPM packages of the same software do both, because that is what those
+# distributions expect of a service package.
+
+post_install() {
+    cat <<'EOF'
+farland is installed. To run the multi-session daemon:
+
+  install -Dm644 /usr/share/farland/farland.toml /etc/farland/farland.toml
+  $EDITOR /etc/farland/farland.toml            # pick the desktop, at least
+  systemctl enable --now farlandd.service      # port 3389
+  farlandctl passwd                            # enrol yourself
+
+farland-server serves one desktop without the daemon; see the README.
+EOF
+}
+
+post_upgrade() {
+    # farlandd and the agents speak the broker protocol to each other, so
+    # both ends should be this version. Sessions and their clients survive
+    # the restart (docs/ROADMAP.md M7).
+    if systemctl is-active --quiet farlandd.service; then
+        echo 'Restart farlandd to run the new version: systemctl try-restart farlandd.service'
+    fi
+}
+
+post_remove() {
+    echo 'farlandd left /etc/farland and /var/lib/farland (its certificate, users and sessions) behind.'
+}

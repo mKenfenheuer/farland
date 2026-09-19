@@ -19,6 +19,17 @@ Useful configurations:
 
 GitHub CI runs one job only: a release build with `-Dwerror=true`, one `meson test` run, one run of the release binary, and the Debian package (`sh packaging/make-deb.sh BUILD_DIR OUTPUT_DIR`, needs `dpkg-dev`), which it installs to check that the `farlandd` service starts. That keeps runner minutes low, so everything else is on you before you push: the sanitizer, fuzz and clang-tidy builds above, the other compilers (GCC 13 to 16, Clang 19 to 21) and distributions, and the compositor tests.
 
+The other packages are built the same way, and not in CI for the same reason -- run them before a release, on a machine or in a container of that distribution:
+
+| Package | Build | Checked with |
+|---|---|---|
+| deb | `sh packaging/make-deb.sh BUILD_DIR OUT` | `dpkg -i`, then `systemctl is-active farlandd` |
+| rpm | `sh packaging/make-rpm.sh OUT` (`rpm-build`) | `podman run --rm -v $PWD:/src:ro fedora:42`, `dnf install ./farland-*.rpm` |
+| AUR | `cd packaging/aur && makepkg -si` | an Arch container; `makepkg --printsrcinfo > .SRCINFO` before uploading |
+| container | `podman build -t farland -f packaging/container/Containerfile .` | `podman run --rm -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret farland`, then a client |
+
+The deb and the rpm are the same package in two formats: the same four binaries, the same unit, PAM file, D-Bus and polkit policies, and the same handling of `/etc/farland/farland.toml` -- the reference stays in `/usr/share/farland/farland.toml` and is copied in only when the file is absent. A change to one of them almost always belongs in the other. The AUR recipe deliberately differs: Arch packages do not enable services or write into `/etc`, so it prints what to run.
+
 On macOS, use Apple clang for the sanitizer builds (ASan, UBSan and TSan all work). Apple clang has no libFuzzer, though, so fuzz with Homebrew LLVM (`CC=$(brew --prefix llvm)/bin/clang`) and `-Db_sanitize=undefined` only: Homebrew LLVM 20's AddressSanitizer runtime deadlocks at startup on macOS 26, inside `AsanInitInternal`. ASan fuzzing therefore only works on Linux. farland itself targets Linux, and macOS is only for working on the platform-independent libraries.
 
 Tests that need an H.264 encoder are skipped unless one is available. To run them, set `FARLAND_OPENH264_LIBRARY` to a libopenh264 (Cisco's prebuilt binaries from ciscobinary.openh264.org work) or configure with `-Dx264=enabled`. `FARLAND_FFMPEG` and `FARLAND_FFPROBE` point the H.264 quality tests at ffmpeg.

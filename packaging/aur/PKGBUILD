@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+# Maintainer: Maximilian Kenfenheuer <maximilian.kenfenheuer@ksol.it>
+#
+# The AUR recipe. It builds from git because farland has no tagged release
+# yet; a release turns this into `farland` with a source tarball and a fixed
+# pkgver, and the rest stays as it is.
+
+pkgname=farland-git
+pkgver=0.0.1.r0.g0000000
+pkgrel=1
+pkgdesc='RDP server for Linux and Wayland, with headless multi-session'
+arch=('x86_64' 'aarch64')
+url='https://github.com/mKenfenheuer/farland'
+license=('Apache-2.0')
+depends=('openssl' 'systemd-libs' 'libei' 'pipewire' 'mesa' 'libglvnd' 'libva'
+         'wayland' 'libxkbcommon' 'pam')
+# arch-meson forbids downloading wraps, as an Arch package should: both
+# subprojects have to come from the repositories.
+makedepends=('git' 'meson' 'ninja' 'pkgconf' 'wayland-protocols'
+             'tomlplusplus' 'catch2')
+optdepends=('xdg-desktop-portal: sharing the running desktop (--share)'
+            'gdm: headless GNOME sessions per user'
+            'plasma-workspace: headless Plasma sessions per user')
+# What `meson test` needs beyond the build: a session bus and the Python
+# bindings the portal and notification mocks talk over, the same set
+# ci/install-deps.sh installs.
+checkdepends=('dbus' 'python-dbus' 'python-gobject')
+provides=('farland')
+conflicts=('farland')
+backup=('etc/pam.d/farland')
+install=farland.install
+source=("$pkgname::git+https://github.com/mKenfenheuer/farland.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$pkgname"
+    # The project version, the number of commits and the commit: the
+    # pattern AUR -git packages use. meson.build names other versions
+    # too (a dependency's minimum), so only a plain number counts.
+    local version
+    version=$(sed -n "s/^  version: '\([0-9.]*\)',$/\1/p" meson.build | head -1)
+    printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    arch-meson "$pkgname" build -Dwerror=true
+    meson compile -C build
+}
+
+check() {
+    meson test -C build --print-errorlogs
+}
+
+package() {
+    meson install -C build --destdir "$pkgdir"
+
+    # meson installs the reference configuration with every key and its
+    # default at usr/share/farland/farland.toml. Nothing is written into
+    # /etc: farlandd's own file is the administrator's, and farland.install
+    # says how to start it.
+    install -Dm644 "$pkgname/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    install -dm700 "$pkgdir/var/lib/farland"
+}

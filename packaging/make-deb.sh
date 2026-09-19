@@ -32,13 +32,12 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT INT TERM
 
 DESTDIR="$stage" meson install -C "$build" --quiet
-# The daemon reads /etc/farland/farland.toml. The package ships the
-# reference next to the documentation rather than into /etc, and postinst
-# copies it in the first time: as a conffile it would change with every
-# release that documents a new key, and dpkg then stops to ask -- which on a
-# non-interactive upgrade fails the whole package and leaves it unconfigured,
-# with the new binaries in place and postinst never run.
-install -D -m 0644 "$source_dir/data/farland.toml" "$stage/usr/share/doc/farland/farland.toml"
+# The daemon reads /etc/farland/farland.toml. meson installs the reference
+# with every key and its default at usr/share/farland/farland.toml, and
+# postinst copies it into /etc the first time: as a conffile it would change
+# with every release that documents a new key, and dpkg then stops to ask --
+# which on a non-interactive upgrade fails the whole package and leaves it
+# unconfigured, with the new binaries in place and postinst never run.
 
 # Only farland's own files: a build with tests also installs Catch2's
 # headers, library and pkg-config files from the subproject.
@@ -49,7 +48,7 @@ find "$stage/usr" -type f | while read -r file; do
     *" $path "*) continue ;;
     esac
     case $path in
-    usr/lib/systemd/* | usr/share/dbus-1/* | usr/share/polkit-1/* | usr/share/doc/farland/*) continue ;;
+    usr/lib/systemd/* | usr/share/dbus-1/* | usr/share/polkit-1/* | usr/share/farland/*) continue ;;
     # The PAM module that asks a client before somebody at the machine
     # takes the session back; it does nothing until a PAM service names it
     # (packaging/pam/).
@@ -82,7 +81,7 @@ Architecture: $arch
 Maintainer: $maintainer
 Section: net
 Priority: optional
-Homepage: https://github.com/kenfenheuer/farland
+Homepage: https://github.com/mKenfenheuer/farland
 Installed-Size: $size
 Depends: $depends
 Recommends: xdg-desktop-portal, pipewire
@@ -105,10 +104,10 @@ if [ "$1" = configure ]; then
     chmod 0700 /var/lib/farland
     # The administrator's file, created once and never touched again. The
     # reference with every key and its default stays in
-    # /usr/share/doc/farland/farland.toml.
+    # /usr/share/farland/farland.toml.
     if [ ! -e /etc/farland/farland.toml ]; then
         mkdir -p /etc/farland
-        cp /usr/share/doc/farland/farland.toml /etc/farland/farland.toml
+        cp /usr/share/farland/farland.toml /etc/farland/farland.toml
         chmod 0644 /etc/farland/farland.toml
     fi
     if [ -d /run/systemd/system ]; then
@@ -118,9 +117,11 @@ if [ "$1" = configure ]; then
         systemctl enable --now farlandd.service || true
         # An upgrade leaves the old daemon running beside the new agents on
         # disk, and the two speak the broker protocol to each other: restart
-        # it so that both ends are this version. Sessions do not survive a
-        # restart yet (docs/ROADMAP.md M7), so this disconnects whoever is
-        # connected -- which an upgrade does anyway, less predictably.
+        # it so that both ends are this version. The sessions and their
+        # clients survive it (docs/ROADMAP.md M7): farlandd writes its
+        # session table, the agents keep their desktops and the network
+        # processes keep the clients' connections, and the new farlandd
+        # picks them up again.
         systemctl try-restart farlandd.service || true
     fi
 fi
