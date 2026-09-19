@@ -97,6 +97,14 @@ constexpr auto terminate_grace = std::chrono::seconds(15);
 /// handed to it, waits out the takeover prompt nobody will answer, and ends
 /// up on a desktop that is not there.
 constexpr auto agent_silence_limit = std::chrono::seconds(30);
+/// How long a client waits for a session restored from before a restart
+/// before farlandd gives that session up and starts it one of its own. An
+/// agent that is alive reconnects within a second of farlandd coming back,
+/// which is long before any client does, so a restored session that still
+/// has no agent when somebody connects is not coming back. Waiting out the
+/// whole reattach window means staring at nothing for a minute and a half
+/// and then being dropped.
+constexpr auto reattach_grace_with_client = std::chrono::seconds(5);
 constexpr auto hello_timeout = std::chrono::seconds(10);
 /// A question about somebody logging in at the machine runs under a
 /// connection id of its own, above every id a client will ever have
@@ -1151,6 +1159,11 @@ void Daemon::Impl::deliver(Live& session, Authenticated client)
                       session.waiting->peer, session.waiting->id, client.id);
         }
         session.waiting = std::move(client);
+        // A session restored from before a restart starts its short grace
+        // the moment somebody is actually waiting on it.
+        if (session.reattach_deadline) {
+            session.reattach_deadline = std::min(*session.reattach_deadline, Clock::now() + reattach_grace_with_client);
+        }
         return;
     }
     // Whoever holds the session now: the client connected to it, or the
@@ -1563,12 +1576,32 @@ void Daemon::Impl::tick()
     }
     // A session from before the restart whose agent never came back: its
     // process is gone, or too old to speak to us.
-    for (auto& s : live) {
+    std::vector<std::uint32_t> lost;
+    for (const auto& s : live) {
         if (s->reattach_deadline && now >= *s->reattach_deadline) {
-            s->reattach_deadline.reset();
-            log::info(log_component, "session {} of {}: its agent did not come back after the restart", s->id,
-                      s->account);
-            end_session(*s, "the agent did not come back after the restart", "not_reattached");
+            lost.push_back(s->id);
+        }
+    }
+    for (const std::uint32_t id : lost) {
+        Live* s = find(id);
+        if (s == nullptr) {
+            continue;
+        }
+        s->reattach_deadline.reset();
+        log::info(log_component, "session {} of {}: its agent did not come back after the restart", s->id, s->account);
+        // Whoever was waiting for it gets a session of their own rather than
+        // a refusal: they asked for a desktop, and there is nothing wrong
+        // with them.
+        auto waiting = std::move(s->waiting);
+        s->waiting.reset();
+        const std::string account = s->account;
+        const auto user = s->user;
+        const bool attach = registry.find(s->id) != nullptr && registry.find(s->id)->attached;
+        end_session(*s, "the agent did not come back after the restart", "not_reattached");
+        if (waiting) {
+            log::info(log_component, "{}: starting a new session; the one from before the restart is gone",
+                      waiting->peer);
+            start_session(std::move(*waiting), account, user, attach, false, false);
         }
     }
     // An agent that has gone quiet. Its socket is still open -- the process

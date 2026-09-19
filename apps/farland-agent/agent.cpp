@@ -429,13 +429,19 @@ std::optional<UniqueFd> connect_agent_socket(const std::string& path)
 
 bool Agent::reattach(const std::atomic<bool>& stop)
 {
-    // Nothing to come back to without a desktop, and nowhere to look
-    // without the socket's path (an agent started the old way).
-    if (config_.socket_path.empty() || !desktop_ || config_.reattach_timeout.count() <= 0) {
+    // Nowhere to look without the socket's path (an agent started the old
+    // way). A desktop is not required: a session whose client has gone has
+    // released it -- on GNOME the Mutter remote desktop session ends and the
+    // seat gets its session back -- and that is precisely the session most
+    // likely to be sitting there when a package upgrade restarts farlandd.
+    // What comes back is the login session and its applications, which is
+    // what the user cares about; the desktop is made again for the next
+    // client either way.
+    if (config_.socket_path.empty() || config_.reattach_timeout.count() <= 0) {
         return false;
     }
-    log::warn(log_component, "session {}: farlandd is gone; keeping the desktop and looking for it for {} s",
-              config_.logon_id, config_.reattach_timeout.count());
+    log::warn(log_component, "session {}: farlandd is gone; keeping the session{} and looking for it for {} s",
+              config_.logon_id, desktop_ ? " and its desktop" : "", config_.reattach_timeout.count());
     config_.daemon.reset();
     const auto deadline = Clock::now() + config_.reattach_timeout;
     while (!stop.load() && Clock::now() < deadline) {
