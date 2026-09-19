@@ -25,7 +25,31 @@ enum class Type : std::uint8_t {
     verify_password_request = 3,
     verify_password_response = 4,
     authenticated = 5,
+    kerberos_request = 6,
+    kerberos_response = 7,
 };
+
+/// Largest blob inside a Kerberos message. A ticket with a PAC is the
+/// reason the whole message limit is what it is.
+constexpr std::size_t max_kerberos_blob = 48000;
+
+void write_blob(Writer& w, std::span<const std::byte> bytes)
+{
+    FARLAND_ASSERT(bytes.size() <= max_kerberos_blob);
+    w.u32le(static_cast<std::uint32_t>(bytes.size()));
+    w.bytes(bytes);
+}
+
+Result<std::vector<std::byte>> read_blob(Reader& r)
+{
+    const std::size_t start = r.offset();
+    FARLAND_TRY(const std::uint32_t size, r.u32le());
+    if (size > max_kerberos_blob) {
+        return fail(Errc::limit_exceeded, "privsep blob too long", start);
+    }
+    FARLAND_TRY(const auto bytes, r.bytes(size));
+    return std::vector<std::byte>(bytes.begin(), bytes.end());
+}
 
 void write_string(Writer& w, std::string_view text)
 {
@@ -92,6 +116,19 @@ std::vector<std::byte> encode(const Message& message)
             } else if constexpr (std::is_same_v<T, VerifyPasswordResponse>) {
                 w.u8(static_cast<std::uint8_t>(Type::verify_password_response));
                 w.u8(m.ok ? 1 : 0);
+            } else if constexpr (std::is_same_v<T, KerberosRequest>) {
+                w.u8(static_cast<std::uint8_t>(Type::kerberos_request));
+                w.u8(static_cast<std::uint8_t>(m.op));
+                write_blob(w, m.data);
+                write_blob(w, m.mic);
+                write_blob(w, m.mechanism_oid);
+            } else if constexpr (std::is_same_v<T, KerberosResponse>) {
+                w.u8(static_cast<std::uint8_t>(Type::kerberos_response));
+                w.u8(m.ok ? 1 : 0);
+                w.u8(m.complete ? 1 : 0);
+                write_blob(w, m.data);
+                write_string(w, m.user);
+                write_string(w, m.domain);
             } else if constexpr (std::is_same_v<T, Authenticated>) {
                 const auto& n = m.negotiation;
                 w.u8(static_cast<std::uint8_t>(Type::authenticated));
@@ -178,6 +215,30 @@ Result<Message> decode(std::span<const std::byte> frame)
         message = VerifyPasswordResponse{ok != 0};
         break;
     }
+    case Type::kerberos_request: {
+        KerberosRequest m;
+        FARLAND_TRY(const std::uint8_t op, r.u8());
+        if (op < static_cast<std::uint8_t>(KerberosOp::step) ||
+            op > static_cast<std::uint8_t>(KerberosOp::verify_mic)) {
+            return fail(Errc::invalid_value, "unknown Kerberos operation", 0);
+        }
+        m.op = static_cast<KerberosOp>(op);
+        FARLAND_TRY(m.data, read_blob(r));
+        FARLAND_TRY(m.mic, read_blob(r));
+        FARLAND_TRY(m.mechanism_oid, read_blob(r));
+        return Message{std::move(m)};
+    }
+    case Type::kerberos_response: {
+        KerberosResponse m;
+        FARLAND_TRY(const std::uint8_t ok, r.u8());
+        FARLAND_TRY(const std::uint8_t complete, r.u8());
+        m.ok = ok != 0;
+        m.complete = complete != 0;
+        FARLAND_TRY(m.data, read_blob(r));
+        FARLAND_TRY(m.user, read_string(r));
+        FARLAND_TRY(m.domain, read_string(r));
+        return Message{std::move(m)};
+    }
     case Type::authenticated: {
         Authenticated m;
         FARLAND_TRY(m.negotiation.cookie, read_string(r));
@@ -242,7 +303,149 @@ bool RemoteVerifier::verify_password(std::string_view user, std::string_view dom
            std::get<VerifyPasswordResponse>(*message).ok;
 }
 
+// RemoteKerberos -------------------------------------------------------------------
+
+Result<KerberosResponse> RemoteKerberos::ask(KerberosOp op, std::span<const std::byte> data,
+                                             std::span<const std::byte> mic)
+{
+    if (data.size() > max_kerberos_blob || mic.size() > max_kerberos_blob) {
+        return fail(Errc::limit_exceeded, "the Kerberos message is too large to hand to the monitor");
+    }
+    KerberosRequest request;
+    request.op = op;
+    request.data.assign(data.begin(), data.end());
+    request.mic.assign(mic.begin(), mic.end());
+    if (op == KerberosOp::step) {
+        request.mechanism_oid = mechanism_oid_;
+    }
+    auto reply = call_(encode(request));
+    if (!reply) {
+        return fail(Errc::io, "the monitor did not answer a Kerberos request");
+    }
+    auto message = decode(*reply);
+    secure_zero(*reply);
+    if (!message || !std::holds_alternative<KerberosResponse>(*message)) {
+        return fail(Errc::invalid_value, "the monitor's answer is not a Kerberos response");
+    }
+    auto response = std::get<KerberosResponse>(std::move(*message));
+    if (!response.ok) {
+        return fail(Errc::invalid_value, "the monitor refused a Kerberos operation");
+    }
+    return response;
+}
+
+Result<auth::Step> RemoteKerberos::step(std::span<const std::byte> input)
+{
+    FARLAND_TRY(auto response, ask(KerberosOp::step, input));
+    auth::Step step;
+    step.token = std::move(response.data);
+    step.complete = response.complete;
+    if (response.complete) {
+        complete_ = true;
+        identity_.user = std::move(response.user);
+        identity_.domain = std::move(response.domain);
+    }
+    return step;
+}
+
+std::vector<std::byte> RemoteKerberos::wrap(std::span<const std::byte> plaintext)
+{
+    auto response = ask(KerberosOp::wrap, plaintext);
+    // The interface has no way to report a failure here; an empty token is
+    // one the peer cannot accept, which ends the handshake.
+    return response ? std::move(response->data) : std::vector<std::byte>{};
+}
+
+Result<std::vector<std::byte>> RemoteKerberos::unwrap(std::span<const std::byte> wrapped)
+{
+    FARLAND_TRY(auto response, ask(KerberosOp::unwrap, wrapped));
+    return std::move(response.data);
+}
+
+std::vector<std::byte> RemoteKerberos::get_mic(std::span<const std::byte> message)
+{
+    auto response = ask(KerberosOp::get_mic, message);
+    return response ? std::move(response->data) : std::vector<std::byte>{};
+}
+
+Result<void> RemoteKerberos::verify_mic(std::span<const std::byte> message, std::span<const std::byte> mic)
+{
+    FARLAND_TRY_VOID(ask(KerberosOp::verify_mic, message, mic));
+    return {};
+}
+
 // MonitorService -------------------------------------------------------------------
+
+Result<KerberosResponse> MonitorService::handle_kerberos(const KerberosRequest& request)
+{
+    if (!kerberos_) {
+        log::warn(log_component, "the network process asked for Kerberos, which this host does not accept");
+        return KerberosResponse{};
+    }
+    if (request.op == KerberosOp::step && kerberos_context_ == nullptr) {
+        kerberos_context_ = kerberos_(request.mechanism_oid);
+        if (kerberos_context_ == nullptr) {
+            log::warn(log_component, "the network process asked for a mechanism that is not Kerberos");
+            return KerberosResponse{};
+        }
+    }
+    if (kerberos_context_ == nullptr) {
+        return fail(Errc::invalid_value, "a Kerberos operation before the context exists", 0);
+    }
+
+    KerberosResponse response;
+    switch (request.op) {
+    case KerberosOp::step: {
+        auto step = kerberos_context_->step(request.data);
+        if (!step) {
+            return KerberosResponse{};
+        }
+        response.ok = true;
+        response.data = std::move(step->token);
+        response.complete = step->complete;
+        if (step->complete) {
+            const auto& identity = kerberos_context_->identity();
+            response.user = identity.user;
+            response.domain = identity.domain;
+            // The same rule as NTLM: the network process may later claim
+            // only an identity the monitor established itself.
+            verified_.emplace(identity.user, identity.domain);
+        }
+        break;
+    }
+    case KerberosOp::wrap: {
+        auto sealed = kerberos_context_->wrap(request.data);
+        if (sealed.empty()) {
+            return KerberosResponse{};
+        }
+        response.ok = true;
+        response.data = std::move(sealed);
+        break;
+    }
+    case KerberosOp::unwrap: {
+        auto plaintext = kerberos_context_->unwrap(request.data);
+        if (!plaintext) {
+            return KerberosResponse{};
+        }
+        response.ok = true;
+        response.data = std::move(*plaintext);
+        break;
+    }
+    case KerberosOp::get_mic: {
+        auto mic = kerberos_context_->get_mic(request.data);
+        if (mic.empty()) {
+            return KerberosResponse{};
+        }
+        response.ok = true;
+        response.data = std::move(mic);
+        break;
+    }
+    case KerberosOp::verify_mic:
+        response.ok = kerberos_context_->verify_mic(request.data, request.mic).has_value();
+        break;
+    }
+    return response;
+}
 
 Result<std::optional<std::vector<std::byte>>> MonitorService::handle(std::span<const std::byte> frame)
 {
@@ -271,6 +474,18 @@ Result<std::optional<std::vector<std::byte>>> MonitorService::handle(std::span<c
         }
         return encode(VerifyPasswordResponse{
             verifier_->verify_password(request->user, request->domain, request->password.view())});
+    }
+    if (auto* request = std::get_if<KerberosRequest>(&message)) {
+        // A ticket is checked once, like a password: the step count is the
+        // same budget the NTLM verifications spend from.
+        if (request->op == KerberosOp::step && ++attempts_ > max_attempts_) {
+            log::warn(log_component, "too many verification attempts on one connection");
+            return encode(KerberosResponse{});
+        }
+        FARLAND_TRY(auto response, handle_kerberos(*request));
+        auto reply = encode(response);
+        secure_zero(response.data);
+        return reply;
     }
     if (auto* notice = std::get_if<Authenticated>(&message)) {
         if (reported_) {

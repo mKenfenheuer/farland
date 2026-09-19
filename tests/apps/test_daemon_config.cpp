@@ -189,6 +189,38 @@ activation_timeout = "90s"
     CHECK(describe(Config{}).find("graphics.render_node = unset\n") != std::string::npos);
 }
 
+TEST_CASE("Kerberos is configured beside the credential store")
+{
+    const auto both = parse_config(R"(
+[auth]
+keytab = "/etc/farland/farland.keytab"
+service_principal = "TERMSRV/host.example.com"
+)");
+    REQUIRE(both.has_value());
+    // mode stays "store", so NTLM is still accepted and SPNEGO picks.
+    CHECK(both->auth.mode == AuthMode::store);
+    CHECK(both->auth.keytab == std::filesystem::path("/etc/farland/farland.keytab"));
+    CHECK(both->auth.service_principal == "TERMSRV/host.example.com");
+    CHECK(describe(*both).find("auth.service_principal = \"TERMSRV/host.example.com\"\n") != std::string::npos);
+    CHECK(describe(Config{}).find("auth.service_principal = unset\n") != std::string::npos);
+
+    // The path has to be one: "the system keytab" is written out as
+    // /etc/krb5.keytab, not as an empty string nobody can read.
+    CHECK_FALSE(parse_config("[auth]\nkeytab = \"\"\n").has_value());
+    CHECK_FALSE(parse_config("[auth]\nkeytab = \"krb5.keytab\"\n").has_value());
+
+    // Kerberos as the only way in needs something to check tickets with.
+    const auto only = parse_config(R"(
+[auth]
+mode = "kerberos"
+keytab = "/etc/farland/farland.keytab"
+)");
+    REQUIRE(only.has_value());
+    CHECK(only->auth.mode == AuthMode::kerberos);
+    CHECK_FALSE(parse_config("[auth]\nmode = \"kerberos\"\n").has_value());
+    CHECK_FALSE(parse_config("[auth]\nservice_principal = 7\n").has_value());
+}
+
 TEST_CASE("The metrics address is read and checked")
 {
     const auto on = parse_config(R"(
@@ -284,7 +316,8 @@ TEST_CASE("Configuration errors name the setting and its line")
     check("[policy]\n\nidle_timout = 5\n", "unknown key idle_timout in [policy]", 3);
     check("[auth]\nmode = \"pam\"\n", "[auth] mode must be one of store, kerberos, not \"pam\"", 2);
     check("[auth]\ncredential_store = \"users\"\n", "must be an absolute path", 2);
-    check("[auth]\nkeytab = \"/etc/krb5.keytab\"\n", "keytab needs mode = \"kerberos\"", 2);
+    // A keytab no longer needs a mode: it adds Kerberos beside NTLM.
+    check("[auth]\nmode = \"kerberos\"\n", "needs a keytab", 0);
     check("[session]\ndesktop = \"kde\"\n", "one of gnome, plasma, sway, labwc, cage", 2);
     check("[session]\ndesktop = \"cage\"\n", "needs [session] command", 2);
     check("[session]\ndesktop = \"cage\"\ncommand = []\n", "non-empty array of strings", 3);

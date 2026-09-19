@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2; Kerberos is open).
+**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics, Kerberos, and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -361,7 +361,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
 - **Authentication:**
   - Default: **self-enrolment.** `farlandctl passwd` asks farlandd over D-Bus. Polkit (`auth_self`) and a PAM password check confirm the user, and farlandd stores the NT hash with the local account (`user:domain:NT hash[:local account]`).
   - Delegated login with PAM (PLAN §3.5) is dropped: NTLM needs the NT hash before a password could ever reach PAM.
-  - Kerberos: the SPNEGO/GSSAPI acceptor with a keytab (moved here from M2), with the principal mapped to a local user.
+  - Kerberos: the SPNEGO/GSSAPI acceptor with a keytab (moved here from M2), with the principal mapped to a local user. **Done** (`src/farland/auth/kerberos.{hpp,cpp}`), live against an MIT KDC on Kubuntu 26.04 with FreeRDP 3.31 (2026-09-19): `[auth] keytab` accepts tickets beside NTLM and the client's SPNEGO picks; `mode = "kerberos"` refuses anyone without one. The acceptor runs in the monitor and the sandboxed network process drives it over the privsep channel, because the keytab is the host's long-term key and that process has no file system access whatsoever. Two details cost the most: CredSSP wants the Wrap token in the layout Windows produces, where everything but the sealed data comes first — MIT emits RRC = 0, so the pieces have to be rotated as RFC 4121 provides for — and a Kerberos login has no shared secret for a delegated password to be checked against, so `accept_credentials` is told which mechanism authenticated and checks the name alone there.
 - **Session broker:**
   - The NLA identity picks the user's one session (`max_sessions_per_user = 1`). A second connection takes over and ends the first with ERRINFO_DISCONNECTED_BY_OTHERCONNECTION, after `[policy] takeover` asked whoever is using it.
   - The agent sends a fresh **auto-reconnect cookie** (Save Session Info) on every connection and checks a returning one; NLA stays authoritative.
@@ -406,7 +406,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     leaves the session running, and reconnecting lands in the same one with what was typed
     still on screen. The backend itself was already tried under `farland-server --headless`;
     what was open was farlandd driving it, and that needed nothing new.
-  - S5: policies, the D-Bus API and polkit, `farlandctl` commands, metrics, units and packaging; then Kerberos.
+  - S5 (done): policies, the D-Bus API and polkit, `farlandctl` commands, metrics, units and packaging, and Kerberos.
   - S6 (optional): Server Redirection and RDSTLS for several hosts.
 - **Status of the wlroots backend (S4): implemented, and served per user by farlandd** (tried live on Kubuntu 26.04 with sway 1.11, labwc 0.9.3 and cage 0.2.1; see M7 S4).
   - Done:
@@ -421,7 +421,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - No dmabuf capture yet: frames come in shared memory, so AVC420 reads them from CPU memory.
   - Tested: unit tests for the keymap (layouts, modifiers, spare keys), pointer mapping, damage, cursor pixels and the launch setup; compositor tests against headless sway 1.11, labwc 0.9.3 and cage 0.2.1 (frames, resizing, cursor positions, key bindings with modifiers, a typed €, a clipboard round trip). Live on Ubuntu 26.04 with FreeRDP 3.31: sway's terminal opened and typed into, resized to the client's window, the clipboard in both directions; labwc's menu at the pointer; cage running foot.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
-- **Status (2026-09-19): S0, S1, S3, S4 and S5 done, and mstsc and Windows App reach a session; the GNOME route of S2 works. S5 in full: policies, the control API with polkit, self-enrolment, `farlandctl sessions`/`terminate`, Prometheus metrics, the systemd units, and packaging as deb (built and installed by CI), rpm, an AUR recipe and a container image. Kerberos, the last thing S5 names, is still open.**
+- **Status (2026-09-19): S0, S1, S3, S4 and S5 done, and mstsc and Windows App reach a session; the GNOME route of S2 works. S5 in full: policies, the control API with polkit, self-enrolment, `farlandctl sessions`/`terminate`, Prometheus metrics, Kerberos, the systemd units, and packaging as deb (built and installed by CI), rpm, an AUR recipe and a container image.**
   - Done:
     - `farlandd` (`apps/farlandd/`):
       - The port, the TLS identity and the credential store.

@@ -27,6 +27,8 @@ option('headless-plasma', type: 'feature', value: 'auto',
   description: 'Headless Plasma sessions for farlandd through KWin')
 option('headless-wlroots', type: 'feature', value: 'auto',
   description: 'Headless sway, labwc and cage sessions for farlandd (wayland-client)')
+option('kerberos', type: 'feature', value: 'auto',
+  description: 'Kerberos as an NLA mechanism (MIT krb5 GSS-API). The acceptor lives in the monitor process: the keytab never reaches the sandboxed network process')
 option('pam', type: 'feature', value: 'auto',
   description: 'farlandd starts sessions through PAM and logind (libpam, Linux). Without it farlandd only runs agents as its own user (--no-pam)')
 option('kwin', type: 'feature', value: 'auto',

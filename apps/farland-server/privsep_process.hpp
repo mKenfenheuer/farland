@@ -4,8 +4,10 @@
 #pragma once
 
 #include <farland/auth/gss.hpp>
+#include <farland/auth/kerberos.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/unique_fd.hpp>
+#include <farland/server/privsep.hpp>
 
 #include "session.hpp"
 
@@ -33,8 +35,27 @@ inline constexpr int child_client_fd = 3;   ///< the client's TCP socket
 inline constexpr int child_control_fd = 4;  ///< privsep messages to and from the monitor
 inline constexpr int child_plain_fd = 5;    ///< the RDP stream after pre-authentication
 
-/// Builds the CredSSP acceptor factory around a verifier.
-using NlaFactoryMaker = std::function<server::PreAuth::NlaFactory(auth::NtlmVerifier& verifier)>;
+/// What an NLA acceptor can reach. NTLM is checked by the verifier, which
+/// in the network process is the monitor at the other end of the control
+/// channel. Kerberos is the monitor's own context, driven through `monitor`;
+/// only without privilege separation is there a credential here to use
+/// directly, because a sandboxed process can read no keytab.
+struct NlaBackends {
+    auth::NtlmVerifier& verifier;
+    /// Set in the network process: one round trip to the monitor.
+    server::privsep::Call monitor;
+    /// The monitor accepts Kerberos (the network process learns this from
+    /// its --kerberos argument), or `credential` is set here.
+    bool kerberos = false;
+    /// Only without privilege separation: the acceptor credential itself.
+    const auth::kerberos::Credential* credential = nullptr;
+    /// Refuse NTLM: a client without a ticket does not get in
+    /// (farlandd's [auth] mode = "kerberos").
+    bool kerberos_only = false;
+};
+
+/// Builds the CredSSP acceptor factory around what it can reach.
+using NlaFactoryMaker = std::function<server::PreAuth::NlaFactory(const NlaBackends&)>;
 
 /// How to start the network process: this executable, with the arguments
 /// that recreate its configuration after "--privsep-child".
@@ -47,7 +68,8 @@ struct ChildLaunch {
 /// verification requests with `verifier`, then runs the session on the
 /// stream it relays. Closes `client_fd`; reaps the process.
 void run_monitored_session(int client_fd, const std::string& peer, const ChildLaunch& launch,
-                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop);
+                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop,
+                           const auth::kerberos::Credential* kerberos = nullptr);
 
 /// A client whose network process finished pre-authentication: the
 /// plaintext RDP stream it relays from now on.
@@ -67,7 +89,8 @@ struct AuthenticatedClient {
 [[nodiscard]] std::optional<AuthenticatedClient>
 authenticate_monitored(int client_fd, const std::string& peer, const ChildLaunch& launch, auth::NtlmVerifier& verifier,
                        const SessionOptions& options, const std::atomic<bool>& stop,
-                       std::chrono::steady_clock::time_point started);
+                       std::chrono::steady_clock::time_point started,
+                       const auth::kerberos::Credential* kerberos = nullptr);
 
 /// Waits for a network process to exit, however long it relays, and logs
 /// how it ended.
@@ -76,8 +99,11 @@ void wait_network_process(pid_t pid);
 /// Network process main, after enter_network_sandbox(): serves the client on
 /// the inherited descriptors. `make_nla` may be empty (TLS only). Returns the
 /// exit status.
+/// `kerberos` says the monitor accepts it and `kerberos_only` that it
+/// accepts nothing else, both from the network process's arguments.
 [[nodiscard]] int run_network_child(const std::string& peer, const auth::TlsIdentity& identity,
-                                    const SessionOptions& options, const NlaFactoryMaker& make_nla);
+                                    const SessionOptions& options, const NlaFactoryMaker& make_nla,
+                                    bool kerberos = false, bool kerberos_only = false);
 
 /// The absolute path of the running executable, for ChildLaunch.
 [[nodiscard]] std::filesystem::path current_executable(const char* argv0);

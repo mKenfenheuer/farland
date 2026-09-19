@@ -194,9 +194,13 @@ pid_t spawn_child(const ChildLaunch& launch, const std::string& peer, std::array
 /// Answers the network process until it reports a finished pre-authentication.
 std::optional<server::Negotiation> await_authentication(int control, const std::string& peer,
                                                         auth::NtlmVerifier& verifier, const SessionOptions& options,
-                                                        const std::atomic<bool>& stop, Clock::time_point started)
+                                                        const std::atomic<bool>& stop, Clock::time_point started,
+                                                        const auth::kerberos::Credential* kerberos)
 {
     privsep::MonitorService service(verifier);
+    if (kerberos != nullptr) {
+        service.serve_kerberos([kerberos](std::span<const std::byte> oid) { return kerberos->accept(oid); });
+    }
     std::vector<std::byte> buffer;
     const auto deadline = started + std::chrono::seconds(options.activation_timeout);
     while (!stop.load()) {
@@ -237,7 +241,8 @@ std::optional<server::Negotiation> await_authentication(int control, const std::
 std::optional<AuthenticatedClient> authenticate_monitored(int client_fd, const std::string& peer,
                                                           const ChildLaunch& launch, auth::NtlmVerifier& verifier,
                                                           const SessionOptions& options, const std::atomic<bool>& stop,
-                                                          Clock::time_point started)
+                                                          Clock::time_point started,
+                                                          const auth::kerberos::Credential* kerberos)
 {
     std::array<int, 2> control{-1, -1};
     std::array<int, 2> plain{-1, -1};
@@ -260,7 +265,7 @@ std::optional<AuthenticatedClient> authenticate_monitored(int client_fd, const s
     }
     log::debug(log_component, "{}: network process {}", peer, pid);
 
-    auto negotiation = await_authentication(control[0], peer, verifier, options, stop, started);
+    auto negotiation = await_authentication(control[0], peer, verifier, options, stop, started, kerberos);
     ::close(control[0]);
     if (!negotiation) {
         ::close(plain[0]);
@@ -283,10 +288,11 @@ void wait_network_process(pid_t pid)
 }
 
 void run_monitored_session(int client_fd, const std::string& peer, const ChildLaunch& launch,
-                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop)
+                           auth::NtlmVerifier& verifier, const SessionOptions& options, const std::atomic<bool>& stop,
+                           const auth::kerberos::Credential* kerberos)
 {
     const auto started = Clock::now();
-    auto client = authenticate_monitored(client_fd, peer, launch, verifier, options, stop, started);
+    auto client = authenticate_monitored(client_fd, peer, launch, verifier, options, stop, started, kerberos);
     if (!client) {
         return;
     }
@@ -296,14 +302,14 @@ void run_monitored_session(int client_fd, const std::string& peer, const ChildLa
 }
 
 int run_network_child(const std::string& peer, const auth::TlsIdentity& identity, const SessionOptions& options,
-                      const NlaFactoryMaker& make_nla)
+                      const NlaFactoryMaker& make_nla, bool kerberos, bool kerberos_only)
 {
     prepare_socket(child_client_fd);
     prepare_socket(child_control_fd);
     prepare_socket(child_plain_fd);
 
     std::vector<std::byte> control_buffer;
-    privsep::RemoteVerifier verifier([&](std::span<const std::byte> request) -> Result<std::vector<std::byte>> {
+    const privsep::Call ask = [&](std::span<const std::byte> request) -> Result<std::vector<std::byte>> {
         if (!send_all(child_control_fd, request)) {
             return fail(Errc::io, "the monitor is gone");
         }
@@ -312,9 +318,15 @@ int run_network_child(const std::string& peer, const auth::TlsIdentity& identity
             return fail(Errc::io, "no answer from the monitor");
         }
         return std::move(*reply);
-    });
+    };
+    privsep::RemoteVerifier verifier(ask);
+    const NlaBackends backends{.verifier = verifier,
+                               .monitor = ask,
+                               .kerberos = kerberos,
+                               .credential = nullptr,
+                               .kerberos_only = kerberos_only};
     NetworkStage network(child_client_fd, peer, identity, options.preauth,
-                         make_nla ? make_nla(verifier) : server::PreAuth::NlaFactory{});
+                         make_nla ? make_nla(backends) : server::PreAuth::NlaFactory{});
 
     const auto started = Clock::now();
     std::vector<std::byte> data;

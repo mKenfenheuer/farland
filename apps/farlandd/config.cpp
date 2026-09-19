@@ -240,7 +240,7 @@ std::expected<void, ConfigError> parse_server(const toml::table& table, ServerSe
 
 std::expected<void, ConfigError> parse_auth(const toml::table& table, AuthSection& out)
 {
-    if (auto ok = check_keys(table, "auth", {"mode", "credential_store", "keytab"}); !ok) {
+    if (auto ok = check_keys(table, "auth", {"mode", "credential_store", "keytab", "service_principal"}); !ok) {
         return ok;
     }
     if (const auto* node = table.get("mode")) {
@@ -258,14 +258,23 @@ std::expected<void, ConfigError> parse_auth(const toml::table& table, AuthSectio
         out.credential_store = std::move(*path);
     }
     if (const auto* node = table.get("keytab")) {
-        if (out.mode != AuthMode::kerberos) {
-            return error_at(*node, "[auth] keytab needs mode = \"kerberos\"");
-        }
         auto path = get_path(*node, "[auth] keytab");
         if (!path) {
             return std::unexpected(std::move(path).error());
         }
         out.keytab = std::move(*path);
+    }
+    if (const auto* node = table.get("service_principal")) {
+        const auto* value = node->as_string();
+        if (value == nullptr) {
+            return error_at(*node, "[auth] service_principal must be a string");
+        }
+        out.service_principal = value->get();
+    }
+    // Kerberos is the only way in under that mode, so there has to be a
+    // keytab to check tickets against.
+    if (out.mode == AuthMode::kerberos && !out.keytab) {
+        return std::unexpected(ConfigError{"[auth] mode = \"kerberos\" needs a keytab"});
     }
     return {};
 }
@@ -769,6 +778,8 @@ std::string describe(const Config& config)
     line("auth.mode", quoted(to_string(config.auth.mode)));
     line("auth.credential_store", quoted(config.auth.credential_store.string()));
     line("auth.keytab", optional_path(config.auth.keytab));
+    line("auth.service_principal",
+         config.auth.service_principal.empty() ? std::string("unset") : quoted(config.auth.service_principal));
     line("session.desktop", quoted(to_string(config.session.desktop)));
     std::string command;
     for (const auto& argument : config.session.command) {

@@ -813,7 +813,7 @@ Acceptor::Outcome Acceptor::handle_credentials(const TsRequest& request)
                       "does not support");
     }
     PasswordCredentials delegated = to_password_credentials(std::get<TsPasswordCreds>(credentials->credentials));
-    if (config_.accept_credentials && !config_.accept_credentials(delegated, mech_->identity())) {
+    if (config_.accept_credentials && !config_.accept_credentials(delegated, mech_->identity(), mech_->mechanism())) {
         return reject("delegated credentials rejected: they do not belong to the authenticated user");
     }
     credentials_ = std::move(delegated);

@@ -6,6 +6,7 @@
 // synthetic test backend.
 
 #include <farland/auth/credential_store.hpp>
+#include <farland/auth/kerberos.hpp>
 #include <farland/auth/ntlm.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/log.hpp>
@@ -78,6 +79,15 @@ struct Options {
     /// Start (or attach to) a headless compositor instead: sway, labwc or cage.
     std::optional<app::HeadlessOptions> headless;
     bool allow_tls_only = false;
+    /// Accept Kerberos as well as NTLM: the keytab to accept with (empty
+    /// when --keytab was not given), and the principal within it.
+    std::optional<std::string> keytab;
+    std::string service_principal;
+    /// Internal: the monitor accepts Kerberos, so the network process may
+    /// offer it. The network process never sees the keytab itself.
+    bool kerberos = false;
+    /// Refuse NTLM: only a client with a ticket gets in.
+    bool kerberos_only = false;
     /// Internal: this process is the network process for one client.
     bool privsep_child = false;
     std::string peer;
@@ -153,6 +163,9 @@ void usage()
                  "  --no-clipboard        do not share the clipboard (text, HTML, images, files); without --share\n"
                  "                        the clipboard is a loopback that offers back what the client copies\n"
                  "  --allow-tls-only      also accept clients without NLA (anyone reaches the login screen)\n"
+                 "  --keytab [FILE]       also accept Kerberos, with FILE (default: the system keytab)\n"
+                 "  --service-principal P the principal in the keytab to accept as (default: any)\n"
+                 "  --kerberos-only       with --keytab: refuse clients that have no ticket\n"
                  "  --no-privsep          handle clients in this process instead of a sandboxed one\n"
                  "  --log-level LEVEL     trace, debug, info, warn, error (default info)\n"
                  "  --fingerprint         print the certificate's SHA-256 fingerprint and exit\n";
@@ -245,6 +258,20 @@ bool parse_options(std::span<char*> args, Options& options)
             }
         } else if (arg == "--max-sessions") {
             options.max_sessions = std::stoi(value());
+        } else if (arg == "--keytab") {
+            // The path is optional: bare --keytab means the system default,
+            // which is what KRB5_KTNAME or /etc/krb5.keytab names.
+            if (i + 1 < args.size() && !std::string_view(args[i + 1]).starts_with("--")) {
+                options.keytab = args[++i];
+            } else {
+                options.keytab = std::string{};
+            }
+        } else if (arg == "--service-principal") {
+            options.service_principal = value();
+        } else if (arg == "--kerberos") {
+            options.kerberos = true;
+        } else if (arg == "--kerberos-only") {
+            options.kerberos_only = true;
         } else if (arg == "--allow-tls-only") {
             options.allow_tls_only = true;
             options.session.preauth.require_nla = false;
@@ -338,6 +365,14 @@ app::ChildLaunch child_launch(const Options& options, const char* argv0)
     if (options.allow_tls_only) {
         launch.arguments.emplace_back("--allow-tls-only");
     }
+    // Only that Kerberos is on offer, never the keytab: the network process
+    // is sandboxed out of the file system and must not hold the host key.
+    if (options.keytab) {
+        launch.arguments.emplace_back("--kerberos");
+        if (options.kerberos_only) {
+            launch.arguments.emplace_back("--kerberos-only");
+        }
+    }
     return launch;
 }
 
@@ -416,9 +451,10 @@ int run_child(const Options& options)
         return 1;
     }
     const auto& tls = *identity;
-    return app::run_network_child(options.peer, tls, options.session, [&](farland::auth::NtlmVerifier& verifier) {
-        return app::make_nla_factory(tls, verifier, options.hostname);
-    });
+    return app::run_network_child(
+        options.peer, tls, options.session,
+        [&](const app::NlaBackends& backends) { return app::make_nla_factory(tls, backends, options.hostname); },
+        options.kerberos, options.kerberos_only);
 }
 
 }  // namespace
@@ -512,6 +548,19 @@ int main(int argc, char** argv)
         log::warn(log_component, "no NLA users in {}; add one with: farlandctl passwd USER", options.users.string());
     }
 
+    std::optional<farland::auth::kerberos::Credential> kerberos;
+    if (options.keytab) {
+        auto credential = farland::auth::kerberos::Credential::acquire(
+            {.keytab = *options.keytab, .service_principal = options.service_principal});
+        if (!credential) {
+            std::cerr << "farland-server: " << credential.error().message() << "\n";
+            return 1;
+        }
+        kerberos = std::move(*credential);
+        log::info(log_component, "Kerberos is accepted as {} (keytab {})", kerberos->principal(),
+                  options.keytab->empty() ? "the system default" : *options.keytab);
+    }
+
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
@@ -546,7 +595,7 @@ int main(int argc, char** argv)
         }
         log::info(log_component, "{}: connected", peer);
         ++active_sessions;
-        std::thread([fd, peer, &identity, &options, &launch] {
+        std::thread([fd, peer, &identity, &options, &launch, &kerberos] {
             if (options.privsep) {
                 auto store = farland::auth::CredentialStore::load(options.users);
                 if (!store) {
@@ -554,7 +603,8 @@ int main(int argc, char** argv)
                     ::close(fd);
                 } else {
                     StoreVerifier verifier(std::move(*store));
-                    app::run_monitored_session(fd, peer, launch, verifier, options.session, stop_requested);
+                    app::run_monitored_session(fd, peer, launch, verifier, options.session, stop_requested,
+                                               kerberos ? &*kerberos : nullptr);
                 }
             } else if (auto store = farland::auth::CredentialStore::load(options.users); !store) {
                 log::error(log_component, "{}: refused, the NLA user store cannot be read", peer);
@@ -562,7 +612,14 @@ int main(int argc, char** argv)
             } else {
                 StoreVerifier verifier(std::move(*store));
                 auto session = options.session;
-                session.make_nla = app::make_nla_factory(*identity, verifier, options.hostname);
+                // No privilege separation, so no monitor to ask: the
+                // Kerberos context runs right here.
+                const app::NlaBackends backends{.verifier = verifier,
+                                                .monitor = {},
+                                                .kerberos = false,
+                                                .credential = kerberos ? &*kerberos : nullptr,
+                                                .kerberos_only = options.kerberos_only};
+                session.make_nla = app::make_nla_factory(*identity, backends, options.hostname);
                 app::run_session(fd, peer, *identity, session, stop_requested);
             }
             --active_sessions;

@@ -23,16 +23,36 @@ port = 3389
 # log_level = "info"
 
 [auth]
-# store: NT hashes in the credential store below. kerberos (GSSAPI with a
-# keytab) is not implemented yet.
+# How a client proves who it is.
+#   store     NT hashes in the credential store below (NTLM). With a keytab
+#             set, Kerberos is accepted beside it and the client's SPNEGO
+#             picks: a ticket where there is one, NTLM otherwise.
+#   kerberos  a ticket and nothing else; a client without one is refused.
+#             Needs a keytab.
 mode = "store"
 # NT hashes of the users who may log in, with their local accounts. Users
 # enrol themselves with farlandctl passwd; an administrator can also write
 # entries (farlandctl --file /var/lib/farland/users passwd USER
 # --local-account ACCOUNT).
 credential_store = "/var/lib/farland/users"
-# The keytab for mode = "kerberos"; an error with any other mode.
-# keytab = "/etc/krb5.keytab"
+# Set this and farland also accepts Kerberos. The keytab needs a key for the
+# service principal RDP clients ask for, TERMSRV/<the name the client
+# connects to>; add it with, say,
+#   net ads keytab add TERMSRV/host.example.com      (a domain member), or
+#   kadmin -q "ktadd -k /etc/farland/farland.keytab TERMSRV/host.example.com"
+# The system keytab is /etc/krb5.keytab; name it in full, there is no
+# shorthand. It is read by farlandd itself and never reaches the sandboxed
+# network process, which has no file system access at all.
+# keytab = "/etc/farland/farland.keytab"
+# Which principal in the keytab to accept as. Unset accepts any of them,
+# which is what a host serving one service wants.
+# service_principal = "TERMSRV/host.example.com"
+#
+# A principal logs in as the local account of the same name. To send it
+# somewhere else, give the credential store an entry for it:
+#   farlandctl --file /var/lib/farland/users passwd alice --domain EXAMPLE.COM \
+#       --local-account amueller
+# (that entry also holds an NT hash, which Kerberos does not use).
 
 [session]
 # The desktop each user gets:

@@ -172,8 +172,13 @@ struct AcceptorConfig {
     /// spnego::ntlm_oid.
     std::function<std::unique_ptr<SecurityContext>(std::span<const std::byte> mech_oid)> make_mechanism;
     /// Optional: checks delegated password credentials against the identity
-    /// the mechanism authenticated. Returning false fails the handshake.
-    std::function<bool(const PasswordCredentials&, const Identity&)> accept_credentials;
+    /// the mechanism authenticated, and against the mechanism itself (its
+    /// OID, as `SecurityContext::mechanism()` gives it) -- what can be
+    /// checked differs between NTLM, which shares a password hash with the
+    /// server, and Kerberos, which does not. Returning false fails the
+    /// handshake.
+    std::function<bool(const PasswordCredentials&, const Identity&, std::span<const std::byte> mech_oid)>
+        accept_credentials;
     /// Highest CredSSP version to speak (2 to 6).
     std::uint32_t max_version = credssp::max_version;
 };

@@ -5,6 +5,7 @@
 // root from farlandd.service; `--no-pam` runs it as any user for
 // development and tests, with every session as that user.
 
+#include <farland/auth/kerberos.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/log.hpp>
 
@@ -134,7 +135,8 @@ int run_network_child(std::span<char*> args)
     const auto& tls = *identity;
     return app::run_network_child(
         option(args, "--peer").value_or("?"), tls, options,
-        [&](farland::auth::NtlmVerifier& verifier) { return app::make_nla_factory(tls, verifier, hostname); });
+        [&](const app::NlaBackends& backends) { return app::make_nla_factory(tls, backends, hostname); },
+        has_flag(args, "--kerberos"), has_flag(args, "--kerberos-only"));
 }
 
 }  // namespace
@@ -220,8 +222,9 @@ int main(int argc, char** argv)
         options.log_level = std::string(daemon::to_string(config->server.log_level));
         set_log_level(options.log_level);
     }
-    if (config->auth.mode == daemon::AuthMode::kerberos) {
-        std::cerr << "farlandd: [auth] mode = \"kerberos\" is not implemented yet\n";
+    if (config->auth.keytab && !farland::auth::kerberos::available()) {
+        std::cerr << "farlandd: this build has no Kerberos, so [auth] keytab cannot be used "
+                     "(build with -Dkerberos=enabled)\n";
         return 2;
     }
     if (!options.no_pam) {

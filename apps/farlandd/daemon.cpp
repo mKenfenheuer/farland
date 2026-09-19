@@ -4,6 +4,7 @@
 #include "daemon.hpp"
 
 #include <farland/auth/credential_store.hpp>
+#include <farland/auth/kerberos.hpp>
 #include <farland/auth/ntlm.hpp>
 #include <farland/auth/tls_identity.hpp>
 #include <farland/base/log.hpp>
@@ -553,6 +554,10 @@ struct Daemon::Impl {
     SessionView session_view;
     /// Where the sessions are written down, so a restart can pick them up.
     std::filesystem::path session_table;
+    /// The Kerberos acceptor credential, where a keytab is configured. It is
+    /// shared rather than owned because a connection's thread may outlive
+    /// the daemon, and the monitor side of that thread needs it.
+    std::shared_ptr<const auth::kerberos::Credential> kerberos;
     Metrics metrics;
     std::unique_ptr<MetricsServer> metrics_server;
     std::map<std::uint64_t, std::uint64_t> seat_questions;  ///< connection -> cookie
@@ -610,10 +615,28 @@ bool Daemon::Impl::setup()
     }
     settings = settings_of(config);
     log::info(log_component, "session settings: {}", broker::describe(settings));
+    if (config.auth.keytab) {
+        auto credential = auth::kerberos::Credential::acquire(
+            {.keytab = config.auth.keytab->string(), .service_principal = config.auth.service_principal});
+        if (!credential) {
+            log::error(log_component, "cannot accept Kerberos: {}", credential.error().message());
+            return false;
+        }
+        kerberos = std::make_shared<const auth::kerberos::Credential>(std::move(*credential));
+        log::info(log_component, "Kerberos is accepted as {} (keytab {})", kerberos->principal(),
+                  config.auth.keytab->empty() ? "the system default" : config.auth.keytab->string());
+    }
     network_launch =
         app::ChildLaunch{options.self,
                          {"--cert", cert.string(), "--key", key.string(), "--hostname", options.hostname, "--log-level",
                           options.log_level, "--activation-timeout", std::to_string(settings.activation_seconds)}};
+    // Only that it is on offer: the keytab stays here, out of the sandbox.
+    if (kerberos) {
+        network_launch.arguments.emplace_back("--kerberos");
+        if (config.auth.mode == AuthMode::kerberos) {
+            network_launch.arguments.emplace_back("--kerberos-only");
+        }
+    }
     preauth.preauth.require_nla = true;
     preauth.preauth.advertise_gfx = true;
     preauth.activation_timeout = settings.activation_seconds;
@@ -733,7 +756,7 @@ void Daemon::Impl::accept_client()
     log::info(log_component, "{}: connected (connection {})", peer, id);
     ++mailbox->client_threads;
     // The thread owns copies of what it needs, so it may outlive the daemon.
-    std::thread([box = mailbox, launch = network_launch, options = preauth,
+    std::thread([box = mailbox, launch = network_launch, options = preauth, kerberos = kerberos,
                  store = options.config.auth.credential_store, fd = fd.release(), peer, id] {
         const auto accepted = Clock::now();
         auto loaded = auth::CredentialStore::load(store);
@@ -744,7 +767,8 @@ void Daemon::Impl::accept_client()
             return;
         }
         StoreVerifier verifier(std::move(*loaded));
-        auto client = app::authenticate_monitored(fd, peer, launch, verifier, options, box->stopping, accepted);
+        auto client =
+            app::authenticate_monitored(fd, peer, launch, verifier, options, box->stopping, accepted, kerberos.get());
         if (client && client->negotiation.identity) {
             const pid_t network = client->network_process;
             box->post(Authenticated{id, peer, account_of(verifier, *client->negotiation.identity),

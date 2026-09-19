@@ -435,7 +435,8 @@ struct Options {
     std::string client_password = "Secret1!";
     std::string server_password = "Secret1!";
     Bytes client_key = server_key();
-    std::function<bool(const auth::PasswordCredentials&, const auth::Identity&)> accept_credentials;
+    std::function<bool(const auth::PasswordCredentials&, const auth::Identity&, std::span<const std::byte>)>
+        accept_credentials;
 };
 
 class Harness {
@@ -895,8 +896,12 @@ TEST_CASE("Rejected delegated credentials fail the handshake")
 {
     std::string seen_user;
     Options options;
-    options.accept_credentials = [&](const auth::PasswordCredentials& credentials, const auth::Identity& identity) {
+    options.accept_credentials = [&](const auth::PasswordCredentials& credentials, const auth::Identity& identity,
+                                    std::span<const std::byte> mech_oid) {
         seen_user = identity.user + "/" + credentials.user;
+        // The mechanism is named too, so a policy can tell NTLM from
+        // Kerberos: here it is always NTLM.
+        CHECK(std::ranges::equal(mech_oid, auth::spnego::ntlm_oid));
         return false;
     };
     Harness h(std::move(options));

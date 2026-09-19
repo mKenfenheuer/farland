@@ -14,7 +14,7 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/mKenfenheuer/farland'
 license=('Apache-2.0')
 depends=('openssl' 'systemd-libs' 'libei' 'pipewire' 'mesa' 'libglvnd' 'libva'
-         'wayland' 'libxkbcommon' 'pam')
+         'wayland' 'libxkbcommon' 'pam' 'krb5')
 # arch-meson forbids downloading wraps, as an Arch package should: both
 # subprojects have to come from the repositories.
 makedepends=('git' 'meson' 'ninja' 'pkgconf' 'wayland-protocols'

@@ -688,7 +688,10 @@ TEST_CASE("End to end with NLA: HYBRID_EX, SPNEGO and NTLM in process")
     std::atomic<bool> stop{false};
     farland::app::SessionOptions options;
     options.frames_per_second = 60;
-    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    options.make_nla = farland::app::make_nla_factory(
+        identity,
+        farland::app::NlaBackends{.verifier = verifier, .monitor = {}, .kerberos = false, .credential = nullptr},
+        "e2e.farland.test");
     std::thread server([&] { farland::app::run_session(fds[0], "e2e-nla", identity, options, stop); });
     const Login login{"alice", "Secret1!"};
     run_client(fds[1], stop, proto::protocol::hybrid_ex, &login);
@@ -703,7 +706,10 @@ TEST_CASE("NLA with a wrong password ends with STATUS_LOGON_FAILURE")
     AliceVerifier verifier;
     std::atomic<bool> stop{false};
     farland::app::SessionOptions options;
-    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    options.make_nla = farland::app::make_nla_factory(
+        identity,
+        farland::app::NlaBackends{.verifier = verifier, .monitor = {}, .kerberos = false, .credential = nullptr},
+        "e2e.farland.test");
     std::thread server([&] { farland::app::run_session(fds[0], "e2e-nla-bad", identity, options, stop); });
     {
         TestClient c(fds[1]);
@@ -721,7 +727,10 @@ TEST_CASE("TLS-only clients are refused while NLA is required")
     AliceVerifier verifier;
     std::atomic<bool> stop{false};
     farland::app::SessionOptions options;
-    options.make_nla = farland::app::make_nla_factory(identity, verifier, "e2e.farland.test");
+    options.make_nla = farland::app::make_nla_factory(
+        identity,
+        farland::app::NlaBackends{.verifier = verifier, .monitor = {}, .kerberos = false, .credential = nullptr},
+        "e2e.farland.test");
     std::thread server([&] { farland::app::run_session(fds[0], "e2e-tls-refused", identity, options, stop); });
     {
         TestClient c(fds[1]);

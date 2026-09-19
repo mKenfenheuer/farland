@@ -28,7 +28,8 @@
 ///     [auth]
 ///     mode = "store"                           # store | kerberos
 ///     credential_store = "/var/lib/farland/users"
-///     keytab = "/etc/krb5.keytab"              # kerberos only
+///     keytab = "/etc/krb5.keytab"              # also accept Kerberos
+///     service_principal = "TERMSRV/host.example.com"
 ///
 ///     [session]
 ///     desktop = "gnome"                        # gnome | plasma | sway | labwc | cage | test
@@ -74,7 +75,7 @@ inline constexpr std::string_view default_config_path = "/etc/farland/farland.to
 
 enum class AuthMode : std::uint8_t {
     store,     ///< NT hashes in the credential store, enrolled after a PAM password check
-    kerberos,  ///< GSSAPI with a keytab (not implemented yet)
+    kerberos,  ///< Kerberos only: a client without a ticket is refused
 };
 
 /// `test` is the synthetic test pattern, for CI and first tests of farlandd.
@@ -133,7 +134,12 @@ struct ServerSection {
 struct AuthSection {
     AuthMode mode = AuthMode::store;
     std::filesystem::path credential_store = "/var/lib/farland/users";
+    /// Set: Kerberos is accepted too, with this keytab (an absolute path;
+    /// the system one is /etc/krb5.keytab). `mode` decides whether NTLM is
+    /// accepted beside it.
     std::optional<std::filesystem::path> keytab;
+    /// The principal in the keytab to accept as; empty accepts any of them.
+    std::string service_principal;
 };
 
 struct SessionSection {

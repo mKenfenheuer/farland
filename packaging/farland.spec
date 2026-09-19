@@ -31,6 +31,7 @@ BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  wayland-protocols-devel
 BuildRequires:  pam-devel
+BuildRequires:  krb5-devel
 
 Requires:       pam
 Recommends:     xdg-desktop-portal
