@@ -473,6 +473,9 @@ broker::Settings settings_of(const Config& config)
 {
     broker::Settings settings;
     settings.frames_per_second = static_cast<std::uint16_t>(config.graphics.frames_per_second);
+    settings.h264_bitrate_kbps = config.graphics.h264_bitrate_kbps;
+    settings.h264_min_bitrate_kbps = config.graphics.h264_min_bitrate_kbps;
+    settings.h264_max_bitrate_kbps = config.graphics.h264_max_bitrate_kbps;
     settings.bitmap_codec = config.graphics.bitmap_codec == BitmapCodec::planar ? server::BitmapCodec::planar
                                                                                 : server::BitmapCodec::uncompressed;
     settings.gfx_codec = tile_codec_of(config.graphics.gfx_codec);

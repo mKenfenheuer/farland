@@ -235,6 +235,9 @@ void encode_body(Writer& w, const Settings& m)
     }
     w.u8(static_cast<std::uint8_t>(m.autodetect));
     w.u32le(m.activation_seconds);
+    w.u32le(m.h264_bitrate_kbps);
+    w.u32le(m.h264_min_bitrate_kbps);
+    w.u32le(m.h264_max_bitrate_kbps);
 }
 
 void encode_body(Writer& w, const NewConnection& m)
@@ -405,6 +408,14 @@ Result<Message> decode_settings(Reader& r)
     FARLAND_TRY(m.activation_seconds, r.u32le());
     if (m.activation_seconds < min_activation_seconds || m.activation_seconds > max_activation_seconds) {
         return fail(Errc::invalid_value, "activation timeout out of range", timeout_offset);
+    }
+    const std::size_t bitrate_offset = r.offset();
+    FARLAND_TRY(m.h264_bitrate_kbps, r.u32le());
+    FARLAND_TRY(m.h264_min_bitrate_kbps, r.u32le());
+    FARLAND_TRY(m.h264_max_bitrate_kbps, r.u32le());
+    if (m.h264_bitrate_kbps > video::max_bitrate_kbps || m.h264_min_bitrate_kbps > video::max_bitrate_kbps ||
+        m.h264_max_bitrate_kbps > video::max_bitrate_kbps) {
+        return fail(Errc::invalid_value, "H.264 bitrate out of range", bitrate_offset);
     }
     return m;
 }
@@ -587,11 +598,10 @@ bool may_send(Sender sender, const Message& message) noexcept
     if (std::holds_alternative<Disconnect>(message)) {
         return true;
     }
-    const bool daemon_only = std::holds_alternative<NewConnection>(message) ||
-                             std::holds_alternative<Terminate>(message) || std::holds_alternative<Settings>(message) ||
-                             std::holds_alternative<ConsentRequest>(message) ||
-                             std::holds_alternative<ConsentCancel>(message) ||
-                             std::holds_alternative<SeatTakeover>(message);
+    const bool daemon_only =
+        std::holds_alternative<NewConnection>(message) || std::holds_alternative<Terminate>(message) ||
+        std::holds_alternative<Settings>(message) || std::holds_alternative<ConsentRequest>(message) ||
+        std::holds_alternative<ConsentCancel>(message) || std::holds_alternative<SeatTakeover>(message);
     return sender == Sender::daemon ? daemon_only : !daemon_only;
 }
 

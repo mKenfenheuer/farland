@@ -129,6 +129,9 @@ void usage()
                  "  --fps N               frame rate of the test pattern (default 30)\n"
                  "  --codec planar|raw    bitmap codec for 32 bpp sessions (default planar)\n"
                  "  --gfx-codec CODEC     progressive, planar, avc420 or avc444 for GFX clients (default progressive)\n"
+                 "  --h264-bitrate KBIT   aim at this average bitrate instead of constant quality\n"
+                 "  --h264-min-bitrate KBIT  floor for every quality tier (default 300)\n"
+                 "  --h264-max-bitrate KBIT  ceiling for every quality tier (default: the ladder's own)\n"
                  "  --openh264 FILE       OpenH264 library for avc420/avc444 (default: libopenh264.so.8 and older)\n"
                  "  --h264-encoder NAME   auto, nvenc, vaapi, openh264 or x264 for avc420/avc444 (default auto:\n"
                  "                        NVENC on NVIDIA, VA-API where another GPU encodes H.264, else OpenH264)\n"
@@ -196,6 +199,12 @@ bool parse_options(std::span<char*> args, Options& options)
             options.hostname = value();
         } else if (arg == "--fps") {
             options.session.frames_per_second = static_cast<unsigned>(std::stoul(value()));
+        } else if (arg == "--h264-bitrate") {
+            options.session.h264_bitrate_kbps = static_cast<unsigned>(std::stoul(value()));
+        } else if (arg == "--h264-min-bitrate") {
+            options.session.h264_min_bitrate_kbps = static_cast<unsigned>(std::stoul(value()));
+        } else if (arg == "--h264-max-bitrate") {
+            options.session.h264_max_bitrate_kbps = static_cast<unsigned>(std::stoul(value()));
         } else if (arg == "--codec") {
             const auto codec = value();
             if (codec != "planar" && codec != "raw") {

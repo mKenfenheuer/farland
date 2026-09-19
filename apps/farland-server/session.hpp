@@ -53,6 +53,12 @@ struct SessionControl {
 
 struct SessionOptions {
     unsigned frames_per_second = 30;
+    /// What the H.264 quality ladder may spend, in kbit/s (0: the ladder's
+    /// own numbers). `h264_bitrate` switches it from constant quality to an
+    /// average bitrate; the other two bound every tier either way.
+    unsigned h264_min_bitrate_kbps = 300;
+    unsigned h264_max_bitrate_kbps = 0;
+    unsigned h264_bitrate_kbps = 0;
     server::BitmapCodec codec = server::BitmapCodec::planar;
     /// Codec for the Graphics Pipeline, when the client runs it.
     server::TileCodec gfx_codec = server::TileCodec::progressive;

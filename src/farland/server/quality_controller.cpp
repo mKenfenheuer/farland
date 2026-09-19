@@ -34,7 +34,6 @@ constexpr std::array<Rung, QualityController::tier_count> rungs{{
 }};
 
 constexpr unsigned min_fps = 5;
-constexpr std::uint32_t min_cap_kbps = 300;
 
 double ms(Clock::duration d)
 {
@@ -67,8 +66,23 @@ QualityTier QualityController::make_tier(unsigned level, const Config& config,
     }
     tier.h264.mode = video::RateControl::Mode::constant_quality;
     tier.h264.quality = rung.crf;
+    if (config.target_bitrate_kbps > 0) {
+        // An asked-for bitrate: the top tier aims at it and the rest scale
+        // down as their bits per pixel do, so the ladder still steps.
+        tier.h264.mode = video::RateControl::Mode::bitrate;
+        const double share = rung.bits_per_pixel / rungs.front().bits_per_pixel;
+        cap = config.target_bitrate_kbps * share;
+        tier.budget_kbps = static_cast<std::uint32_t>(cap * tier.fps / std::max(fps, 1U));
+    }
     cap /= std::max(config.pictures_per_frame, 1U);
-    tier.h264.max_bitrate_kbps = std::clamp(static_cast<std::uint32_t>(cap), min_cap_kbps, video::max_bitrate_kbps);
+    if (config.max_bitrate_kbps > 0) {
+        cap = std::min(cap, static_cast<double>(config.max_bitrate_kbps));
+    }
+    const auto floor_kbps = std::min(config.min_bitrate_kbps, video::max_bitrate_kbps);
+    tier.h264.max_bitrate_kbps = std::clamp(static_cast<std::uint32_t>(cap), floor_kbps, video::max_bitrate_kbps);
+    if (tier.h264.mode == video::RateControl::Mode::bitrate) {
+        tier.h264.bitrate_kbps = tier.h264.max_bitrate_kbps;
+    }
     return tier;
 }
 

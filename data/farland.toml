@@ -166,6 +166,25 @@ on_local_session = "separate"
 # it on a slow network. Above 30 costs bandwidth and CPU for little gain on
 # a desktop.
 # frames_per_second = 30
+# What H.264 may spend, in kbit/s. Without these the quality ladder works a
+# cap out for each of its four tiers from the surface, the frame rate and the
+# tier's bits per pixel, and runs the encoder at constant quality; congestion
+# control steps down the tiers on its own. Set these where the link's
+# capacity is known rather than discovered, or where it is metered.
+#   h264_bitrate      aim at this average bitrate instead of constant
+#                     quality. The top tier gets it and the lower tiers
+#                     scale down with their bits per pixel. 0 leaves the
+#                     ladder at constant quality.
+#   h264_min_bitrate  no tier goes below this, however congested the link:
+#                     the point where a smaller picture is worse than a
+#                     slower one.
+#   h264_max_bitrate  no tier goes above this. 0 keeps the ladder's own
+#                     ceiling.
+# With avc444 two H.264 pictures go out per frame and share these, so the
+# numbers are what reaches the wire either way.
+# h264_bitrate = 0
+# h264_min_bitrate = 300
+# h264_max_bitrate = 0
 
 [network]
 # Network characteristics detection, for clients that support it. It

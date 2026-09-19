@@ -35,6 +35,8 @@ constexpr std::chrono::seconds max_takeover_timeout{300};
 /// The frame rate the session aims for; the quality tiers lower it.
 constexpr std::int64_t min_frame_rate = 1;
 constexpr std::int64_t max_frame_rate = 240;
+/// kbit/s. 0 means "not set"; the ceiling is video::max_bitrate_kbps.
+constexpr std::int64_t max_bitrate_kbps = 1'000'000;
 
 Error error_at(const toml::source_region& where, std::string message)
 {
@@ -417,7 +419,8 @@ std::expected<void, ConfigError> parse_graphics(const toml::table& table, Graphi
 {
     if (auto ok = check_keys(table, "graphics",
                              {"gfx_codec", "bitmap_codec", "h264_encoder", "openh264", "render_node", "zero_copy",
-                              "clearcodec", "refine", "video_regions", "lossless_still", "frames_per_second"});
+                              "clearcodec", "refine", "video_regions", "lossless_still", "frames_per_second",
+                              "h264_bitrate", "h264_min_bitrate", "h264_max_bitrate"});
         !ok) {
         return ok;
     }
@@ -477,6 +480,26 @@ std::expected<void, ConfigError> parse_graphics(const toml::table& table, Graphi
             return std::unexpected(std::move(rate).error());
         }
         out.frames_per_second = static_cast<unsigned>(*rate);
+    }
+    // What the H.264 ladder may spend. A floor of 0 is meaningful (let the
+    // ladder go as low as it likes), so all three take 0.
+    const std::array<std::pair<std::string_view, unsigned*>, 3> bitrates{{
+        {"h264_bitrate", &out.h264_bitrate_kbps},
+        {"h264_min_bitrate", &out.h264_min_bitrate_kbps},
+        {"h264_max_bitrate", &out.h264_max_bitrate_kbps},
+    }};
+    for (const auto& [key, field] : bitrates) {
+        if (const auto* node = table.get(key)) {
+            auto value = get_integer(*node, std::format("[graphics] {}", key), 0, max_bitrate_kbps);
+            if (!value) {
+                return std::unexpected(std::move(value).error());
+            }
+            *field = static_cast<unsigned>(*value);
+        }
+    }
+    if (out.h264_max_bitrate_kbps > 0 && out.h264_max_bitrate_kbps < out.h264_min_bitrate_kbps) {
+        return std::unexpected(
+            ConfigError{"[graphics] h264_max_bitrate is below h264_min_bitrate, so no tier could be chosen"});
     }
     return {};
 }
@@ -806,6 +829,9 @@ std::string describe(const Config& config)
     line("graphics.clearcodec", flag(config.graphics.clearcodec));
     line("graphics.refine", flag(config.graphics.refine));
     line("graphics.video_regions", flag(config.graphics.video_regions));
+    line("graphics.h264_bitrate", std::to_string(config.graphics.h264_bitrate_kbps));
+    line("graphics.h264_min_bitrate", std::to_string(config.graphics.h264_min_bitrate_kbps));
+    line("graphics.h264_max_bitrate", std::to_string(config.graphics.h264_max_bitrate_kbps));
     line("graphics.lossless_still", flag(config.graphics.lossless_still));
     line("graphics.frames_per_second", std::to_string(config.graphics.frames_per_second));
     line("network.autodetect", quoted(to_string(config.network.autodetect)));

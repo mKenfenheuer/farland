@@ -67,6 +67,84 @@ struct Trace {
 
 }  // namespace
 
+namespace {
+
+QualityController::Config config_default()
+{
+    QualityController::Config config;
+    config.width = 1920;
+    config.height = 1080;
+    config.fps = 30;
+    return config;
+}
+
+}  // namespace
+
+TEST_CASE("Tiers honour a configured bitrate floor, ceiling and target", "[server][quality]")
+{
+    QualityController::Config config;
+    config.width = 1920;
+    config.height = 1080;
+    config.fps = 30;
+
+    const auto plain = QualityController::make_tier(0, config);
+    CHECK(plain.h264.mode == farland::video::RateControl::Mode::constant_quality);
+
+    SECTION("a ceiling holds every tier down")
+    {
+        config.max_bitrate_kbps = 1500;
+        for (unsigned level = 0; level < QualityController::tier_count; ++level) {
+            const auto tier = QualityController::make_tier(level, config);
+            INFO("tier " << level);
+            CHECK(tier.h264.max_bitrate_kbps <= 1500);
+        }
+        // Without it the top tier wants far more than that, so the ceiling
+        // is doing something.
+        CHECK(plain.h264.max_bitrate_kbps > 1500);
+    }
+
+    SECTION("a floor holds the lowest tier up")
+    {
+        config.min_bitrate_kbps = 4000;
+        for (unsigned level = 0; level < QualityController::tier_count; ++level) {
+            const auto tier = QualityController::make_tier(level, config);
+            INFO("tier " << level);
+            CHECK(tier.h264.max_bitrate_kbps >= 4000);
+        }
+        // The lowest tier is below that on its own.
+        CHECK(QualityController::make_tier(QualityController::tier_count - 1, config_default()).h264.max_bitrate_kbps <
+              4000);
+    }
+
+    SECTION("a target switches to average bitrate, and the ladder still steps")
+    {
+        config.target_bitrate_kbps = 4000;
+        config.min_bitrate_kbps = 0;
+        std::uint32_t previous = 0;
+        for (unsigned level = 0; level < QualityController::tier_count; ++level) {
+            const auto tier = QualityController::make_tier(level, config);
+            INFO("tier " << level);
+            CHECK(tier.h264.mode == farland::video::RateControl::Mode::bitrate);
+            CHECK(tier.h264.bitrate_kbps == tier.h264.max_bitrate_kbps);
+            if (level == 0) {
+                CHECK(tier.h264.bitrate_kbps == 4000);
+            } else {
+                CHECK(tier.h264.bitrate_kbps < previous);
+            }
+            previous = tier.h264.bitrate_kbps;
+        }
+    }
+
+    SECTION("AVC444's two pictures share the ceiling")
+    {
+        config.max_bitrate_kbps = 2000;
+        config.pictures_per_frame = 2;
+        // The cap is per picture, so two views stay inside the ceiling
+        // between them rather than each taking all of it.
+        CHECK(QualityController::make_tier(0, config).h264.max_bitrate_kbps <= 2000);
+    }
+}
+
 TEST_CASE("Quality tiers: frame rate, quantization and an H.264 budget that scales with the desktop")
 {
     const QualityController::Config config;  // 1920x1080 at 30 fps

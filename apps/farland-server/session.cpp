@@ -877,6 +877,9 @@ private:
         // AVC444 puts two H.264 pictures on the wire for every frame, so the
         // encoder's per-second cap has to be half the session's budget.
         quality.pictures_per_frame = avc444 ? 2U : 1U;
+        quality.min_bitrate_kbps = options_.h264_min_bitrate_kbps;
+        quality.max_bitrate_kbps = options_.h264_max_bitrate_kbps;
+        quality.target_bitrate_kbps = options_.h264_bitrate_kbps;
         quality_.emplace(quality);
         apply_tier(quality_->tier());
     }
@@ -1033,6 +1036,12 @@ private:
         if (gfx_) {
             gfx_->set_quality(tier.progressive_quant, tier.h264, tier.defer_chroma);
         }
+        // What the encoder was actually told, so a configured bitrate can be
+        // seen to have taken rather than inferred from the output.
+        log::info(log_component, "{}: tier {} ({}), {} fps, H.264 {}", peer_, tier.level, tier.name, tier.fps,
+                  tier.h264.mode == video::RateControl::Mode::bitrate
+                      ? std::format("{} kbit/s average, cap {}", tier.h264.bitrate_kbps, tier.h264.max_bitrate_kbps)
+                      : std::format("quality {}, cap {} kbit/s", tier.h264.quality, tier.h264.max_bitrate_kbps));
     }
 
     /// Feeds the quality controller and applies the tier it picks.

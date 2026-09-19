@@ -95,6 +95,11 @@ inline constexpr std::uint32_t max_activation_seconds = 3600;
 /// an agent that never hears it behaves as the command line does.
 struct Settings {
     std::uint16_t frames_per_second = 30;
+    /// What the H.264 quality ladder may spend, kbit/s. `h264_bitrate_kbps`
+    /// of 0 keeps constant quality; the other two bound every tier.
+    std::uint32_t h264_bitrate_kbps = 0;
+    std::uint32_t h264_min_bitrate_kbps = 300;
+    std::uint32_t h264_max_bitrate_kbps = 0;
     BitmapCodec bitmap_codec = BitmapCodec::planar;
     TileCodec gfx_codec = TileCodec::progressive;
     /// nullopt: try the backends this build has, GPU first.

@@ -88,6 +88,23 @@ public:
         std::uint32_t queue_depth_limit = 3;
         /// Share of the measured bandwidth the graphics may use.
         double bandwidth_share = 0.8;
+
+        /// What the H.264 tiers may spend, in kbit/s. The ladder works out a
+        /// cap per tier from the surface, the frame rate and the tier's
+        /// bits per pixel; these bound the result, so a link with a known
+        /// capacity (or a metered one) can be told about it rather than
+        /// discovered.
+        ///
+        /// `min_bitrate_kbps` is the floor no tier drops below -- the point
+        /// at which a smaller picture is worse than a slower one.
+        /// `max_bitrate_kbps` is a ceiling on every tier; 0 leaves the
+        /// ladder's own numbers alone. `target_bitrate_kbps` replaces
+        /// constant quality with average bitrate: the top tier aims at it
+        /// and the lower tiers scale down with their bits per pixel, which
+        /// is what an administrator asking for "3 Mbit/s" means.
+        std::uint32_t min_bitrate_kbps = 300;
+        std::uint32_t max_bitrate_kbps = 0;
+        std::uint32_t target_bitrate_kbps = 0;
     };
 
     /// What the session knows at a sample.

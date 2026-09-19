@@ -56,6 +56,9 @@
 ///     clearcodec = true
 ///     refine = true
 ///     frames_per_second = 30
+///     h264_bitrate = 0                         # kbit/s; 0: constant quality
+///     h264_min_bitrate = 300
+///     h264_max_bitrate = 0                     # 0: the ladder's own ceiling
 ///
 ///     [network]
 ///     autodetect = "full"                      # full | continuous | off
@@ -193,6 +196,13 @@ struct GraphicsSection {
     bool video_regions = true;
     bool lossless_still = true;
     unsigned frames_per_second = 30;
+    /// What the H.264 quality ladder may spend, kbit/s. `h264_bitrate`
+    /// of 0 leaves it at constant quality, where the ladder works a cap
+    /// out from the surface and the frame rate; the other two bound
+    /// every tier either way.
+    unsigned h264_bitrate_kbps = 0;
+    unsigned h264_min_bitrate_kbps = 300;
+    unsigned h264_max_bitrate_kbps = 0;
 };
 
 struct NetworkSection {

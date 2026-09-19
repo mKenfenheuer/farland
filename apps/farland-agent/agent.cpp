@@ -276,6 +276,9 @@ void Agent::apply(const broker::Settings& settings)
     }
     auto& session = config_.session;
     session.frames_per_second = settings.frames_per_second;
+    session.h264_bitrate_kbps = settings.h264_bitrate_kbps;
+    session.h264_min_bitrate_kbps = settings.h264_min_bitrate_kbps;
+    session.h264_max_bitrate_kbps = settings.h264_max_bitrate_kbps;
     session.codec = settings.bitmap_codec;
     session.gfx_codec = settings.gfx_codec;
     session.h264_backend = settings.h264_backend;

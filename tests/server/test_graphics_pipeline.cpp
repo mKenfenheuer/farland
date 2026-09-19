@@ -808,6 +808,88 @@ TEST_CASE("GFX: only AVC420 surfaces with an encoder that takes dmabufs accept t
     }
 }
 
+TEST_CASE("GFX: a picture keeps its hue through the coarse-first ladder")
+{
+    // A first paint on a slow link arrives coarse and is refined while it
+    // stands still. Every stage of that has to look like the picture, not
+    // like its opposite: a red and blue that trade places turn an orange
+    // logo blue, and a viewer sees it long before any measurement does.
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    gfx::GfxServerConfig config;
+    config.avc420 = config.avc444 = config.avc444v2 = false;
+    // direct_tiles = 0 forces the ladder rather than the one-shot pass that
+    // small damage takes; both are covered, this one is the slow-link path.
+    GraphicsPipeline pipeline(channels, width, height, config, TileCodec::progressive, {},
+                              farland::server::PipelineOptions{.direct_tiles = 0});
+    const auto id = establish(client, channels, pipeline);
+
+    // Shaded orange: a colour per pixel, so this is a picture to the
+    // classifier and goes through Progressive. Flat orange would go through
+    // ClearCodec, which is exact and could never show the problem.
+    Bytes pixels(std::size_t{width} * height * 4);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto at = ((std::size_t{y} * width) + x) * 4;
+            pixels[at] = static_cast<std::byte>((x + y) % 48);              // B: little
+            pixels[at + 1] = static_cast<std::byte>(120 + ((y * 7) % 70));  // G: middling
+            pixels[at + 2] = static_cast<std::byte>(200 + ((x * 3) % 56));  // R: most
+            pixels[at + 3] = std::byte{0xFF};
+        }
+    }
+    const farland::codec::ImageView frame{pixels, width, height, std::size_t{width} * 4};
+    auto decoder = farland::codec::progressive::Decoder::create(width, height).value();
+
+    const auto pixel = [](const farland::codec::ImageView& image, std::uint32_t x, std::uint32_t y) {
+        const std::size_t at = (std::size_t{y} * image.stride) + (std::size_t{x} * 4);
+        return std::array<int, 3>{std::to_integer<int>(image.data[at + 2]), std::to_integer<int>(image.data[at + 1]),
+                                  std::to_integer<int>(image.data[at])};
+    };
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> probes{
+        {{width / 4, height / 4}, {width / 2, height / 2}, {(width * 3) / 4, (height * 3) / 4}}};
+
+    bool refined = false;
+    for (int f = 0; f < 8 && !refined; ++f) {
+        const auto frame_id = pipeline.send_frame(frame);
+        if (!frame_id) {
+            continue;
+        }
+        bool decoded_any = false;
+        for (const auto& pdu : client.take_gfx(id)) {
+            if (const auto* w2 = std::get_if<gfx::WireToSurface2>(&pdu)) {
+                REQUIRE(w2->codec_id == gfx::codec::progressive);
+                REQUIRE(decoder.decode(w2->bitmap_data, *frame_id).has_value());
+                decoded_any = true;
+            }
+        }
+        if (!decoded_any) {
+            continue;
+        }
+        for (const auto& [x, y] : probes) {
+            const auto want = pixel(frame, x, y);
+            const auto got = pixel(decoder.image(), x, y);
+            INFO("frame " << f << " at " << x << "," << y << ": wanted r=" << want[0] << " g=" << want[1]
+                          << " b=" << want[2] << ", got r=" << got[0] << " g=" << got[1] << " b=" << got[2]);
+            // The hue survives: red stays the strongest channel and blue the
+            // weakest, at every stage and not only at the end.
+            CHECK(got[0] > got[1]);
+            CHECK(got[1] > got[2]);
+            // And the coarse stage is already close, not merely the right
+            // way round: a channel swap would be far outside this.
+            CHECK(std::abs(got[0] - want[0]) <= 40);
+            CHECK(std::abs(got[1] - want[1]) <= 40);
+            CHECK(std::abs(got[2] - want[2]) <= 40);
+        }
+        // Once a stage lands within a couple of steps the ladder has done
+        // its work and there is nothing further to check.
+        const auto want = pixel(frame, width / 2, height / 2);
+        const auto got = pixel(decoder.image(), width / 2, height / 2);
+        refined = std::abs(got[0] - want[0]) <= 4 && std::abs(got[2] - want[2]) <= 10;
+    }
+    CHECK(refined);
+}
+
 TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined while the picture stands still")
 {
     Client client;

@@ -500,10 +500,26 @@ TEST_CASE("Malformed broker messages are rejected")
         }
         w.u8(2);  // auto-detect: full
     };
+    // What follows the activation timeout: the H.264 bitrates.
+    const auto settings_tail = [](Writer& w) {
+        w.u32le(0);    // h264_bitrate: constant quality
+        w.u32le(300);  // floor
+        w.u32le(0);    // no ceiling
+    };
     CHECK(broker::decode(frame([&](Writer& w) {
               settings_prefix(w);
               w.u32le(60);
+              settings_tail(w);
           })).has_value());
+    // A bitrate above the encoder's limit is refused.
+    check_error(frame([&](Writer& w) {
+                    settings_prefix(w);
+                    w.u32le(60);
+                    w.u32le(1'000'001);
+                    w.u32le(300);
+                    w.u32le(0);
+                }),
+                Errc::invalid_value);
     check_error(frame([&](Writer& w) {
                     settings_prefix(w);
                     w.u32le(4);  // activation timeout below the range
@@ -517,6 +533,7 @@ TEST_CASE("Malformed broker messages are rejected")
     check_error(frame([&](Writer& w) {
                     settings_prefix(w);
                     w.u32le(60);
+                    settings_tail(w);
                     w.u8(0);  // a trailing byte
                 }),
                 Errc::trailing_data);
