@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics and packaging as deb, rpm, an AUR recipe and a container image (S0, S1, S3, S4, S5 and the GNOME half of S2; Kerberos is open).
+**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2; Kerberos is open).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -421,7 +421,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - No dmabuf capture yet: frames come in shared memory, so AVC420 reads them from CPU memory.
   - Tested: unit tests for the keymap (layouts, modifiers, spare keys), pointer mapping, damage, cursor pixels and the launch setup; compositor tests against headless sway 1.11, labwc 0.9.3 and cage 0.2.1 (frames, resizing, cursor positions, key bindings with modifiers, a typed €, a clipboard round trip). Live on Ubuntu 26.04 with FreeRDP 3.31: sway's terminal opened and typed into, resized to the client's window, the clipboard in both directions; labwc's menu at the pointer; cage running foot.
 - **Exit:** several users log into separate headless GNOME or Plasma sessions through one port, and disconnecting and reconnecting resumes each session.
-- **Status (2026-09-19): S0, S1, S3, S4 and S5 done; the GNOME route of S2 works. S5 in full: policies, the control API with polkit, self-enrolment, `farlandctl sessions`/`terminate`, Prometheus metrics, the systemd units, and packaging as deb (built and installed by CI), rpm, an AUR recipe and a container image. Kerberos, the last thing S5 names, is still open.**
+- **Status (2026-09-19): S0, S1, S3, S4 and S5 done, and mstsc and Windows App reach a session; the GNOME route of S2 works. S5 in full: policies, the control API with polkit, self-enrolment, `farlandctl sessions`/`terminate`, Prometheus metrics, the systemd units, and packaging as deb (built and installed by CI), rpm, an AUR recipe and a container image. Kerberos, the last thing S5 names, is still open.**
   - Done:
     - `farlandd` (`apps/farlandd/`):
       - The port, the TLS identity and the credential store.
@@ -435,6 +435,7 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
       - Plasma, sway, labwc, cage and the test pattern: farlandd starts itself as a session helper. The helper runs PAM (`farland`: account, setcred, open_session with type wayland, class user, the desktop and PAM_RHOST, so pam_systemd registers a remote session), runs the agent as the user, and closes the session after it.
       - GNOME: GDM's `CreateUserDisplay` (what `gnome-headless-session@.service` does), then the agent as a transient unit in the user's service manager (sd-bus to `user@.host`) with the token in its environment, attached to that session's Mutter. `DestroyUserDisplay` ends it.
       - `on_local_session = "attach"` starts the agent the same way in the user's local session.
+        Tried live (2026-09-19).
     - `farland-agent` (`apps/farland-agent/`):
       - Greets farlandd with its token; farlandd checks the token and the peer's uid.
       - Takes each connection's plaintext socket and reads the MCS Connect Initial to start the desktop at the client's size, through `start_headless_desktop` (`headless.hpp`: one factory per backend, stubs for the missing ones) or the test pattern desktop.
@@ -476,9 +477,9 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
     - Handing the seat back created a **new greeter every time**. `switch_seat_to_greeter()` called GDM's `CreateTransientDisplay` unconditionally, and GDM makes another transient display on each call: four takeover attempts on the test host left four greeter sessions, each with a GNOME Shell of its own, until Mutter stopped answering D-Bus and every later connection died with "the desktop did not start". It now looks for a session of class `greeter` on the seat and activates that one, and only creates a display when the seat has none.
   - **S3 (Plasma per user through farlandd) is done**, live on Kubuntu 26.04 with KWin 6.6 (2026-09-19): a client authenticates with NLA, farlandd opens a PAM session (type wayland, class user, Remote=yes), the agent starts KWin's virtual backend with `plasma_session` on a private bus, and the desktop comes up at the client's size.
     - It needs one thing of the account that nothing said out loud: **access to a DRM render node**. KWin casts a screen only with OpenGL compositing, OpenGL needs `/dev/dri/renderD*`, and that node is `root:render` with no world access. logind puts an ACL on it for whoever is logged in at the machine; a farland session is on no seat, so it gets none, and the account has to be in the node's group. Without it KWin falls back to QPainter and answers the cast request with "unsupported compositing type", which says nothing about the cause: the first account tried failed for exactly this, while the developer's own account worked because it was in `render` already. The Plasma backend now looks at the render node when a cast is refused and says so, with the command to fix it.
+  - **Tried live by the maintainer (2026-09-19): `on_local_session = "attach"`, and mstsc and
+    Windows App against farlandd.** Both were the last untested parts of M7.
   - Open:
-    - `on_local_session = "attach"` live.
-    - mstsc and Windows App.
     - The agent answers the MCS Connect Initial only once its desktop has started, which takes GDM 10–20 s; FreeRDP needs `/timeout`.
 
 ### M8: Hardening and server 1.0 (~4 weeks, plus fuzzing throughout)
