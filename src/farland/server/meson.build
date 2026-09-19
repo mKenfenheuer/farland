@@ -21,6 +21,7 @@ farland_server_lib = static_library(
   'frame_encoder.cpp',
   'frame_scheduler.cpp',
   'graphics_pipeline.cpp',
+  'latency.cpp',
   'loopback_clipboard.cpp',
   'preauth.cpp',
   'privsep.cpp',

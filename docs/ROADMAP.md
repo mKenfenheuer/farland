@@ -8,7 +8,7 @@ M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0    
 ~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
 ```
 
-**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; the latency target is still to be measured. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics, Kerberos, and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2).
+**Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; its latency is measured and the codecs are the whole budget, so the 50 ms target needs the GPU encoder neither test machine has. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics, Kerberos, and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2).
 
 Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can run in parallel with M4 and M7 if there are two engineers.
 
@@ -140,7 +140,35 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **Exit:**
   - Full control of GNOME 48+ and Plasma 6.x desktops from mstsc and FreeRDP.
   - Glass-to-glass latency on a LAN is at most 50 ms at 1080p60 with AVC420.
-- **Status: implemented; works on GNOME with mstsc, Windows App, ZeroVDI and FreeRDP, and on Plasma with FreeRDP. The latency target is not measured yet.**
+- **Status: implemented; works on GNOME with mstsc, Windows App, ZeroVDI and FreeRDP, and on Plasma with FreeRDP. The latency target is measured now (2026-09-19) and is met at the median for an interactive desktop, not at the 95th percentile, and not at 60 fps -- on hardware with no GPU encoder, which is the whole of the finding.**
+  - **Where the time goes** (`src/farland/server/latency.hpp`). Every frame is timed through four stages --
+    waiting for the scheduler, reading the pixels, encoding and framing, then the wire, the client's decode
+    and its acknowledgement -- and the session reports the percentiles when it ends. What no server can see
+    is the client's own compositor putting the frame on its screen, so these numbers are glass-to-glass
+    minus that, and the report says so on every line it prints.
+  - **Measured** between the two test machines over a real LAN (Kubuntu 26.04 serving a headless Plasma
+    desktop at 1920x1080, Ubuntu 26.04 running FreeRDP 3.31 built with H.264), milliseconds p50/p95 end to
+    end, with the sustained frame rate:
+
+      | content | codec | fps | encoding | end to end |
+      | --- | --- | ---: | ---: | ---: |
+      | a desktop with a small moving window | AVC420 | 29 | 26.8 / 33.7 | **36.3 / 74.4** |
+      | the same | mixed mode (the default) | 34 | 29.3 / 36.5 | 59.2 / 80.4 |
+      | full-screen 1080p60 video | AVC420 | 19 | 52.5 / 78.0 | 108.4 / 156.5 |
+      | the same | mixed mode | 14 | 69.1 / 93.7 | 143.4 / 188.9 |
+
+    **The budget is the codecs and nothing else.** Reading the pixels costs 0.0-1.3 ms at the median, the
+    LAN round trip is 0.2 ms, and the scheduler adds nothing. Encoding is 27-69 ms and the client's decode
+    is most of what is left. Both machines are virtio-gpu VMs with no VA-API and no NVENC, so H.264 runs on
+    the CPU through OpenH264; the exit criterion's 1080p60 assumes the GPU encoder the roadmap has always
+    said it wants, and 60 fps is not reachable without one. The M8 line "tune encoder latency" now has a
+    number to beat.
+  - **What the measurement turned up:** KWin's screen casting sets no presentation timestamp in its PipeWire
+    buffers (`SPA_META_Header` pts is 0), so the interval from the compositor drawing a frame to farland
+    taking it cannot be seen on Plasma at all. The tracker reports how many frames arrived without one
+    rather than guessing; on GNOME, where Mutter sets it, that stage should appear.
+  - Still open: the same measurement on a host with a GPU encoder, which is the configuration the 50 ms
+    criterion describes.
   - Done:
     - The backend interface (`FrameSource`, `CursorSource`, `InputSink`).
     - The portal client: RemoteDesktop and ScreenCast over sd-bus, restore tokens, and the Notify* fallback.
@@ -162,7 +190,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
     - The session read each frame into CPU memory; since M5, AVC420 on VA-API takes the captured dmabufs directly.
     - Unicode input is not typed through libei, which has no text input.
     - A virtual monitor was always 1920x1080; since M6 it takes the client's size on GNOME (KWin's portal keeps 1920x1080).
-  - Not tested yet: mstsc on Plasma, tiled (GPU-imported) dmabufs, AVC420 against a real client, input on the virtual monitor, and the latency exit criterion.
+  - Not tested yet: mstsc on Plasma, tiled (GPU-imported) dmabufs, input on the virtual monitor, and the latency criterion on a host that has a GPU encoder. AVC420 against a real client is done: the latency runs above are FreeRDP 3.31 decoding AVC420 over a LAN.
 
 ### M5: Codecs 2, quality and efficiency (~7 weeks)
 - **VA-API encoder:** dmabuf → VASurface zero-copy (Intel/AMD), with the colour conversion on the GPU. **NVENC** optional.

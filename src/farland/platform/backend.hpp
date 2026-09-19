@@ -6,6 +6,7 @@
 #include <farland/codec/image.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -80,6 +81,12 @@ struct Frame {
     std::uint64_t sequence = 0;
     /// The frame in GPU memory; only with FrameAccess::dmabuf.
     std::optional<Dmabuf> dmabuf;
+    /// When the compositor produced this frame, on the steady clock, where
+    /// the source knows. It is the near end of glass-to-glass latency
+    /// (docs/ROADMAP.md M4) and nothing else reads it; a source without a
+    /// clock of its own leaves it unset and the measurement starts when the
+    /// frame was taken instead.
+    std::optional<std::chrono::steady_clock::time_point> captured;
 };
 
 /// What the consumer of a FrameSource needs.

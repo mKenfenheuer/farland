@@ -312,6 +312,11 @@ struct PipeWireCapture::Impl {
     std::uint32_t pending_width = 0;
     std::uint32_t pending_height = 0;
     std::uint64_t pending_sequence = 0;
+    /// SPA_META_Header's pts for the pending frame: the compositor's own
+    /// CLOCK_MONOTONIC reading of when it produced the frame, which is the
+    /// same clock std::chrono::steady_clock reads on Linux. 0 when the
+    /// producer set none.
+    std::int64_t pending_pts = 0;
     bool frame_pending = false;
     /// The pending frame is `pending_held`, not the pixels in `pending`.
     bool pending_is_dmabuf = false;
@@ -741,6 +746,14 @@ struct PipeWireCapture::Impl {
         buffers_received.fetch_add(handled, std::memory_order_release);
     }
 
+    /// SPA_META_Header's pts: when the compositor produced this buffer, on
+    /// CLOCK_MONOTONIC. 0 where the producer set none, which is allowed.
+    [[nodiscard]] static std::int64_t presentation_time(const spa_buffer* spa)
+    {
+        const auto header = read_struct<spa_meta_header>(find_meta(spa, SPA_META_Header), 0);
+        return header ? header->pts : 0;
+    }
+
     /// SPA_META_VideoDamage: an invalid region or the end of the array ends the
     /// list; no metadata or no regions means everything changed.
     static void collect_damage(const spa_buffer* spa, const Rect& bounds, DamageAccumulator& damage)
@@ -797,12 +810,13 @@ struct PipeWireCapture::Impl {
     /// Makes the pending frame, with `mutex` held: merges its damage, and
     /// gives back a dmabuf that was pending (returned for requeueing).
     [[nodiscard]] pw_buffer* set_pending_locked(std::uint32_t width, std::uint32_t height,
-                                                DamageAccumulator& view_damage)
+                                                DamageAccumulator& view_damage, std::int64_t pts)
     {
         pw_buffer* superseded = std::exchange(pending_held.buffer, nullptr);
         pending_width = width;
         pending_height = height;
         pending_sequence = frames_received;
+        pending_pts = pts;
         if (view_damage.full()) {
             pending_damage.add_full();
         } else {
@@ -828,7 +842,7 @@ struct PipeWireCapture::Impl {
         {
             const std::lock_guard lock(mutex);
             std::swap(pending, work);
-            superseded = set_pending_locked(width, height, view_damage);
+            superseded = set_pending_locked(width, height, view_damage, presentation_time(buffer->buffer));
             pending_held = HeldBuffer{};
             pending_is_dmabuf = false;
         }
@@ -905,7 +919,7 @@ struct PipeWireCapture::Impl {
         {
             const std::lock_guard lock(mutex);
             held.dmabuf.generation = buffer_generation;
-            superseded = set_pending_locked(width, height, view_damage);
+            superseded = set_pending_locked(width, height, view_damage, presentation_time(buffer->buffer));
             pending_held = std::move(held);  // the old descriptors close with `held`
             pending_is_dmabuf = true;
         }
@@ -1161,6 +1175,15 @@ struct PipeWireCapture::Impl {
             }
             frame.damage = std::move(damage);
             frame.sequence = pending_sequence;
+            // A pts from the future, or from before the process started, is
+            // some other clock: better no measurement than a wrong one.
+            if (pending_pts > 0) {
+                const std::chrono::steady_clock::time_point produced{std::chrono::nanoseconds(pending_pts)};
+                const auto now = std::chrono::steady_clock::now();
+                if (produced <= now && now - produced < std::chrono::seconds(1)) {
+                    frame.captured = produced;
+                }
+            }
         }
         if (returned_buffer) {
             pw::loop_signal_event(pw_thread_loop_get_loop(loop), release_event);

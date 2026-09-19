@@ -500,7 +500,8 @@ public:
                                                          .plane_count = 1};
                 return frame;
             }
-            return farland::platform::Frame{{pixels_, width, height, std::size_t{width} * 4}, {}, 1, std::nullopt};
+            return farland::platform::Frame{
+                {pixels_, width, height, std::size_t{width} * 4}, {}, 1, std::nullopt, std::nullopt};
         }
         [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> size() const override { return {width, height}; }
         void set_access(farland::platform::FrameAccess a) override { access = a; }

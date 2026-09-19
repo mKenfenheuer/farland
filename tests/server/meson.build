@@ -17,6 +17,7 @@ unit_test_sources += files(
   'test_frame_encoder.cpp',
   'test_frame_scheduler.cpp',
   'test_graphics_pipeline.cpp',
+  'test_latency.cpp',
   'test_preauth.cpp',
   'test_privsep.cpp',
   'test_quality_controller.cpp',

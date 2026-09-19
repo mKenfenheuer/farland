@@ -15,6 +15,7 @@
 #include <farland/server/dynamic_channels.hpp>
 #include <farland/server/frame_scheduler.hpp>
 #include <farland/server/graphics_pipeline.hpp>
+#include <farland/server/latency.hpp>
 #include <farland/server/loopback_clipboard.hpp>
 #include <farland/server/quality_controller.hpp>
 #include <farland/server/test_pattern.hpp>
@@ -183,6 +184,7 @@ public:
         if (translator_) {
             translator_->release_all();  // never leave keys held on the shared desktop
         }
+        report_latency();
         camera_.reset();  // the local camera goes with the session
         audio_.reset();   // the capture and the microphone source go at once
         if (desktop_ != nullptr) {
@@ -355,6 +357,7 @@ private:
         }
         for (std::size_t i = 0; i < screens_.size(); ++i) {
             if (auto frame = desktop_->screen_frames(i).take_frame()) {
+                latency_.frame_taken(Clock::now(), frame->captured);
                 on_frame(i, std::move(*frame));
             }
         }
@@ -649,6 +652,7 @@ private:
         if (!s.image) {
             return std::nullopt;
         }
+        latency_.frame_read(Clock::now());
         s.dirty = false;
         s.damage.clear();  // the CPU paths diff the pixels themselves
         s.damage_full = false;
@@ -1093,7 +1097,9 @@ private:
                             const bool suspend = e.queue_depth == channels::rdpgfx::suspend_frame_acknowledgement;
                             scheduler_->set_acknowledgements_suspended(suspend);
                             if (!suspend) {
-                                scheduler_->frame_acknowledged(e.frame_id, Clock::now());
+                                const auto acknowledged = Clock::now();
+                                scheduler_->frame_acknowledged(e.frame_id, acknowledged);
+                                latency_.frame_acknowledged(e.frame_id, acknowledged);
                                 queue_depth_ = e.queue_depth;
                             }
                         }
@@ -1122,6 +1128,18 @@ private:
 
     /// Every few seconds: frame rate, acknowledgements and round trip, what
     /// auto-detect measured and the quality tier.
+    /// Where the time went, once, when the session ends. It answers the
+    /// M4 exit criterion as far as a server can (docs/ROADMAP.md), so it is
+    /// worth a few lines of log rather than a number nobody can break down.
+    void report_latency()
+    {
+        const auto summary = latency_.summary();
+        if (summary.frames == 0) {
+            return;
+        }
+        log::info(log_component, "{}: latency, {}", peer_, server::LatencyTracker::describe(summary));
+    }
+
     void log_gfx_statistics(Clock::time_point now)
     {
         constexpr auto period = std::chrono::seconds(5);
@@ -1142,10 +1160,13 @@ private:
                                network.bandwidth_kbps ? std::format("{} kbit/s", *network.bandwidth_kbps)
                                                       : std::string("unknown"));
         }
-        log::info(log_component, "{}: GFX {:.1f} fps, {} in flight, round trip {}{}, sending {} kbit/s, tier {}", peer_,
-                  static_cast<double>(gfx_frames_) / seconds, scheduler_->frames_in_flight(),
+        const auto latency = latency_.summary();
+        const auto server_ms = std::chrono::duration<double, std::milli>(latency.server_p95).count();
+        log::info(log_component,
+                  "{}: GFX {:.1f} fps, {} in flight, round trip {}{}, sending {} kbit/s, tier {}, server {:.1f} ms p95",
+                  peer_, static_cast<double>(gfx_frames_) / seconds, scheduler_->frames_in_flight(),
                   milliseconds(scheduler_->round_trip()), link, quality_ ? quality_->send_kbps() : 0,
-                  quality_ ? std::format("{} ({})", quality_->tier().level, quality_->tier().name) : "none");
+                  quality_ ? std::format("{} ({})", quality_->tier().level, quality_->tier().name) : "none", server_ms);
         gfx_frames_ = 0;
         gfx_statistics_since_ = now;
     }
@@ -1203,6 +1224,9 @@ private:
         }
         ++frame_;
         if (const auto frame_id = gfx_->end_frame()) {
+            const auto sent = Clock::now();
+            latency_.frame_encoded(sent);
+            latency_.frame_sent(*frame_id, sent);
             scheduler_->frame_sent(*frame_id, now);
             ++gfx_frames_;
             count_frame();
@@ -1499,6 +1523,10 @@ private:
     std::optional<server::ClipboardBridge> clipboard_;
     std::uint16_t clipboard_channel_ = 0;
     std::optional<server::FrameScheduler> scheduler_;
+    /// Where the time goes from the compositor to the client's
+    /// acknowledgement (docs/ROADMAP.md M4). Costs one timestamp per stage
+    /// and nothing else; reported when the session ends.
+    server::LatencyTracker latency_;
     std::optional<server::QualityController> quality_;
     std::uint32_t queue_depth_ = 0;  ///< from the client's last frame acknowledgement
     std::uint64_t bytes_sent_ = 0;
