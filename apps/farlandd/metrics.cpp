@@ -207,11 +207,15 @@ struct MetricsServer::Impl {
     explicit Impl(const Metrics& source) : metrics(&source) {}
     ~Impl()
     {
+        // The thread polls the listener with a timeout, so it notices `stop`
+        // on its own within a quarter of a second. It has to be joined before
+        // the socket is closed: closing an fd another thread is polling is a
+        // race with whatever opens the next one.
         stop = true;
-        listener.reset();  // wakes the accept
         if (thread.joinable()) {
             thread.join();
         }
+        listener.reset();
     }
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
