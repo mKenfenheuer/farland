@@ -250,7 +250,8 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
       Reading it: a whole frame repainted 30 times a second is the worst case and nothing but H.264 fits a link; what a desktop actually sends is a few changed tiles per frame. The refined Progressive row shows what the coarse-first ladder costs in time: a full-frame repaint of a photo needs 21 frames (667 ms) of upgrades before the picture is complete, which is exactly why small damage now skips the ladder. ClearCodec is pixel-exact on text and UI at a quarter of the bytes of Progressive, and Progressive is an order of magnitude smaller than either lossless codec on a photo.
     - **Text at 2 Mbit/s: met.** Typing into a full page of text (three 64x64 tiles repainted per frame) costs 1978 bytes per frame, 475 kbit/s at 30 fps, and is pixel-exact: ClearCodec, which is where mixed mode sends text tiles. Repainting the whole page at once costs 322 KB, so a full-page repaint takes about 1.3 s of a 2 Mbit/s link; it stays exact and happens once, not per frame. Progressive on the same page reaches 35.3 dB over the glyphs, which is what ClearCodec exists to avoid.
   - Open:
-    - AVC444, ClearCodec, Progressive refinement, the H.264 video regions and the lossless pass against mstsc and Windows App.
+    - **The H.264 video regions are tried against mstsc and Windows App** (the maintainer, 2026-09-19): moving picture goes out as an AVC420 region on the Progressive surface and comes back sharp when it stops, on the clients the mixed-mode pipeline was written for.
+    - AVC444, ClearCodec, Progressive refinement and the lossless pass against mstsc and Windows App.
     - Zero-copy covers AVC420 only; AVC444 would need the 4:4:4 split on the GPU, and the mixed-mode video regions read pixels because the classifier needs them.
   - Tested:
     - FreeRDP 3 answers every auto-detect request. mstsc and Windows App are not tested with auto-detect yet, and no tier change has been seen on a real slow link (only in simulated traces).
@@ -283,7 +284,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **rdpei (MS-RDPEI):** touch and pen, delivered as EIS touch events.
 - Optional: **rdpecam** as a PipeWire virtual camera; **ainput**. rdpecam is done (below); ainput is not.
 - **Exit:** clipboard works in both directions for text, images and files; audio stays in sync (under 100 ms) and the microphone works from Windows App and FreeRDP.
-- **Status: all four channels implemented and tried with FreeRDP, and rdpecam with them; the exit needs mstsc and Windows App, the portal clipboard on a live desktop, a real touch device and a real camera.**
+- **Status: all four channels implemented and tried with FreeRDP, and rdpecam with them. The clipboard and touch are tried against mstsc and Windows App (the maintainer, 2026-09-19); the exit still needs a real camera, a pen, and the portal clipboard on a live desktop.**
 - **Status of rdpecam: implemented; not yet tried with a real camera.**
   - Done:
     - The codec ([MS-RDPECAM] 2.2, `channels/rdpecam`): every PDU of both the device enumeration channel and a device channel, with the two-byte shared header, decoded strictly. List PDUs (stream descriptions, media types, properties) take as many entries as fill the message, and a partial entry is an error; a media type with a zero frame rate or aspect ratio is refused, as FreeRDP's client refuses it; device and channel names must be terminated and are bounded; a sample is capped at 64 MB. Fuzz target `rdpecam`, which also drives the media type choice.
@@ -330,7 +331,8 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
     - Unit tests with the spec's integer examples, and an in-process end-to-end test: a scripted client opens the channel through drdynvc, and its touches reach an `InputSink` through `TouchInput` and the translator.
     - `EiInput` against an in-process libeis server with a touchscreen.
     - Live on Plasma 6.6 (2026-09-14): `farland-touch-probe` touched the shared monitor through the portal's EIS connection, and a full-screen Qt client got the tap, a swipe, a two-finger spread and a cancel at the right positions. KWin's EIS supports touch and cancel; Mutter 50's reads touches but not cancels (a cancel becomes an up there), from the symbols it imports; GNOME was not tried live.
-  - Not tested yet: a real touch or pen client (Windows App on a tablet, mstsc on a Surface), and pen input anywhere.
+  - **Touch is tried with a real touch client** (the maintainer, 2026-09-19): contacts from the client's touchscreen arrive over RDPEI and reach the compositor.
+  - Not tested yet: a pen anywhere (Windows App on a tablet, mstsc on a Surface). libei has no tablet devices, so a pen moves the pointer rather than acting as one.
 - **Status of cliprdr: implemented; the portal clipboard is not yet tried on a live desktop.**
   - Done:
     - The protocol ([MS-RDPECLIP]): all PDUs with strict decoding and limits, long and short format names, delayed rendering both ways, one outstanding request per direction with time-outs, file contents by size and range with stream IDs, Lock/Unlock with clip data IDs, huge files; a fuzz target with a seed corpus.
@@ -340,7 +342,8 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
     - The test pattern has a loopback clipboard: what the client copies is fetched at once and offered back.
   - Tested:
     - FreeRDP 3.31 (xfreerdp3) against the loopback, with text, HTML, an image (CF_DIB to PNG and BMP and back, pixel-exact) and files (a file and a folder with 3 MB, staged on the server and read back through FreeRDP's FUSE mount), on Ubuntu 26.04. The portal path is tested against the mock portal; against GNOME 50 it reaches Start with RequestClipboard, but the permission dialog was not answered, so the real desktop clipboard and mstsc/Windows App are still untested.
-  - Not tested yet: the portal clipboard on a live desktop (the portal's permission dialog was not accepted in the test), mstsc and Windows App.
+  - **Tried with mstsc and Windows App** (the maintainer, 2026-09-19): text and the rest travel both ways between a Windows client and a farland session.
+  - Not tested yet: the portal clipboard on a live desktop, which is the `--share` path rather than a session's own -- the portal's permission dialog was not accepted in the test.
 
 ### M7: Sessions, headless, deployment (~7 weeks)
 Multi-session with headless desktops behind one port (decided 2026-09-14).
