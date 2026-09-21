@@ -31,6 +31,7 @@ enum class Type : std::uint8_t {
     consent_cancel = 9,
     consent_reply = 10,
     seat_takeover = 11,
+    seat_greeter = 12,
 };
 
 void write_string(Writer& w, std::string_view text, std::size_t max)
@@ -305,6 +306,11 @@ void encode_body(Writer& w, const SeatTakeover& m)
     write_flag(w, m.allowed);
 }
 
+void encode_body(Writer& w, const SeatGreeter& /*m*/)
+{
+    w.u8(static_cast<std::uint8_t>(Type::seat_greeter));
+}
+
 void encode_body(Writer& w, const SessionEnded& m)
 {
     w.u8(static_cast<std::uint8_t>(Type::session_ended));
@@ -490,6 +496,8 @@ Result<Message> decode_body(Reader& r)
         FARLAND_TRY(m.allowed, read_flag(r));
         return m;
     }
+    case Type::seat_greeter:
+        return SeatGreeter{};
     case Type::session_ended: {
         SessionEnded m;
         const std::size_t reason_offset = r.offset();

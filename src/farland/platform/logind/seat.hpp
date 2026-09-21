@@ -83,6 +83,10 @@ private:
 /// unless it was asked to keep drawing off it, so a session switched away
 /// this way may stop producing frames, and a client holding it would see
 /// nothing. Only call it where the screens keep being drawn.
+/// Never makes a second greeter: where one is already on the seat this
+/// switches to it, and fails (without creating anything) where it may not,
+/// so that a privileged caller can do the switch instead. A new greeter is
+/// created only when the seat has none.
 [[nodiscard]] LogindResult<void> switch_seat_to_greeter();
 
 /// Brings the user's graphical session to its seat if something else is

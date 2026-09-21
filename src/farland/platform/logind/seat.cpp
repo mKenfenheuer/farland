@@ -239,6 +239,15 @@ LogindResult<void> switch_seat_to_greeter()
     // makes another one every time it is called: four calls leave four
     // greeters, each with a GNOME Shell of its own, until the machine stops
     // answering. Switch to the one that exists instead.
+    //
+    // Whether or not the switch works, a greeter that is already there means
+    // the seat shows a login screen, which is all this function is for -- so
+    // never go on to make another. Activate() is refused (polkit, "interactive
+    // authentication required") whenever this runs as the session's own user,
+    // which is the usual case: farland-agent runs as the user whose session
+    // the client holds, and the greeter belongs to the display manager's own
+    // uid. Falling through to CreateTransientDisplay there is what left nine
+    // greeters and ~1.3 GB of GNOME Shells on a 3 GB test host.
     if (const std::string greeter = greeter_session(raw); !greeter.empty()) {
         portal::detail::BusError error;
         sd_bus_message* reply = nullptr;
@@ -249,8 +258,15 @@ LogindResult<void> switch_seat_to_greeter()
             log::debug(log_component, "the seat already shows a greeter ({}), switching to it", greeter);
             return {};
         }
-        log::debug(log_component, "cannot switch to the greeter on the seat: {}",
-                   error.get()->message != nullptr ? error.get()->message : std::strerror(-r));
+        // A greeter is there, but this process may not switch the seat to it:
+        // logind's Activate goes through polkit, which refuses it across
+        // users, and the agent runs as the user whose session the client
+        // holds while the greeter belongs to the display manager's own uid.
+        // Say so instead of making a second greeter; a caller with a
+        // privileged helper (farlandd runs as root) can do the switch.
+        return fail(PortalErrc::failed,
+                    std::format("a greeter is on the seat ({}) but this process cannot activate it: {}", greeter,
+                                error.get()->message != nullptr ? error.get()->message : std::strerror(-r)));
     }
 
     portal::detail::BusError gdm_error;

@@ -174,6 +174,13 @@ if pam_dep.found()
   daemon_deps += pam_dep
   daemon_args += '-DFARLAND_HAVE_PAM=1'
 endif
+# The seat and the display manager's greeter: farlandd switches the seat to a
+# login screen on behalf of an agent, which as the session's own user is
+# refused it (broker::SeatGreeter).
+if farland_platform_logind_dep.found()
+  daemon_deps += farland_platform_logind_dep
+  daemon_args += '-DFARLAND_HAVE_LOGIND_SEAT=1'
+endif
 farland_daemon_lib = static_library(
   'farland-daemon',
   'farlandd/config.cpp',

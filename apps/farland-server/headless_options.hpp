@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,15 @@ struct HeadlessOptions {
     std::vector<std::string> cage_command;
     /// How long to wait for the compositor and for the first frame.
     std::chrono::seconds timeout{30};
+    /// Asks a privileged helper to put a login screen on the seat, for the
+    /// case this process may not do it itself: a greeter is already on the
+    /// seat and logind refuses this user the Activate that would switch to
+    /// it. farland-agent points this at farlandd, which runs as root and
+    /// calls the same switch_seat_to_greeter() -- so it still only creates a
+    /// greeter where the seat has none. Unset (farland-server standalone):
+    /// the backend makes do with what it can do itself. Called on the
+    /// agent's main thread; there is no answer to wait for.
+    std::function<void()> ask_for_greeter;
 };
 
 }  // namespace farland::app

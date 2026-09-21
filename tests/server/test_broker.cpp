@@ -242,6 +242,10 @@ TEST_CASE("Broker messages round-trip")
         CHECK(seat.allowed == allowed);
     }
 
+    // Asking farlandd for a login screen on the seat carries nothing.
+    CHECK(std::holds_alternative<broker::SeatGreeter>(
+        broker::decode(broker::encode(broker::SeatGreeter{})).value()));
+
     // A connection without NLA, summary, cookie or input.
     broker::NewConnection bare;
     bare.connection_id = 9;
@@ -579,6 +583,12 @@ TEST_CASE("Each side may send only its own broker messages, with a descriptor on
     CHECK(broker::decode_from(broker::Sender::daemon, seat, false).has_value());
     CHECK_FALSE(broker::decode_from(broker::Sender::agent, seat, false).has_value());
     CHECK_FALSE(broker::decode_from(broker::Sender::daemon, seat, true).has_value());
+
+    // ...and only an agent asks for one: it is the unprivileged side.
+    const auto greeter = broker::encode(broker::SeatGreeter{});
+    CHECK(broker::decode_from(broker::Sender::agent, greeter, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::daemon, greeter, false).has_value());
+    CHECK_FALSE(broker::decode_from(broker::Sender::agent, greeter, true).has_value());
 }
 
 TEST_CASE("farlandd accepts an agent only after a hello with its token")

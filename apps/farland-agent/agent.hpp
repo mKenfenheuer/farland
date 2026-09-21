@@ -54,6 +54,9 @@ struct DesktopRequest {
     std::string render_node;
     /// [graphics] frames_per_second, for the test pattern's animation.
     unsigned frames_per_second = 30;
+    /// Passed to HeadlessOptions::ask_for_greeter: asks farlandd, which runs
+    /// as root, to put a login screen on the seat where the agent may not.
+    std::function<void()> ask_for_greeter;
 };
 
 /// Starts the session's desktop for `request`.

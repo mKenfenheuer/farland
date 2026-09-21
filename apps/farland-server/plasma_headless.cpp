@@ -703,6 +703,17 @@ bool PlasmaHeadlessDesktop::hand_the_seat_a_greeter()
         return true;
     }
     if (auto handed = logind::switch_seat_to_greeter(); !handed) {
+        // This process may not switch the seat to the greeter that is on it
+        // (polkit refuses Activate across users). Nothing was created --
+        // switch_seat_to_greeter() only creates a greeter where the seat has
+        // none -- so ask the privileged helper to do the switch instead of
+        // ending up with a second login screen.
+        if (options_.ask_for_greeter) {
+            log::info(log_component, "cannot switch the seat to its login screen ({}); asking farlandd to do it",
+                      handed.error().message);
+            options_.ask_for_greeter();
+            return true;
+        }
         // The seat keeps showing the session; the client still has it.
         log::warn(log_component,
                   "cannot put a login screen on the seat ({}); the screen at the machine keeps showing the session",

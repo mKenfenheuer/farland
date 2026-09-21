@@ -15,6 +15,9 @@
 #include <farland/proto/mcs.hpp>
 #include <farland/server/broker.hpp>
 #include <farland/server/connection.hpp>
+#ifdef FARLAND_HAVE_LOGIND_SEAT
+#include <farland/platform/logind/seat.hpp>
+#endif
 
 #include "agent_token.hpp"
 #include "consent.hpp"
@@ -896,6 +899,31 @@ void Daemon::Impl::read_unclaimed(AgentPeer& peer, bool& drop)
                                         -1, agent_send_timeout_ms));
 }
 
+namespace {
+
+/// broker::SeatGreeter: an agent asks for a login screen on the seat because
+/// it may not put one there itself. A greeter already on the seat belongs to
+/// the display manager's uid, and logind refuses the agent -- which runs as
+/// the session's own user -- the Activate that would switch to it. farlandd
+/// is root, so the same call succeeds here. It creates a greeter only where
+/// the seat has none, so this never leaves a second one behind.
+void put_a_login_screen_on_the_seat([[maybe_unused]] std::uint32_t session_id)
+{
+#ifdef FARLAND_HAVE_LOGIND_SEAT
+    if (auto handed = platform::logind::switch_seat_to_greeter(); !handed) {
+        log::warn(log_component, "session {}: cannot put a login screen on the seat: {}", session_id,
+                  handed.error().message);
+        return;
+    }
+    log::info(log_component, "session {}: the screen at the machine shows a login screen", session_id);
+#else
+    log::debug(log_component, "session {}: asked for a login screen on the seat; this build has no logind seat support",
+               session_id);
+#endif
+}
+
+}  // namespace
+
 void Daemon::Impl::read_agent(Live& session)
 {
     const bool open = read_available(session.agent.get(), session.inbox);
@@ -933,6 +961,8 @@ void Daemon::Impl::read_agent(Live& session)
             if (auto resolved = consent.answered(reply->connection_id, reply->answer)) {
                 resolutions.push_back(std::move(*resolved));
             }
+        } else if (std::holds_alternative<broker::SeatGreeter>(*message)) {
+            put_a_login_screen_on_the_seat(session.id);
         } else if (const auto* ended = std::get_if<broker::SessionEnded>(&*message)) {
             log::info(log_component, "session {} of {} ended: {}", session.id, session.account, ended->detail);
             registry.set_ending(session.id);

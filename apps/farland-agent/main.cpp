@@ -233,6 +233,7 @@ int main(int argc, char** argv)
             headless.width = request.width;
             headless.height = request.height;
             headless.render_node = request.render_node;
+            headless.ask_for_greeter = request.ask_for_greeter;
             return app::start_headless_desktop(headless);
         };
     }

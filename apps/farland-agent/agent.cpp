@@ -497,8 +497,18 @@ bool Agent::on_new_connection(broker::NewConnection message, UniqueFd fd)
         }
         const auto [width, height] =
             client ? initial_size(*client) : std::pair<std::uint32_t, std::uint32_t>{1024, 768};
-        auto desktop = config_.make_desktop(
-            DesktopRequest{width, height, config_.session.render_node, config_.session.frames_per_second});
+        // ask_for_greeter: farlandd runs as root, so it can switch the seat
+        // to a greeter this process is refused (broker::SeatGreeter). Safe to
+        // capture `this` -- the agent owns the desktop and outlives it, and
+        // set_held() runs on this same thread.
+        const DesktopRequest request{
+            .width = width,
+            .height = height,
+            .render_node = config_.session.render_node,
+            .frames_per_second = config_.session.frames_per_second,
+            .ask_for_greeter = [this] { static_cast<void>(send(broker::SeatGreeter{})); },
+        };
+        auto desktop = config_.make_desktop(request);
         if (!desktop) {
             log::error(log_component, "session {}: cannot start the desktop: {}", config_.logon_id,
                        desktop.error().message());

@@ -46,6 +46,7 @@
 /// | ConsentCancel  | daemon: take that question back             | none                 |
 /// | ConsentReply   | agent: what the user answered               | none                 |
 /// | SeatTakeover   | daemon: how a login at the machine went     | none                 |
+/// | SeatGreeter    | agent: put a login screen on the seat        | none                 |
 /// | SessionEnded   | agent, as its last message                  | none                 |
 /// | Stats          | agent, periodically                         | none                 |
 /// | Terminate      | daemon: end the whole session               | none                 |
@@ -59,7 +60,7 @@ namespace farland::server::broker {
 
 /// Bumped on every incompatible change; farlandd and the agent come from one
 /// package, so the daemon simply refuses another version.
-inline constexpr std::uint16_t protocol_version = 4;
+inline constexpr std::uint16_t protocol_version = 5;
 
 /// A per-agent secret farlandd generates when it starts the agent. Together
 /// with the peer's uid (SO_PEERCRED) it ties the socket connection to the
@@ -246,6 +247,15 @@ struct SeatTakeover {
     bool allowed = true;
 };
 
+/// Agent to daemon: put a login screen on the seat, because the agent may
+/// not do it itself. A greeter already on the seat belongs to the display
+/// manager's uid, and logind refuses the agent -- running as the session's
+/// own user -- the Activate that would switch to it; farlandd runs as root
+/// and may. Nothing is created where a greeter is already there: farlandd
+/// calls the same switch_seat_to_greeter(), which only creates one when the
+/// seat has none. There is no reply; the agent carries on either way.
+struct SeatGreeter {};
+
 enum class EndReason : std::uint8_t {
     logout = 1,                ///< the user logged out; the compositor exited normally
     desktop_failed = 2,        ///< the compositor or the capture backend died
@@ -285,7 +295,7 @@ struct Terminate {
 };
 
 using Message = std::variant<Hello, Settings, NewConnection, Disconnect, ConsentRequest, ConsentCancel, ConsentReply,
-                             SeatTakeover, SessionEnded, Stats, Terminate>;
+                             SeatTakeover, SeatGreeter, SessionEnded, Stats, Terminate>;
 
 enum class Sender : std::uint8_t { daemon, agent };
 
