@@ -57,6 +57,10 @@ struct DesktopRequest {
     /// Passed to HeadlessOptions::ask_for_greeter: asks farlandd, which runs
     /// as root, to put a login screen on the seat where the agent may not.
     std::function<void()> ask_for_greeter;
+    /// Passed to HeadlessOptions::still_waiting: the backend calls it while
+    /// it waits for the compositor, so that whoever is watching the agent
+    /// keeps hearing from it.
+    std::function<void()> still_waiting;
 };
 
 /// Starts the session's desktop for `request`.
@@ -138,6 +142,13 @@ private:
     AgentConfig config_;
     auth::arc::Secret arc_;
     std::unique_ptr<app::Desktop> desktop_;
+    /// This session has had a desktop at least once. A GNOME session on a
+    /// seat gives its desktop back whenever no client holds it, so every
+    /// later connection builds one again -- and one that cannot (the screen
+    /// at the machine is locked, say) must take only itself down, never the
+    /// session and the windows in it. Only the connection that was to start
+    /// the session in the first place is worth ending it for.
+    bool had_desktop_ = false;
     std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::unique_ptr<Connection> current_;
     std::unique_ptr<Prompt> prompt_;

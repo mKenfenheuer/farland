@@ -52,6 +52,13 @@ struct HeadlessOptions {
     /// the backend makes do with what it can do itself. Called on the
     /// agent's main thread; there is no answer to wait for.
     std::function<void()> ask_for_greeter;
+    /// Called while the backend waits for the compositor, about twice a
+    /// second. Starting a desktop blocks the caller's loop for as long as
+    /// the timeout allows, and farlandd ends a session whose agent has said
+    /// nothing for half a minute -- so a wait that does not keep talking
+    /// takes the whole session down with it. Unset (farland-server
+    /// standalone): nobody is waiting to hear from us.
+    std::function<void()> still_waiting;
 };
 
 }  // namespace farland::app

@@ -50,6 +50,7 @@ broker::NewConnection full_connection()
     cookie.security_verifier.fill(std::byte{0x5A});
     m.auto_reconnect = cookie;
     m.pending_input = {std::byte{0x03}, std::byte{0x00}, std::byte{0x01}, std::byte{0x2C}};
+    m.password = farland::SecretString("hunter2");
     return m;
 }
 
@@ -77,6 +78,7 @@ void connection_prefix(Writer& w, std::uint32_t selected = proto::protocol::ssl,
         w.bytes(std::as_bytes(std::span(std::string_view("alice"))));
         w.u16le(0);
     }
+    w.u16le(0);  // delegated password
     w.u16le(0);  // peer
     w.u32le(0);  // elapsed
 }
@@ -111,7 +113,7 @@ TEST_CASE("Broker messages round-trip")
     CHECK(hello.token == token_of(1));
 
     const auto connection_frame = broker::encode(full_connection());
-    const auto connection = std::get<broker::NewConnection>(broker::decode(connection_frame).value());
+    auto connection = std::get<broker::NewConnection>(broker::decode(connection_frame).value());
     CHECK(connection.connection_id == 7);
     CHECK(connection.negotiation.cookie == "alice");
     CHECK(connection.negotiation.selected_protocol == proto::protocol::hybrid_ex);
@@ -131,7 +133,12 @@ TEST_CASE("Broker messages round-trip")
     REQUIRE(connection.auto_reconnect.has_value());
     CHECK(connection.auto_reconnect->logon_id == 0x1234);
     CHECK(connection.pending_input == full_connection().pending_input);
-    CHECK(broker::encode(connection) == connection_frame);
+    // The delegated password rides along so that the agent can unlock a
+    // session the screen at the machine has locked.
+    CHECK(connection.password.view() == "hunter2");
+    // NewConnection carries a secret, so it only moves; re-encoding what we
+    // decoded is the last thing this one is good for.
+    CHECK(broker::encode(std::move(connection)) == connection_frame);
 
     const auto disconnect = std::get<broker::Disconnect>(
         broker::decode(broker::encode(broker::Disconnect{7, proto::errinfo::disconnected_by_other_connection}))
@@ -250,10 +257,14 @@ TEST_CASE("Broker messages round-trip")
     broker::NewConnection bare;
     bare.connection_id = 9;
     bare.negotiation.selected_protocol = proto::protocol::ssl;
-    const auto decoded_bare = std::get<broker::NewConnection>(broker::decode(broker::encode(bare)).value());
+    const auto bare_frame = broker::encode(std::move(bare));
+    const auto decoded_bare = std::get<broker::NewConnection>(broker::decode(bare_frame).value());
     CHECK_FALSE(decoded_bare.negotiation.identity.has_value());
     CHECK_FALSE(decoded_bare.client.has_value());
     CHECK(decoded_bare.pending_input.empty());
+    // A client that delegated nothing leaves the password empty, and a
+    // locked session then stays locked.
+    CHECK(decoded_bare.password.empty());
 }
 
 TEST_CASE("Broker frames are length-prefixed like privsep")

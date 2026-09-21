@@ -283,7 +283,7 @@ std::expected<void, ConfigError> parse_auth(const toml::table& table, AuthSectio
 
 std::expected<void, ConfigError> parse_session(const toml::table& table, SessionSection& out)
 {
-    if (auto ok = check_keys(table, "session", {"desktop", "command"}); !ok) {
+    if (auto ok = check_keys(table, "session", {"desktop", "command", "gdm_display"}); !ok) {
         return ok;
     }
     if (const auto* node = table.get("desktop")) {
@@ -317,6 +317,19 @@ std::expected<void, ConfigError> parse_session(const toml::table& table, Session
     } else if (out.desktop == DesktopKind::cage) {
         const auto& where = table.get("desktop")->source();
         return error_at(where, "desktop = \"cage\" needs [session] command, the application to run");
+    }
+    if (const auto* node = table.get("gdm_display")) {
+        // GDM starts the session for GNOME alone; every other desktop is
+        // farlandd's own PAM and logind session, which this cannot move.
+        if (out.desktop != DesktopKind::gnome) {
+            return error_at(*node, "[session] gdm_display is only for desktop = \"gnome\"");
+        }
+        auto display = get_enum<GdmDisplay>(*node, "[session] gdm_display",
+                                            std::array<std::string_view, 2>{"seat", "headless"});
+        if (!display) {
+            return std::unexpected(std::move(display).error());
+        }
+        out.gdm_display = *display;
     }
     return {};
 }
@@ -681,6 +694,17 @@ std::string_view to_string(DesktopKind desktop) noexcept
     return "unknown";
 }
 
+std::string_view to_string(GdmDisplay display) noexcept
+{
+    switch (display) {
+    case GdmDisplay::seat:
+        return "seat";
+    case GdmDisplay::headless:
+        return "headless";
+    }
+    return "seat";
+}
+
 std::string_view to_string(LocalSessionPolicy policy) noexcept
 {
     switch (policy) {
@@ -810,6 +834,7 @@ std::string describe(const Config& config)
         command += quoted(argument);
     }
     line("session.command", std::format("[{}]", command));
+    line("session.gdm_display", quoted(to_string(config.session.gdm_display)));
     line("policy.disconnected_timeout", seconds(config.policy.disconnected_timeout));
     line("policy.idle_timeout", seconds(config.policy.idle_timeout));
     line("policy.activation_timeout", seconds(config.policy.activation_timeout));

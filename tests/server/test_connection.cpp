@@ -470,7 +470,13 @@ TEST_CASE("The full connection sequence, step by step")
     REQUIRE(out.tpkt.size() == 2);
     pdus = data_pdus(Output{{out.tpkt[0]}, {}}, keep);
     CHECK(std::get<proto::SetErrorInfo>(pdus[0]).error_info == proto::errinfo::rpc_initiated_disconnect);
-    CHECK(std::holds_alternative<mcs::DisconnectProviderUltimatum>(domain_of(out.tpkt[1], storage)));
+    // The ultimatum agrees with the Set Error Info: clients derive an error
+    // from the reason and let it stand over the code we sent, so the server
+    // letting go says so, and only a logoff says the user asked.
+    const auto ultimatum = domain_of(out.tpkt[1], storage);
+    REQUIRE(std::holds_alternative<mcs::DisconnectProviderUltimatum>(ultimatum));
+    CHECK(std::get<mcs::DisconnectProviderUltimatum>(ultimatum).reason ==
+          mcs::DisconnectReason::provider_initiated);
     evs = events(c);
     REQUIRE(evs.size() == 1);
     CHECK_FALSE(std::get<ev::Closed>(evs[0]).error);

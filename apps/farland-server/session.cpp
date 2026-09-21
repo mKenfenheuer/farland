@@ -41,6 +41,36 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Size = std::pair<std::uint32_t, std::uint32_t>;
 constexpr std::string_view log_component = "app.session";
+
+/// The Set Error Info code that tells a client a desktop went away on
+/// purpose ([MS-RDPBCGR] 2.2.5.1.1). Every one of these is a reason, and a
+/// client that is given a reason does not reconnect behind the user's back;
+/// ERRINFO_NONE is not one, because it says nothing at all.
+std::uint32_t error_info_for(DesktopEnd end)
+{
+    switch (end) {
+    case DesktopEnd::logged_out:
+        return proto::errinfo::logoff_by_user;
+    case DesktopEnd::taken_at_the_machine:
+        return proto::errinfo::disconnected_by_other_connection;
+    case DesktopEnd::sharing_stopped:
+        break;
+    }
+    return proto::errinfo::rpc_initiated_disconnect;
+}
+
+std::string_view describe(DesktopEnd end)
+{
+    switch (end) {
+    case DesktopEnd::logged_out:
+        return "the user logged out";
+    case DesktopEnd::taken_at_the_machine:
+        return "somebody took it at the machine";
+    case DesktopEnd::sharing_stopped:
+        break;
+    }
+    return "sharing stopped";
+}
 constexpr std::size_t max_frames_in_flight = 2;
 /// Damage rectangles collected between two frames; more mean everything.
 constexpr std::size_t max_damage_rects = 64;
@@ -357,9 +387,19 @@ private:
         desktop_->dispatch();
         sync_screen_count();
         if (desktop_->closed()) {
-            log::info(log_component, "{}: the shared desktop went away", peer_);
+            // Say why, in the one way RDP has of saying it. A client that
+            // is told nothing takes the disconnection for a dropped link
+            // and reconnects on its auto-reconnect cookie -- so a logout,
+            // or the user stopping the share from the top bar, would come
+            // straight back as a new connection.
+            const std::uint32_t code = error_info_for(desktop_->end_reason());
+            log::info(log_component, "{}: the shared desktop went away ({}), ending the connection with {:#x}", peer_,
+                      describe(desktop_->end_reason()), code);
             if (connection_) {
-                connection_->disconnect(proto::errinfo::none);
+                connection_->disconnect(code);
+                if (control() != nullptr) {
+                    control()->sent_error_info = code;
+                }
                 pump();
             }
             running_ = false;

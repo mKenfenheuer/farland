@@ -127,6 +127,24 @@ std::string display_manager_seat(const std::string& logind_seat_path)
 
 }  // namespace
 
+bool user_session_locked()
+{
+    sd_bus* raw = nullptr;
+    if (sd_bus_open_system(&raw) < 0) {
+        return false;
+    }
+    const portal::detail::BusPtr bus(raw);
+    const auto path = our_session_path(raw);
+    if (!path) {
+        return false;
+    }
+    // LockedHint is what the session's own screen locker sets; logind only
+    // relays it. A session whose locker never sets it reads as unlocked,
+    // which is the right way round: we then try to attach and Mutter has
+    // the last word.
+    return session_flag(raw, *path, "LockedHint");
+}
+
 LogindResult<void> activate_user_session()
 {
     sd_bus* raw = nullptr;

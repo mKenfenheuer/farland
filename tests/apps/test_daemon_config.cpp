@@ -82,6 +82,10 @@ TEST_CASE("An empty farland.toml gives the defaults")
     CHECK(config.auth.credential_store == "/var/lib/farland/users");
     CHECK(config.session.desktop == DesktopKind::gnome);
     CHECK(config.session.command.empty());
+    // A session the greeter can come back to is what a default install
+    // wants; headless is the deliberate choice.
+    CHECK(config.session.gdm_display == GdmDisplay::seat);
+    CHECK(to_string(config.session.gdm_display) == "seat");
     CHECK(config.server.log_level == LogLevel::info);
     CHECK(config.policy.disconnected_timeout == 0s);
     CHECK(config.policy.idle_timeout == 0s);
@@ -277,6 +281,9 @@ on_local_session = "attach"
     CHECK(config.policy.max_sessions == 20);
     CHECK(config.policy.on_local_session == LocalSessionPolicy::attach);
 
+    const auto headless = parse_config("[session]\ndesktop = \"gnome\"\ngdm_display = \"headless\"\n").value();
+    CHECK(headless.session.gdm_display == GdmDisplay::headless);
+
     const auto kerberos = parse_config("[auth]\nmode = \"kerberos\"\nkeytab = \"/etc/krb5.keytab\"\n").value();
     CHECK(kerberos.auth.mode == AuthMode::kerberos);
     CHECK(kerberos.auth.keytab == std::filesystem::path("/etc/krb5.keytab"));
@@ -323,6 +330,8 @@ TEST_CASE("Configuration errors name the setting and its line")
     check("[session]\ndesktop = \"cage\"\ncommand = []\n", "non-empty array of strings", 3);
     check("[session]\ndesktop = \"cage\"\ncommand = [\"a\", 1]\n", "only strings", 3);
     check("[session]\ncommand = [\"firefox\"]\n", "only for desktop = \"cage\"", 2);
+    check("[session]\ngdm_display = \"vt\"\n", "[session] gdm_display must be one of seat, headless", 2);
+    check("[session]\ndesktop = \"sway\"\ngdm_display = \"seat\"\n", "only for desktop = \"gnome\"", 3);
     check("[policy]\nmax_sessions_per_user = 2\n", "can only be 1", 2);
     check("[policy]\nmax_sessions = -1\n", "between 0 and", 2);
     check("[policy]\non_local_session = \"steal\"\n", "one of refuse, attach, replace, separate", 2);

@@ -97,8 +97,8 @@ public:
     /// The current size of the file at `index`.
     [[nodiscard]] Result<std::uint64_t> size(std::int32_t index) const;
     /// Up to `length` bytes at `offset` (fewer at the end of the file). The
-    /// file must still be the one that was listed (same device and inode),
-    /// and is opened without following a symlink.
+    /// file must still be the one that was listed -- same device, inode and
+    /// inode change time -- and is opened without following a symlink.
     [[nodiscard]] Result<std::vector<std::byte>> read(std::int32_t index, std::uint64_t offset,
                                                       std::size_t length) const;
 
@@ -108,6 +108,12 @@ private:
         bool directory = false;
         std::uint64_t device = 0;
         std::uint64_t inode = 0;
+        /// st_ctim at listing time, nanoseconds. The device and inode alone
+        /// do not identify a file: delete it and write another in its
+        /// place and the filesystem hands the new one the very same inode
+        /// number (ext4 does, reliably). The change time is what separates
+        /// them -- the replacement was created after we looked.
+        std::uint64_t change_time_ns = 0;
     };
     [[nodiscard]] Result<const Entry*> file(std::int32_t index) const;
 

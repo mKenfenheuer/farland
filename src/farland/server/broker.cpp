@@ -245,9 +245,11 @@ void encode_body(Writer& w, const NewConnection& m)
 {
     FARLAND_ASSERT(m.connection_id != 0);
     FARLAND_ASSERT(m.pending_input.size() <= max_pending_input);
+    FARLAND_ASSERT(m.password.view().size() <= max_password);
     w.u8(static_cast<std::uint8_t>(Type::new_connection));
     w.u64le(m.connection_id);
     write_negotiation(w, m.negotiation);
+    write_string(w, m.password.view(), max_password);
     write_string(w, m.peer, max_short_string);
     w.u32le(m.elapsed_ms);
     write_flag(w, m.client.has_value());
@@ -435,6 +437,8 @@ Result<Message> decode_new_connection(Reader& r)
         return fail(Errc::invalid_value, "connection id 0", id_offset);
     }
     FARLAND_TRY(m.negotiation, read_negotiation(r));
+    FARLAND_TRY(auto password, read_string(r, max_password));
+    m.password = SecretString(std::move(password));
     FARLAND_TRY(m.peer, read_string(r, max_short_string));
     FARLAND_TRY(m.elapsed_ms, r.u32le());
     FARLAND_TRY(const bool has_client, read_flag(r));

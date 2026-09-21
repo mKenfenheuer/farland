@@ -10,10 +10,12 @@
 #include <farland/proto/mcs.hpp>
 #include <farland/proto/save_session_info.hpp>
 #include <farland/proto/share.hpp>
+#include <farland/platform/logind/seat.hpp>
 #include <farland/proto/x224.hpp>
 
 #include "transport.hpp"
 #include "unix_socket.hpp"
+#include "unlock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +25,7 @@
 #include <format>
 #include <optional>
 #include <poll.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -33,6 +36,20 @@ namespace farland::agent {
 namespace {
 
 namespace broker = server::broker;
+
+/// The account this agent runs as; GDM reauthenticates a session by the name
+/// of whoever owns it, and the agent is that user.
+std::string local_account()
+{
+    passwd entry{};
+    passwd* found = nullptr;
+    std::vector<char> buffer(16384);
+    if (::getpwuid_r(::geteuid(), &entry, buffer.data(), buffer.size(), &found) == 0 && found != nullptr &&
+        entry.pw_name != nullptr) {
+        return entry.pw_name;
+    }
+    return {};
+}
 using Clock = std::chrono::steady_clock;
 constexpr std::string_view log_component = "agent";
 constexpr std::uint32_t min_size = 64;
@@ -359,8 +376,18 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
             if (const auto* settings = std::get_if<broker::Settings>(&*message)) {
                 apply(*settings);
             } else if (auto* connection = std::get_if<broker::NewConnection>(&*message)) {
+                const std::uint64_t id = connection->connection_id;
                 if (!on_new_connection(std::move(*connection), std::move((*received)->fd))) {
-                    return finish(broker::EndReason::desktop_failed, "the desktop did not start");
+                    if (!had_desktop_) {
+                        return finish(broker::EndReason::desktop_failed, "the desktop did not start");
+                    }
+                    // The session is still there with everything in it; only
+                    // this connection could not be given a desktop. Refusing
+                    // it leaves the session for whoever can -- the same
+                    // client once the screen at the machine is unlocked.
+                    log::warn(log_component, "session {}: connection {} gets no desktop; the session stays",
+                              config_.logon_id, id);
+                    static_cast<void>(send(broker::Disconnect{id, proto::errinfo::server_denied_connection}));
                 }
             } else if (const auto* disconnect = std::get_if<broker::Disconnect>(&*message)) {
                 if (current_ && current_->id == disconnect->connection_id) {
@@ -508,14 +535,38 @@ bool Agent::on_new_connection(broker::NewConnection message, UniqueFd fd)
             .render_node = config_.session.render_node,
             .frames_per_second = config_.session.frames_per_second,
             .ask_for_greeter = [this] { static_cast<void>(send(broker::SeatGreeter{})); },
+            // Starting a desktop holds this thread, so farlandd hears
+            // nothing from the session meanwhile and, after half a minute,
+            // gives it up for dead. Keep the Stats going from inside the
+            // wait.
+            .still_waiting = [this] { send_stats(); },
         };
         auto desktop = config_.make_desktop(request);
+        if (!desktop && platform::logind::user_session_locked()) {
+            // The screen at the machine has locked the session, and Mutter
+            // will not share a locked one. The client authenticated to get
+            // this far and delegated the password it used; GDM puts that to
+            // PAM and, if it holds, takes the lock screen down itself
+            // (unlock.hpp). Then, and only then, the attach is worth a
+            // second try.
+            log::info(log_component, "session {}: the session is locked at the machine; asking the screen there to "
+                                     "let this client in",
+                      config_.logon_id);
+            if (auto unlocked = unlock_the_session(local_account(), message.password, [this] { send_stats(); });
+                unlocked) {
+                desktop = config_.make_desktop(request);
+            } else {
+                log::info(log_component, "session {}: the session stays locked: {}", config_.logon_id,
+                          unlocked.error().message());
+            }
+        }
         if (!desktop) {
             log::error(log_component, "session {}: cannot start the desktop: {}", config_.logon_id,
                        desktop.error().message());
             return false;
         }
         desktop_ = std::move(*desktop);
+        had_desktop_ = true;
         log::info(log_component, "session {}: desktop started at {}x{}", config_.logon_id, width, height);
     }
 

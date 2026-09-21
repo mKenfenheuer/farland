@@ -22,6 +22,12 @@ if farland_platform_portal_dep.found()
   if libeis_dep.found()
     unit_test_deps += declare_dependency(compile_args: '-DFARLAND_TEST_HAVE_LIBEIS=1', dependencies: libeis_dep)
   endif
+  # The same check ei_input.cpp makes, so the touch tests can tell whether
+  # they are running against a libei that carries touches at all. Ubuntu
+  # 24.04, which CI builds on, ships libei 1.2.
+  if meson.get_compiler('cpp').has_header_symbol('libei.h', 'ei_touch_cancel', dependencies: libei_dep)
+    unit_test_deps += declare_dependency(compile_args: '-DFARLAND_TEST_HAVE_EI_TOUCH=1')
+  endif
 
   # Manual check against a real desktop portal; not run as a test.
   executable(

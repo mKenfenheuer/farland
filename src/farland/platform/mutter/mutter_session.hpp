@@ -208,6 +208,11 @@ public:
     /// True once Mutter closed the session, Mutter left the bus, or the
     /// connection broke.
     [[nodiscard]] bool closed() const noexcept { return closed_; }
+    /// The session closed because GNOME Shell itself went away, not because
+    /// it stopped sharing: the user logged out and took the whole desktop
+    /// with them. The two look the same from here but mean quite different
+    /// things to a client, which is told one or the other.
+    [[nodiscard]] bool compositor_gone() const noexcept { return compositor_gone_; }
 
     /// For MutterClipboard.
     [[nodiscard]] portal::detail::Bus* bus() const noexcept { return bus_.get(); }
@@ -240,6 +245,7 @@ private:
     std::unique_ptr<portal::detail::Bus> bus_;
     std::chrono::milliseconds timeout_{};
     std::string owner_;
+    bool compositor_gone_ = false;
     std::string session_path_;
     std::string screen_cast_path_;
     MutterCapabilities capabilities_;

@@ -31,6 +31,17 @@ constexpr std::size_t max_descriptor_name = 259;
 constexpr std::uint64_t filetime_epoch_offset = 11644473600ULL;
 constexpr const char* directory_prefix = "clipboard-";
 
+/// st_ctim as one number. A file is created with a change time, and nothing
+/// a writer does moves that time backwards, so it tells a replacement from
+/// the original even where the inode number comes round again -- which it
+/// does: delete a file and write another in its place and ext4 hands the
+/// new one the very same inode.
+std::uint64_t change_time_ns(const struct stat& info)
+{
+    return (static_cast<std::uint64_t>(info.st_ctim.tv_sec) * 1000000000ULL) +
+           static_cast<std::uint64_t>(info.st_ctim.tv_nsec);
+}
+
 void close_fd(int& fd) noexcept
 {
     if (fd >= 0) {
@@ -448,7 +459,7 @@ Result<LocalFileList> LocalFileList::from_paths(std::span<const std::filesystem:
         const auto& info = walker.infos[i];
         const bool directory = S_ISDIR(info.st_mode);
         list.entries_.push_back(Entry{walker.paths[i], directory, static_cast<std::uint64_t>(info.st_dev),
-                                      static_cast<std::uint64_t>(info.st_ino)});
+                                      static_cast<std::uint64_t>(info.st_ino), change_time_ns(info)});
         cliprdr::FileDescriptor descriptor;
         descriptor.flags = cliprdr::fd_flag::attributes | cliprdr::fd_flag::write_time |
                            cliprdr::fd_flag::show_progress_ui | (directory ? 0 : cliprdr::fd_flag::file_size);
@@ -476,7 +487,8 @@ Result<const LocalFileList::Entry*> LocalFileList::file(std::int32_t index) cons
 namespace {
 
 /// Opens a listed file again, checking that it still is that file.
-Result<int> open_listed(const std::filesystem::path& path, std::uint64_t device, std::uint64_t inode)
+Result<int> open_listed(const std::filesystem::path& path, std::uint64_t device, std::uint64_t inode,
+                        std::uint64_t change_time)
 {
     const int fd =
         ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);  // NOLINT(cppcoreguidelines-pro-type-vararg): open(2)
@@ -485,7 +497,7 @@ Result<int> open_listed(const std::filesystem::path& path, std::uint64_t device,
     }
     struct stat info{};
     if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || static_cast<std::uint64_t>(info.st_dev) != device ||
-        static_cast<std::uint64_t>(info.st_ino) != inode) {
+        static_cast<std::uint64_t>(info.st_ino) != inode || change_time_ns(info) != change_time) {
         ::close(fd);
         return fail(Errc::io, "a file on the clipboard was replaced");
     }
@@ -497,7 +509,7 @@ Result<int> open_listed(const std::filesystem::path& path, std::uint64_t device,
 Result<std::uint64_t> LocalFileList::size(std::int32_t index) const
 {
     FARLAND_TRY(const auto* entry, file(index));
-    FARLAND_TRY(int fd, open_listed(entry->path, entry->device, entry->inode));
+    FARLAND_TRY(int fd, open_listed(entry->path, entry->device, entry->inode, entry->change_time_ns));
     struct stat info{};
     const bool ok = ::fstat(fd, &info) == 0;
     close_fd(fd);
@@ -513,7 +525,7 @@ Result<std::vector<std::byte>> LocalFileList::read(std::int32_t index, std::uint
     if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
         return fail(Errc::invalid_value, "file offset out of range");
     }
-    FARLAND_TRY(int fd, open_listed(entry->path, entry->device, entry->inode));
+    FARLAND_TRY(int fd, open_listed(entry->path, entry->device, entry->inode, entry->change_time_ns));
     std::vector<std::byte> data(length);
     std::size_t done = 0;
     while (done < length) {

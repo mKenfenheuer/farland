@@ -816,6 +816,7 @@ int MutterSession::on_name_owner_changed(sd_bus_message* message, void* userdata
     std::string new_owner;
     if (reader.string(name) && reader.string(old_owner) && reader.string(new_owner) && old_owner == self->owner_ &&
         (name == remote_desktop_service || name == self->owner_) && new_owner != self->owner_) {
+        self->compositor_gone_ = true;
         self->mark_closed("Mutter left the session bus (GNOME Shell ended)");
     }
     return 0;

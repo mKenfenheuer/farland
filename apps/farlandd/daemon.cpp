@@ -117,6 +117,11 @@ constexpr std::uint64_t seat_connection_bit = std::uint64_t{1} << 63;
 /// back before it is given up. The agent tries for as long (agent.cpp), so
 /// whichever notices first ends it cleanly.
 constexpr auto reattach_window = std::chrono::seconds(120);
+/// How long a client's unlock may take before a login at the machine counts
+/// as a real one again. The GDM conversation is a round trip through PAM,
+/// which sleeps after a wrong password, so this is a little longer than
+/// that; it is only ever open while an agent is actually unlocking.
+constexpr auto unlock_window = std::chrono::seconds(30);
 
 /// How long an agent may keep farlandd waiting to take a message.
 constexpr int agent_send_timeout_ms = 5000;
@@ -139,13 +144,27 @@ public:
     }
     bool verify_password(std::string_view user, std::string_view domain, std::string_view password) override
     {
-        return verifier_.verify_password(user, domain, password);
+        const bool ok = verifier_.verify_password(user, domain, password);
+        if (ok) {
+            // A client that delegates its password over NLA has handed us
+            // the one thing that can unlock its session where the screen at
+            // the machine locked it (unlock.hpp). One StoreVerifier serves
+            // one connection, so this is that connection's password and
+            // nobody else's; it goes no further than this process, and the
+            // connection's thread takes it away as soon as it is done.
+            delegated_ = SecretString(std::string(password));
+        }
+        return ok;
     }
     [[nodiscard]] const auth::CredentialStore& store() const noexcept { return store_; }
+    /// The delegated password, if the client sent one and it checked out.
+    /// Moving it out leaves nothing behind.
+    [[nodiscard]] SecretString take_delegated_password() noexcept { return std::move(delegated_); }
 
 private:
     auth::CredentialStore store_;
     auth::ntlm::LocalNtlmVerifier verifier_;
+    SecretString delegated_;
 };
 
 /// A client through NLA, on its way to a session.
@@ -156,6 +175,11 @@ struct Authenticated {
     server::Negotiation negotiation;
     UniqueFd plain;
     Clock::time_point accepted;
+    /// What the client delegated over NLA, where it delegated anything: the
+    /// only thing that can unlock a session the screen at the machine has
+    /// locked (unlock.hpp). Empty otherwise, and then a locked session
+    /// stays locked.
+    SecretString password;
 };
 
 /// A session launch that ran on its own thread (GDM, the user's manager).
@@ -541,7 +565,9 @@ struct Daemon::Impl {
                        bool attach, bool replace_local = false, bool own_shell = false);
     /// Applies [policy] takeover, then hands the connection over or holds
     /// it while the session's user is asked.
-    void deliver(Live& session, Authenticated client);
+    /// `at_the_machine`: the screen at the machine is showing this session
+    /// now, so taking it over takes it away from whoever is there.
+    void deliver(Live& session, Authenticated client, bool at_the_machine = false);
     /// Sends the connection and its socket to the session's agent.
     void hand_over(Live& session, Authenticated client);
     void ask_consent(Live& session, Authenticated client);
@@ -570,6 +596,17 @@ struct Daemon::Impl {
     DaemonOptions options;
     SessionRegistry registry;
     ConsentBroker consent;
+    /// [policy] seat_takeover, and farland getting in its own way: when an
+    /// agent unlocks the session for a client coming back (the screen at
+    /// the machine locked it), it does that through GDM, whose PAM stack
+    /// runs pam_farland -- which asks farlandd whether somebody is logging
+    /// in at the machine. Without this, that question goes to the very
+    /// client the unlock is for, which is not connected yet and cannot
+    /// answer, and everything waits for everything else. So the account is
+    /// noted here when its session is handed a connection to unlock into,
+    /// and a login at the machine during that moment is let straight
+    /// through instead of being asked about.
+    std::map<std::string, Clock::time_point> unlocking;
     /// Questions that are over, waiting for the loop to act on them.
     std::vector<ConsentBroker::Resolved> resolutions;
     /// [policy] seat_takeover: the logins at the machine being asked about,
@@ -797,7 +834,8 @@ void Daemon::Impl::accept_client()
         if (client && client->negotiation.identity) {
             const pid_t network = client->network_process;
             box->post(Authenticated{id, peer, account_of(verifier, *client->negotiation.identity),
-                                    std::move(client->negotiation), std::move(client->plain), accepted});
+                                    std::move(client->negotiation), std::move(client->plain), accepted,
+                                    verifier.take_delegated_password()});
             app::wait_network_process(network);
         } else if (client) {
             client->plain.reset();
@@ -996,6 +1034,7 @@ void Daemon::Impl::handle(Authenticated client)
     const std::string account = client.account;
     std::optional<Account> user;
     bool local_session = false;
+    bool at_the_machine = false;
     if (!options.no_pam) {
         user = lookup_account(account);
         if (!user) {
@@ -1008,12 +1047,16 @@ void Daemon::Impl::handle(Authenticated client)
             return;
         }
         local_session = !registry.find_account(account) && local_graphical_session(user->uid).has_value();
+        // Asked of every connection, not only of the ones that start a
+        // session: a session that already exists can be the seat's too, and
+        // then whoever is at the machine is asked before it is taken.
+        at_the_machine = session_shows_at_the_machine(user->uid);
     }
     const auto decision = registry.admit(account, local_session);
     switch (decision.admission) {
     case SessionRegistry::Admission::existing:
         if (Live* session = find(decision.session)) {
-            deliver(*session, std::move(client));
+            deliver(*session, std::move(client), at_the_machine);
         }
         return;
     case SessionRegistry::Admission::create:
@@ -1121,15 +1164,19 @@ void Daemon::Impl::start_session(Authenticated client, const std::string& accoun
             }
         }
         const uid_t uid = user ? user->uid : ::getuid();
+        // GDM's two factories differ in what the session becomes, not in how
+        // it starts ([session] gdm_display, logind.hpp).
+        const auto factory =
+            config.session.gdm_display == GdmDisplay::seat ? DisplayFactory::local : DisplayFactory::remote;
         std::thread([box = mailbox, id = session->id, account, uid, gdm = session->gdm, unit = session->unit,
-                     argv = agent_arguments(launch), token = app::token_to_hex(session->token), local,
-                     replace_local]() mutable {
+                     argv = agent_arguments(launch), token = app::token_to_hex(session->token), local, replace_local,
+                     factory]() mutable {
             std::string login = local.value_or("");
             if (replace_local) {
                 end_local_sessions(account, uid);
             }
             if (gdm) {
-                auto created = create_gdm_user_display(account, uid, std::chrono::seconds(60));
+                auto created = create_gdm_user_display(account, uid, factory, std::chrono::seconds(60));
                 if (!created) {
                     box->post(Launched{id, false, {}, account, gdm});
                     secure_zero(std::as_writable_bytes(std::span(token)));
@@ -1181,7 +1228,7 @@ void Daemon::Impl::handle(Launched launched)
               session->login_session.empty() ? "?" : session->login_session);
 }
 
-void Daemon::Impl::deliver(Live& session, Authenticated client)
+void Daemon::Impl::deliver(Live& session, Authenticated client, bool at_the_machine)
 {
     if (!session.link) {
         if (session.waiting) {
@@ -1198,8 +1245,17 @@ void Daemon::Impl::deliver(Live& session, Authenticated client)
     }
     // Whoever holds the session now: the client connected to it, or the
     // user at the machine whose session this one shows.
+    //
+    // `attached` alone is not enough for the second of those. It says how
+    // the session began, and a session begins on the seat in more ways than
+    // farlandd records: a GNOME session farlandd had GDM start on the seat
+    // goes back to the seat whenever no client holds it, and a session
+    // whose seat takeover was allowed is the seat's from then on. What
+    // decides is the screen at the machine, which logind can be asked
+    // about, so ask it -- otherwise a client walks into a session somebody
+    // is sitting in front of without anybody being asked.
     const auto* state = registry.find(session.id);
-    const bool held = state != nullptr && (state->connection != 0 || state->attached);
+    const bool held = state != nullptr && (state->connection != 0 || state->attached || at_the_machine);
     switch (consent.admit(held)) {
     case ConsentBroker::Admission::refuse:
         refuse(std::move(client), proto::errinfo::server_denied_connection, consent.refusal(session.account));
@@ -1254,6 +1310,17 @@ void Daemon::Impl::ask_the_seat()
     seat_gate.set_held_accounts(std::move(held));
 
     for (const auto& waiting : seat_gate.take_new()) {
+        if (const auto found = unlocking.find(waiting.account);
+            found != unlocking.end() && Clock::now() < found->second) {
+            // Our own unlock, wearing a login's clothes: pam_farland cannot
+            // tell the two apart, and the client this would ask has no
+            // desktop yet to be asked on.
+            log::info(log_component, "the login at the machine for {} is that session's own unlock; letting it "
+                                     "through",
+                      waiting.account);
+            seat_gate.resolve(waiting.cookie, true);
+            continue;
+        }
         const auto* state = registry.find_account(waiting.account);
         Live* session = state != nullptr ? find(state->id) : nullptr;
         if (state == nullptr || session == nullptr || state->connection == 0 || !session->link) {
@@ -1363,9 +1430,22 @@ void Daemon::Impl::hand_over(Live& session, Authenticated client)
     message.connection_id = client.id;
     message.negotiation = client.negotiation;
     message.peer = client.peer.substr(0, 255);
+    // The agent needs it to unlock a session the screen at the machine has
+    // locked; farlandd keeps no copy past this point.
+    const bool may_unlock = !client.password.empty() && session.user && !options.no_pam &&
+                            session_locked_at_the_machine(session.user->uid);
+    message.password = std::move(client.password);
+    if (may_unlock) {
+        // The agent is about to reauthenticate through GDM, and that runs
+        // pam_farland, which will ask us about a login at the machine.
+        unlocking[session.account] = Clock::now() + unlock_window;
+        log::info(log_component, "session {} of {} is locked at the machine; connection {} brings credentials to "
+                                 "unlock it",
+                  session.id, session.account, client.id);
+    }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - client.accepted).count();
     message.elapsed_ms = static_cast<std::uint32_t>(std::clamp<std::int64_t>(elapsed, 0, 3'600'000));
-    if (send_to(session, message, client.plain.get())) {
+    if (send_to(session, std::move(message), client.plain.get())) {
         metrics.connection();
         session.peer = client.peer;
         log::info(log_component, "{}: connection {} goes to session {} of {}", client.peer, client.id, session.id,

@@ -730,8 +730,16 @@ void Connection::disconnect(std::uint32_t error_info)
         send_data_pdu(proto::SetErrorInfo{error_info});
     }
     if (state_ != State::wait_connect_initial) {
+        // The ultimatum's reason has to agree with the Set Error Info above
+        // it: clients derive an error of their own from it and let it stand
+        // over the one we just sent (FreeRDP turns rn-provider-initiated
+        // into ERRINFO_RPC_INITIATED_DISCONNECT), so a mismatch means the
+        // more precise of the two is the one thrown away. A user logging
+        // off is the user's own doing; everything else is the server's.
+        const auto reason = error_info == proto::errinfo::logoff_by_user ? mcs::DisconnectReason::user_requested
+                                                                         : mcs::DisconnectReason::provider_initiated;
         const std::size_t tpkt = proto::begin_data_tpdu(output_);
-        mcs::encode(output_, mcs::DisconnectProviderUltimatum{mcs::DisconnectReason::user_requested});
+        mcs::encode(output_, mcs::DisconnectProviderUltimatum{reason});
         proto::end_tpkt(output_, tpkt);
     }
     close("server disconnected the session");

@@ -40,6 +40,12 @@ std::optional<LoginSession> local_graphical_session(uid_t uid)
     return std::nullopt;
 }
 
+bool session_shows_at_the_machine(uid_t uid)
+{
+    const auto session = local_graphical_session(uid);
+    return session && session->state == "active";
+}
+
 #ifdef FARLAND_HAVE_LIBSYSTEMD
 
 namespace {
@@ -228,6 +234,41 @@ std::vector<LoginSession> user_sessions(uid_t uid)
     return sessions;
 }
 
+bool session_locked_at_the_machine(uid_t uid)
+{
+    const auto session = local_graphical_session(uid);
+    if (!session) {
+        return false;
+    }
+    // sd-login has no accessor for LockedHint, so it comes off the bus.
+    const Bus bus = open_system_bus();
+    if (!bus) {
+        return false;
+    }
+    BusError error;
+    int locked = 0;
+    // Object paths take only [A-Za-z0-9_], and systemd escapes the rest as
+    // _<hex>; a session id of digits comes out as _3<digit> per digit.
+    std::string path = "/org/freedesktop/login1/session/";
+    for (const char c : session->id) {
+        const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                           ((c >= '0' && c <= '9') && path.back() != '/');
+        if (plain) {
+            path += c;
+        } else {
+            static constexpr std::string_view hex = "0123456789abcdef";
+            path += '_';
+            path += hex[(static_cast<unsigned char>(c) >> 4U) & 0xFU];
+            path += hex[static_cast<unsigned char>(c) & 0xFU];
+        }
+    }
+    if (sd_bus_get_property_trivial(bus.get(), "org.freedesktop.login1", path.c_str(),
+                                    "org.freedesktop.login1.Session", "LockedHint", error.get(), 'b', &locked) < 0) {
+        return false;
+    }
+    return locked != 0;
+}
+
 Result<void> terminate_login_session(const std::string& id)
 {
     const Bus bus = open_system_bus();
@@ -245,37 +286,75 @@ Result<void> terminate_login_session(const std::string& id)
     return {};
 }
 
-Result<std::string> create_gdm_user_display(const std::string& user, uid_t uid, std::chrono::seconds timeout)
+namespace {
+
+/// The object path and interface of one of GDM's two display factories.
+struct Factory {
+    const char* path;
+    const char* interface;
+    const char* what;
+};
+
+Factory factory_of(DisplayFactory factory) noexcept
+{
+    if (factory == DisplayFactory::local) {
+        return Factory{"/org/gnome/DisplayManager/LocalDisplayFactory",
+                       "org.gnome.DisplayManager.LocalDisplayFactory", "seat"};
+    }
+    return Factory{"/org/gnome/DisplayManager/RemoteDisplayFactory", "org.gnome.DisplayManager.RemoteDisplayFactory",
+                   "headless"};
+}
+
+}  // namespace
+
+Result<std::string> create_gdm_user_display(const std::string& user, uid_t uid, DisplayFactory factory,
+                                            std::chrono::seconds timeout)
 {
     const Bus bus = open_system_bus();
     if (!bus) {
         return fail(Errc::io, "no system bus");
     }
-    // An earlier headless session of the user (farlandd restarted, say) is
-    // simply used again.
-    if (auto session = find_user_display_session(bus.get(), uid)) {
-        log::info(log_component, "GDM already runs headless session {} for {}", *session, user);
+    // Which session GDM made. A remote display says so itself, over its
+    // SessionId property; a local one does not -- GDM (50.0, Ubuntu 26.04)
+    // publishes a LocalDisplay object with no properties at all, so nothing
+    // on that side ever names the session. logind does: a local display is
+    // precisely a graphical session of the user on a seat, which is what
+    // local_graphical_session() looks for.
+    const auto session_of_the_display = [&bus, uid, factory]() -> std::optional<std::string> {
+        if (factory == DisplayFactory::remote) {
+            return find_user_display_session(bus.get(), uid);
+        }
+        if (auto session = local_graphical_session(uid)) {
+            return session->id;
+        }
+        return std::nullopt;
+    };
+    // An earlier session of the user (farlandd restarted, say) is simply
+    // used again.
+    if (auto session = session_of_the_display()) {
+        log::info(log_component, "GDM already runs session {} for {}", *session, user);
         return std::move(*session);
     }
+    const Factory which = factory_of(factory);
     BusError error;
-    const int rc = sd_bus_call_method(
-        bus.get(), "org.gnome.DisplayManager", "/org/gnome/DisplayManager/RemoteDisplayFactory",
-        "org.gnome.DisplayManager.RemoteDisplayFactory", "CreateUserDisplay", error.get(), nullptr, "s", user.c_str());
+    const int rc = sd_bus_call_method(bus.get(), "org.gnome.DisplayManager", which.path, which.interface,
+                                      "CreateUserDisplay", error.get(), nullptr, "s", user.c_str());
     if (rc < 0) {
-        log::warn(log_component, "GDM CreateUserDisplay for {}: {}", user, error.describe(rc));
-        return fail(Errc::io, "GDM refused to create a headless session");
+        log::warn(log_component, "GDM CreateUserDisplay ({}) for {}: {}", which.what, user, error.describe(rc));
+        return fail(Errc::io, "GDM refused to create a session");
     }
-    log::info(log_component, "GDM starts a headless GNOME session for {}", user);
+    log::info(log_component, "GDM starts a {} GNOME session for {}",
+              factory == DisplayFactory::local ? "seat" : "headless", user);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (auto session = find_user_display_session(bus.get(), uid)) {
+        if (auto session = session_of_the_display()) {
             return std::move(*session);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     log::warn(log_component, "GDM's session for {} did not appear within {} s", user, timeout.count());
     static_cast<void>(destroy_gdm_user_display(user));
-    return fail(Errc::io, "GDM's headless session did not start in time");
+    return fail(Errc::io, "GDM's session did not start in time");
 }
 
 Result<void> destroy_gdm_user_display(const std::string& user)
@@ -284,12 +363,22 @@ Result<void> destroy_gdm_user_display(const std::string& user)
     if (!bus) {
         return fail(Errc::io, "no system bus");
     }
-    BusError error;
-    const int rc = sd_bus_call_method(
-        bus.get(), "org.gnome.DisplayManager", "/org/gnome/DisplayManager/RemoteDisplayFactory",
-        "org.gnome.DisplayManager.RemoteDisplayFactory", "DestroyUserDisplay", error.get(), nullptr, "s", user.c_str());
-    if (rc < 0) {
-        log::warn(log_component, "GDM DestroyUserDisplay for {}: {}", user, error.describe(rc));
+    // Which factory has the display is farlandd's bookkeeping, and a restart
+    // may have lost it; the other one simply has no display of that user.
+    bool destroyed = false;
+    for (auto factory : {DisplayFactory::local, DisplayFactory::remote}) {
+        const Factory which = factory_of(factory);
+        BusError error;
+        const int rc = sd_bus_call_method(bus.get(), "org.gnome.DisplayManager", which.path, which.interface,
+                                          "DestroyUserDisplay", error.get(), nullptr, "s", user.c_str());
+        if (rc < 0) {
+            log::debug(log_component, "GDM DestroyUserDisplay ({}) for {}: {}", which.what, user, error.describe(rc));
+            continue;
+        }
+        destroyed = true;
+    }
+    if (!destroyed) {
+        log::warn(log_component, "GDM has no display of {} to destroy", user);
         return fail(Errc::io, "GDM DestroyUserDisplay failed");
     }
     return {};
@@ -390,13 +479,18 @@ std::vector<LoginSession> user_sessions(uid_t /*uid*/)
     return {};
 }
 
+bool session_locked_at_the_machine(uid_t /*uid*/)
+{
+    return false;
+}
+
 Result<void> terminate_login_session(const std::string& /*id*/)
 {
     return fail(Errc::unsupported, "this build has no systemd support");
 }
 
 Result<std::string> create_gdm_user_display(const std::string& /*user*/, uid_t /*uid*/,
-                                            std::chrono::seconds /*timeout*/)
+                                            DisplayFactory /*factory*/, std::chrono::seconds /*timeout*/)
 {
     return fail(Errc::unsupported, "this build has no systemd support");
 }

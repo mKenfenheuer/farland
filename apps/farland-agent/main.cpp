@@ -234,6 +234,7 @@ int main(int argc, char** argv)
             headless.height = request.height;
             headless.render_node = request.render_node;
             headless.ask_for_greeter = request.ask_for_greeter;
+            headless.still_waiting = request.still_waiting;
             return app::start_headless_desktop(headless);
         };
     }

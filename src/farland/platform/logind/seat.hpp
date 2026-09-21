@@ -97,4 +97,14 @@ private:
 /// manager started), which is always drawn.
 [[nodiscard]] LogindResult<void> activate_user_session();
 
+/// Whether this process's session is locked -- the screen at the machine is
+/// showing the lock screen, whether somebody locked it or it locked itself.
+///
+/// It matters because a locked GNOME session refuses to be shared at all:
+/// Mutter answers RemoteDesktop.CreateSession with "Session creation
+/// inhibited" while the lock screen is up, so a client cannot attach to the
+/// session until it is unlocked. False where there is no logind or no
+/// session, so that a build without either behaves as it always did.
+[[nodiscard]] bool user_session_locked();
+
 }  // namespace farland::platform::logind

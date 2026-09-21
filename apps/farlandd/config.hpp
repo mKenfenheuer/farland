@@ -34,6 +34,7 @@
 ///     [session]
 ///     desktop = "gnome"                        # gnome | plasma | sway | labwc | cage | test
 ///     command = ["firefox", "--kiosk"]         # cage only, and required there
+///     gdm_display = "seat"                     # gnome only: seat | headless
 ///
 ///     [policy]
 ///     disconnected_timeout = "1h"              # seconds, or a number with s, m, h or d; 0: never
@@ -83,6 +84,21 @@ enum class AuthMode : std::uint8_t {
 
 /// `test` is the synthetic test pattern, for CI and first tests of farlandd.
 enum class DesktopKind : std::uint8_t { gnome, plasma, sway, labwc, cage, test };
+
+/// Where a session GDM starts for a client lives (GNOME only; the other
+/// desktops always get a session of farlandd's own).
+enum class GdmDisplay : std::uint8_t {
+    /// A virtual terminal on the machine's seat, exactly as a login at the
+    /// greeter gives: logind records it Remote=no on seat0, and logging in
+    /// at the machine later comes back to this session with its windows.
+    /// Sessions still run side by side, each on a terminal of its own, and
+    /// farland puts a login screen on the seat while a client holds one.
+    seat,
+    /// Headless: no seat and no terminal. The greeter never offers the
+    /// session, so logging in at the machine starts a second, empty one
+    /// and leaves this session's windows where nobody can reach them.
+    headless,
+};
 
 /// What to do when the user already has a session on a local seat.
 enum class LocalSessionPolicy : std::uint8_t {
@@ -149,6 +165,8 @@ struct SessionSection {
     DesktopKind desktop = DesktopKind::gnome;
     /// The kiosk application for cage, as an argument vector (no shell).
     std::vector<std::string> command;
+    /// Where GDM puts a new GNOME session; an error with any other desktop.
+    GdmDisplay gdm_display = GdmDisplay::seat;
 };
 
 struct PolicySection {
@@ -261,6 +279,7 @@ struct ConfigError {
 
 [[nodiscard]] std::string_view to_string(AuthMode mode) noexcept;
 [[nodiscard]] std::string_view to_string(DesktopKind desktop) noexcept;
+[[nodiscard]] std::string_view to_string(GdmDisplay display) noexcept;
 [[nodiscard]] std::string_view to_string(LocalSessionPolicy policy) noexcept;
 [[nodiscard]] std::string_view to_string(TakeoverPolicy takeover) noexcept;
 [[nodiscard]] std::string_view to_string(TakeoverDefault action) noexcept;

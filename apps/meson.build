@@ -120,6 +120,7 @@ farland_agent_lib = static_library(
   'farland-agent',
   'farland-agent/agent.cpp',
   'farland-agent/prompt.cpp',
+  'farland-agent/unlock.cpp',
   dependencies: agent_deps,
   cpp_args: agent_args,
 )

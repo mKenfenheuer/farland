@@ -15,6 +15,20 @@
 
 namespace farland::app {
 
+/// Why a desktop stopped being ours. Each one means something different to
+/// a client, and the difference decides whether it reconnects.
+enum class DesktopEnd : std::uint8_t {
+    /// The session itself is over: the user logged out, and the compositor
+    /// with them. There is nothing left to come back to.
+    logged_out,
+    /// The desktop is still running, but this connection may no longer have
+    /// it: the user stopped sharing, or the stream was closed.
+    sharing_stopped,
+    /// Somebody at the machine logged in and took the session back
+    /// ([policy] seat_takeover). It is theirs now.
+    taken_at_the_machine,
+};
+
 /// A desktop that sessions show and control (docs/PLAN.md §3.3): frames, the
 /// cursor and an input sink, plus the descriptors the session loop polls.
 /// Without one, sessions show the synthetic test pattern.
@@ -43,6 +57,11 @@ public:
     virtual void dispatch() = 0;
     /// The desktop went away: the user stopped sharing or the stream closed.
     [[nodiscard]] virtual bool closed() const = 0;
+    /// Why it went away, so that the client can be told in the one way RDP
+    /// has of saying it. A client that is told nothing assumes the network
+    /// dropped and reconnects by itself, which is precisely wrong when
+    /// somebody has just logged out or stopped sharing on purpose.
+    [[nodiscard]] virtual DesktopEnd end_reason() const { return DesktopEnd::sharing_stopped; }
 
     /// The screens, at least one, ordered left to right as the compositor
     /// arranges them. The count stays the same while the desktop is open,

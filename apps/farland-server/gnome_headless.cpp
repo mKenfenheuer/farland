@@ -87,17 +87,35 @@ public:
         // drawn only on its seat ends the moment it loses it.
         const char* reason = nullptr;
         if (session_->closed()) {
-            reason = "Mutter closed the remote desktop session";
+            // Mutter lets the session go both when the user stops sharing
+            // from the top bar and when the whole session ends -- and it
+            // only leaves the bus for the second. The client is told which,
+            // because "you logged out" and "somebody stopped the share"
+            // read very differently at the other end.
+            if (session_->compositor_gone()) {
+                reason = "GNOME Shell ended: the user logged out";
+                end_ = DesktopEnd::logged_out;
+            } else {
+                reason = "Mutter closed the remote desktop session";
+                end_ = DesktopEnd::sharing_stopped;
+            }
         } else if (seat_watch_ && keeps_rendering() && seat_watch_->returned_to_the_seat()) {
             reason = "somebody logged in at the machine and took the session back";
+            end_ = DesktopEnd::taken_at_the_machine;
         } else if (seat_watch_ && !keeps_rendering() && seat_watch_->left_the_seat()) {
             reason = "something else took the seat the session is on";
+            end_ = DesktopEnd::taken_at_the_machine;
         } else if (screens_.empty()) {
             reason = "the session has no screens left";
+            end_ = DesktopEnd::sharing_stopped;
         } else if (std::ranges::any_of(screens_, [](const Screen& s) { return s.capture->closed(); })) {
             reason = "a screen's stream closed";
+            end_ = DesktopEnd::sharing_stopped;
         } else if (ei_->closed()) {
+            // The input connection goes with the compositor, so this is
+            // what a logout looks like from here.
             reason = "the input connection closed";
+            end_ = DesktopEnd::logged_out;
         }
         if (reason != nullptr && !said_why_closed_) {
             said_why_closed_ = true;
@@ -105,6 +123,7 @@ public:
         }
         return reason != nullptr;
     }
+    [[nodiscard]] DesktopEnd end_reason() const override { return end_; }
     [[nodiscard]] platform::Clipboard* clipboard() override { return clipboard_.get(); }
 
     [[nodiscard]] std::size_t screen_count() const override { return screens_.size(); }
@@ -195,6 +214,8 @@ private:
     Clock::time_point seat_refused_until_{};
     /// closed() said why, once.
     mutable bool said_why_closed_ = false;
+    /// What closed() found, for the code the client is told.
+    mutable DesktopEnd end_ = DesktopEnd::sharing_stopped;
     /// The monitors that were attached before we took the session over (the
     /// seat's screen), to put back when this desktop goes.
     std::vector<mutter::LogicalMonitor> detached_;
@@ -308,6 +329,17 @@ Result<void> GnomeHeadlessDesktop::connect(const HeadlessOptions& options)
             session_ = std::move(*session);
             return {};
         }
+        // A locked session is not a session that is still starting: Mutter
+        // refuses to share it for as long as the lock screen is up, and no
+        // amount of waiting changes that. Say so at once and let the client
+        // hear why, instead of retrying until the timeout and leaving the
+        // agent silent long enough for farlandd to give the session up.
+        if (options.attach && logind::user_session_locked()) {
+            log::error(log_component, "the session is locked at the machine, and Mutter will not share a locked "
+                                      "session: {}",
+                       session.error().message);
+            return fail(Errc::io, "the session is locked at the machine; unlock it there to connect");
+        }
         if (Clock::now() >= deadline || (shell_ && !shell_->running())) {
             log::error(log_component, "{}", session.error().message);
             return fail(Errc::io, "Mutter's remote desktop API is not available");
@@ -315,6 +347,10 @@ Result<void> GnomeHeadlessDesktop::connect(const HeadlessOptions& options)
         if (!waited) {
             waited = true;
             log::info(log_component, "waiting for the GNOME session's bus: {}", session.error().message);
+        }
+        // Whoever is waiting on us has a timeout of their own.
+        if (options.still_waiting) {
+            options.still_waiting();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }

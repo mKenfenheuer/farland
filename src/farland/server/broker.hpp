@@ -4,6 +4,7 @@
 #pragma once
 
 #include <farland/base/error.hpp>
+#include <farland/base/text.hpp>
 #include <farland/server/connection.hpp>
 #include <farland/server/frame_encoder.hpp>
 #include <farland/server/graphics_pipeline.hpp>
@@ -31,7 +32,11 @@
 /// SCM_RIGHTS (apps/farland-server/unix_socket.hpp). The agent continues the
 /// connection from the MCS Connect Initial on, as farland-server does after
 /// privsep: `server::Connection` over a plaintext transport. TLS keys and the
-/// credential store never reach the agent.
+/// credential store never reach the agent. The one secret that does is the
+/// connecting client's own delegated password (NewConnection::password),
+/// which goes only to the agent of the account it belongs to, and only so
+/// that a session locked at the machine can be unlocked to let that client
+/// back in.
 ///
 /// Who sends what:
 ///
@@ -60,7 +65,7 @@ namespace farland::server::broker {
 
 /// Bumped on every incompatible change; farlandd and the agent come from one
 /// package, so the daemon simply refuses another version.
-inline constexpr std::uint16_t protocol_version = 5;
+inline constexpr std::uint16_t protocol_version = 6;
 
 /// A per-agent secret farlandd generates when it starts the agent. Together
 /// with the peer's uid (SO_PEERCRED) it ties the socket connection to the
@@ -160,12 +165,30 @@ struct ReconnectCookie {
     std::array<std::byte, 16> security_verifier{};
 };
 
+/// Longest password the broker carries. [MS-CSSP] leaves no limit; this is
+/// well past anything a login screen takes.
+inline constexpr std::size_t max_password = 512;
+
 /// A client for this session. The plaintext socket comes with it.
 struct NewConnection {
     std::uint64_t connection_id = 0;  ///< farlandd's number, never 0
     /// X.224 result and the NLA identity; the agent builds its
     /// `server::Connection` from it.
     Negotiation negotiation;
+    /// The password the client delegated over NLA, where it delegated one
+    /// and farlandd checked it. It is here for one thing: a GNOME session
+    /// on a seat can be locked, and a locked session refuses to be shared
+    /// at all, so the agent puts this to GDM to unlock the session it is
+    /// about to attach to (apps/farland-agent/unlock.hpp). The agent runs
+    /// as the session's own user, and this is that user's own password, so
+    /// it crosses no boundary the client has not already crossed -- but it
+    /// is still the one secret farlandd hands out, and it is wiped on both
+    /// sides as soon as the connection has it.
+    ///
+    /// Empty where the client delegated nothing (NLA without delegation, a
+    /// smart card). A locked session then stays locked, and the agent says
+    /// so.
+    SecretString password;
     std::string peer;  ///< the client's address, for logs
     /// Milliseconds since farlandd accepted the TCP connection; the agent's
     /// activation timeout counts from then.
