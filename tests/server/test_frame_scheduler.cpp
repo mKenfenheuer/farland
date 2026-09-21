@@ -103,6 +103,45 @@ TEST_CASE("Lost acknowledgements expire, and suspension stops the gating")
     CHECK(s.frames_in_flight() == 0);
 }
 
+TEST_CASE("On a link slower than the timeout the window still gates")
+{
+    // A round trip well past the one-second floor: with a fixed timeout every
+    // frame would expire before its acknowledgement could arrive, the window
+    // would never be full, and the output would stop being limited exactly
+    // where limiting it matters. The timeout follows the round trip instead.
+    FrameScheduler s(config(1));
+    s.damage();
+    s.frame_sent(1, t0);
+    s.frame_acknowledged(1, t0 + 2s);  // a 2 s round trip is now known
+    REQUIRE(s.round_trip() == 2s);
+
+    s.damage();
+    REQUIRE(s.due(t0 + 2s));
+    s.frame_sent(2, t0 + 2s);
+    s.damage();
+    // Once the floor would have given up on frame 2, the window still holds.
+    CHECK_FALSE(s.due(t0 + 4s));
+    CHECK(s.frames_in_flight() == 1);
+    // It opens again at four round trips, and the wait says so rather than
+    // reporting the floor.
+    CHECK(s.wait(t0 + 4s) == 6s);
+    CHECK(s.due(t0 + 10s));
+}
+
+TEST_CASE("A known round trip never shortens the timeout below the floor")
+{
+    FrameScheduler s(config(1));
+    s.damage();
+    s.frame_sent(1, t0);
+    s.frame_acknowledged(1, t0 + 10ms);  // a fast link
+    REQUIRE(s.round_trip() == 10ms);
+    s.damage();
+    s.frame_sent(2, t0 + 10ms);
+    s.damage();
+    CHECK_FALSE(s.due(t0 + 500ms));  // 4 x 10 ms would have expired it
+    CHECK(s.due(t0 + 1s + 10ms));    // the one-second floor still applies
+}
+
 TEST_CASE("The frame-rate cap follows the quality tier")
 {
     FrameScheduler s(config(8, 50));  // 20 ms per frame

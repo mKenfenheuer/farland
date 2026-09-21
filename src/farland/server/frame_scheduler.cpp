@@ -58,9 +58,22 @@ void FrameScheduler::set_acknowledgements_suspended(bool suspended) noexcept
     }
 }
 
+FrameScheduler::Clock::duration FrameScheduler::ack_timeout() const noexcept
+{
+    if (!round_trip_) {
+        return config_.ack_timeout;
+    }
+    const auto scaled = *round_trip_ * config_.ack_timeout_rtt_factor;
+    // std::clamp is undefined where the floor exceeds the ceiling, which a
+    // configured ack_timeout above max_ack_timeout would do.
+    const auto floor = std::min(config_.ack_timeout, config_.max_ack_timeout);
+    return std::clamp(scaled, floor, config_.max_ack_timeout);
+}
+
 void FrameScheduler::expire(Clock::time_point now)
 {
-    while (!in_flight_.empty() && now - in_flight_.front().sent >= config_.ack_timeout) {
+    const auto timeout = ack_timeout();
+    while (!in_flight_.empty() && now - in_flight_.front().sent >= timeout) {
         in_flight_.pop_front();
     }
 }
@@ -89,7 +102,7 @@ std::optional<FrameScheduler::Clock::duration> FrameScheduler::wait(Clock::time_
     }
     if (gated_by_acks() && in_flight_.size() >= config_.max_frames_in_flight) {
         // Only an acknowledgement or the oldest frame's timeout opens the window.
-        wait = std::max(wait, in_flight_.front().sent + config_.ack_timeout - now);
+        wait = std::max(wait, in_flight_.front().sent + ack_timeout() - now);
     }
     return wait;
 }

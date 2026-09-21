@@ -30,7 +30,18 @@ public:
         std::size_t max_frames_in_flight = 2;
         /// A frame without an acknowledgement for this long no longer counts
         /// as in flight, so a lost acknowledgement cannot stall the output.
+        /// This is a floor: the effective timeout follows the measured round
+        /// trip (ack_timeout_rtt_factor), because on a link slower than the
+        /// floor every frame would expire before its acknowledgement could
+        /// arrive and the window would stop limiting the output at all --
+        /// exactly when limiting it matters most.
         Clock::duration ack_timeout = std::chrono::seconds(1);
+        /// Multiple of the smoothed round trip a frame may be outstanding for
+        /// before it is given up on, once a round trip is known.
+        unsigned ack_timeout_rtt_factor = 4;
+        /// Upper bound on the effective timeout, so a pathological round trip
+        /// cannot hold the output shut indefinitely.
+        Clock::duration max_ack_timeout = std::chrono::seconds(10);
         /// Whether the transport acknowledges frames at all (GFX does; legacy
         /// bitmap updates do not).
         bool acknowledgements = true;
@@ -70,6 +81,9 @@ private:
     [[nodiscard]] bool gated_by_acks() const noexcept { return config_.acknowledgements && !suspended_; }
     /// Forgets frames whose acknowledgement is overdue.
     void expire(Clock::time_point now);
+    /// How long a frame may wait for its acknowledgement: the configured
+    /// floor, or a multiple of the measured round trip where that is slower.
+    [[nodiscard]] Clock::duration ack_timeout() const noexcept;
 
     Config config_;
     Clock::duration interval_;
