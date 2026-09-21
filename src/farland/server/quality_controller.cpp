@@ -117,23 +117,36 @@ unsigned QualityController::fitting_level(std::uint32_t bandwidth_kbps) const no
     return tier_count - 1;
 }
 
-QualityController::Verdict QualityController::classify(const Observation& o, std::string& reason,
-                                                       unsigned& fit_level) const
+QualityController::Verdict QualityController::classify(const Observation& o, Clock::time_point now,
+                                                       std::string& reason, unsigned& fit_level) const
 {
     const auto& net = o.network;
+    // A measurement no one has refreshed is not evidence (bandwidth_freshness).
+    const bool bandwidth_known =
+        net.bandwidth_kbps && net.bandwidth_at && now - *net.bandwidth_at < config_.bandwidth_freshness;
     const Clock::duration base = net.base_rtt.value_or(Clock::duration::zero());
     fit_level = 0;
 
-    // Queueing delay: the RTT now (an unanswered probe is at least that late)
-    // above the lowest RTT seen.
+    // What this link's own variation explains, so that jitter is not read as
+    // queueing (Config::jitter_allowance).
+    const auto allowing = [&](Clock::duration limit) {
+        return std::max(limit, net.jitter * config_.jitter_allowance);
+    };
+    const Clock::duration queue_limit = allowing(config_.queue_delay_limit);
+    const Clock::duration ack_limit = allowing(config_.ack_delay_limit);
+
+    // Queueing delay: the measured round trip above the lowest one seen.
     std::optional<Clock::duration> queue_delay;
     if (net.rtt && net.base_rtt) {
-        const auto now_rtt = std::max(*net.rtt, net.unanswered);
-        queue_delay = now_rtt - base;
+        queue_delay = *net.rtt > base ? *net.rtt - base : Clock::duration::zero();
     }
+    // Against the lowest acknowledgement seen, not the base RTT: the
+    // difference is the client's own decoding, which is a constant cost and
+    // not a congested link (Config::ack_delay_limit).
     std::optional<Clock::duration> ack_delay;
     if (o.ack_round_trip) {
-        ack_delay = *o.ack_round_trip > base ? *o.ack_round_trip - base : Clock::duration::zero();
+        const auto best = base_ack_.value_or(*o.ack_round_trip);
+        ack_delay = *o.ack_round_trip > best ? *o.ack_round_trip - best : Clock::duration::zero();
     }
 
     Verdict verdict = Verdict::hold;
@@ -143,20 +156,32 @@ QualityController::Verdict QualityController::classify(const Observation& o, std
             reason = std::move(why);
         }
     };
-    if (queue_delay && *queue_delay > config_.queue_delay_limit) {
-        worse(*queue_delay > config_.queue_delay_limit * 4 ? Verdict::severe : Verdict::congested,
-              std::format("RTT {:.0f} ms is {:.0f} ms above the base RTT",
-                          ms(net.rtt.value_or(decltype(net.rtt)::value_type{})), ms(*queue_delay)));
+    if (queue_delay && *queue_delay > queue_limit) {
+        worse(*queue_delay > queue_limit * 4 ? Verdict::severe : Verdict::congested,
+              std::format("RTT {:.0f} ms is {:.0f} ms above the base RTT {:.0f} ms, past the {:.0f} ms allowed for "
+                          "{:.0f} ms of jitter",
+                          ms(net.rtt.value_or(decltype(net.rtt)::value_type{})), ms(*queue_delay), ms(base),
+                          ms(queue_limit), ms(net.jitter)));
     }
-    if (ack_delay && *ack_delay > config_.ack_delay_limit) {
-        worse(*ack_delay > config_.ack_delay_limit * 4 ? Verdict::severe : Verdict::congested,
-              std::format("frames acknowledged after {:.0f} ms",
-                          ms(o.ack_round_trip.value_or(decltype(o.ack_round_trip)::value_type{}))));
+    // An unanswered probe says only that the round trip is *at least* this
+    // long; it is a lower bound, not a measurement, and at connect time it is
+    // routinely a client still busy with the first full-screen frame. It may
+    // hold the ladder back, never crash it, so it is never severe.
+    if (net.base_rtt && net.unanswered > base + queue_limit) {
+        worse(Verdict::congested,
+              std::format("a round-trip probe has gone {:.0f} ms without an answer", ms(net.unanswered)));
+    }
+    if (ack_delay && *ack_delay > ack_limit) {
+        worse(*ack_delay > ack_limit * 4 ? Verdict::severe : Verdict::congested,
+              std::format("frames acknowledged after {:.0f} ms, {:.0f} ms above this client's best {:.0f} ms, past "
+                          "the {:.0f} ms allowed",
+                          ms(o.ack_round_trip.value_or(decltype(o.ack_round_trip)::value_type{})), ms(*ack_delay),
+                          ms(base_ack_.value_or(Clock::duration::zero())), ms(ack_limit)));
     }
     if (o.queue_depth >= config_.queue_depth_limit) {
         worse(Verdict::congested, std::format("{} frames queued in the client", o.queue_depth));
     }
-    if (net.bandwidth_kbps) {
+    if (bandwidth_known) {
         const double usable = config_.bandwidth_share * *net.bandwidth_kbps;
         fit_level = fitting_level(*net.bandwidth_kbps);
         if (fit_level > tier_.level) {
@@ -171,10 +196,17 @@ QualityController::Verdict QualityController::classify(const Observation& o, std
 
     // Clear: every signal well inside its limit, and the next tier up would
     // fit the bandwidth.
-    const bool quiet = (!queue_delay || *queue_delay < config_.queue_delay_limit / 2) &&
-                       (!ack_delay || *ack_delay < config_.ack_delay_limit / 2) && o.queue_depth <= 1 &&
-                       o.frames_in_flight < o.max_frames_in_flight;
-    const bool room = !net.bandwidth_kbps || tier_.level == 0 ||
+    //
+    // How full the frame window is says nothing on its own. It holds whatever
+    // the round trip and the frame rate make it hold: at 10 fps and a 150 ms
+    // round trip a window of two is full at all times with the link idle, so
+    // requiring room in it meant the ladder could never climb on any link
+    // whose round trip is longer than a frame interval -- every mobile one.
+    // A client that is genuinely behind shows it in queueDepth and in an
+    // acknowledgement round trip that grows, which are the two tests above.
+    const bool quiet = (!queue_delay || *queue_delay < queue_limit / 2) &&
+                       (!ack_delay || *ack_delay < ack_limit / 2) && o.queue_depth <= 1;
+    const bool room = !bandwidth_known || tier_.level == 0 ||
                       budgets_.at(tier_.level - 1) <= config_.bandwidth_share * *net.bandwidth_kbps;
     return quiet && room ? Verdict::clear : Verdict::hold;
 }
@@ -191,10 +223,17 @@ std::optional<QualityController::Change> QualityController::update(const Observa
     }
     last_sample_ = now;
     last_bytes_ = o.bytes_sent;
+    if (o.ack_round_trip) {
+        recent_acks_.push_back(*o.ack_round_trip);
+        if (recent_acks_.size() > std::max<std::size_t>(config_.base_ack_window, 1)) {
+            recent_acks_.pop_front();
+        }
+        base_ack_ = *std::ranges::min_element(recent_acks_);
+    }
 
     std::string reason;
     unsigned fit_level = 0;
-    const Verdict verdict = classify(o, reason, fit_level);
+    const Verdict verdict = classify(o, now, reason, fit_level);
     switch (verdict) {
     case Verdict::severe:
     case Verdict::congested: {
@@ -203,8 +242,18 @@ std::optional<QualityController::Change> QualityController::update(const Observa
         if (tier_.level + 1 >= tier_count) {
             return std::nullopt;
         }
+        // One step per settle_time, severe included. Severe still skips the
+        // congested-sample count, so a link that has genuinely collapsed is
+        // answered on the first sample -- but three samples in three seconds
+        // must not walk the whole ladder down, which is what a connect-time
+        // transient (the first full-screen frame, the client's first decode)
+        // used to do. Where the measured bandwidth says a lower tier outright,
+        // the fast downshift below still goes straight there in one step.
         const bool settled = !last_downshift_ || now - *last_downshift_ >= config_.settle_time;
-        if (verdict == Verdict::congested && (congested_streak_ < config_.downshift_samples || !settled)) {
+        if (!settled) {
+            return std::nullopt;
+        }
+        if (verdict == Verdict::congested && congested_streak_ < config_.downshift_samples) {
             return std::nullopt;
         }
         // Fast downshift: straight to the tier the bandwidth allows.

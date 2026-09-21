@@ -202,7 +202,7 @@ void AutoDetect::on_response(const ad::Response& response, Clock::time_point now
         // [MS-RDPBCGR] 3.3.5.14: kbit/s = byteCount * 8 / timeDelta. A burst that
         // took under a millisecond counts as one millisecond.
         const std::uint64_t kbps = std::uint64_t{results->byte_count} * 8U / std::max(results->time_delta_ms, 1U);
-        add_bandwidth_sample(static_cast<std::uint32_t>(std::min<std::uint64_t>(kbps, 0xFFFFFFFFU)));
+        add_bandwidth_sample(static_cast<std::uint32_t>(std::min<std::uint64_t>(kbps, 0xFFFFFFFFU)), now);
         return;
     }
     const auto& sync = std::get<ad::NetworkCharacteristicsSync>(response);
@@ -214,7 +214,7 @@ void AutoDetect::on_response(const ad::Response& response, Clock::time_point now
         connect_time_rtt_ = connect_time_bandwidth_ = true;
     }
     add_rtt_sample(std::chrono::milliseconds(sync.rtt_ms));
-    add_bandwidth_sample(sync.bandwidth_kbps);
+    add_bandwidth_sample(sync.bandwidth_kbps, now);
 }
 
 void AutoDetect::add_rtt_sample(Clock::duration sample)
@@ -238,10 +238,11 @@ void AutoDetect::add_rtt_sample(Clock::duration sample)
     ++e.rtt_samples;
 }
 
-void AutoDetect::add_bandwidth_sample(std::uint32_t kbps)
+void AutoDetect::add_bandwidth_sample(std::uint32_t kbps, Clock::time_point now)
 {
     auto& e = estimate_;
     e.last_bandwidth_kbps = kbps;
+    e.bandwidth_at = now;
     if (!e.bandwidth_kbps) {
         e.bandwidth_kbps = kbps;
     } else if (kbps < *e.bandwidth_kbps) {

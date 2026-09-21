@@ -9,6 +9,7 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -23,18 +24,23 @@
 ///
 /// The controller samples the session every `sample_interval` and classifies
 /// the link as congested, clear or neither from
-/// - queueing delay: the auto-detect RTT (or the age of an unanswered probe)
-///   above the base RTT; the session's own output queueing up in front of the
-///   probes shows here first;
-/// - the frame acknowledgement round trip above the base RTT;
+/// - queueing delay: the auto-detect RTT above the base RTT, beyond what the
+///   link's own jitter explains (`jitter_allowance`); the session's own output
+///   queueing up in front of the probes shows here first. The age of an
+///   unanswered probe counts too, but only as ordinary congestion: it is a
+///   lower bound on the round trip rather than a measurement;
+/// - the frame acknowledgement round trip above the *lowest* one seen (the
+///   client's own decode cost, which is not congestion), with the same
+///   allowance for jitter;
 /// - the client's queueDepth (frames waiting for its decoder);
 /// - bandwidth: a tier whose bit budget does not fit the measured bandwidth,
 ///   or output close to it.
 ///
 /// Hysteresis: it steps down after `downshift_samples` congested samples in
-/// a row (at once when the congestion is severe), straight to the tier the
-/// bandwidth allows if that is lower, and waits `settle_time` before another
-/// step down. It steps up one tier after `upshift_wait` of clear samples; an
+/// a row (on the first one when the congestion is severe), straight to the
+/// tier the bandwidth allows if that is lower, and never more than one step
+/// per `settle_time` -- severe included, so a burst of bad samples at connect
+/// cannot walk the ladder to its bottom before the link has been seen. It steps up one tier after `upshift_wait` of clear samples; an
 /// upshift that is followed by a downshift within `failed_upshift_window`
 /// doubles that wait (up to `max_upshift_wait`), so the ladder does not flap
 /// around the link's capacity. Sans-IO: every call takes the time.
@@ -79,15 +85,47 @@ public:
         Clock::duration failed_upshift_window = std::chrono::seconds(15);
 
         /// RTT above the base RTT that counts as congestion; four times as
-        /// much is severe.
+        /// much is severe. This is a floor: see `jitter_allowance`.
         Clock::duration queue_delay_limit = std::chrono::milliseconds(80);
-        /// Frame acknowledgement round trip above the base RTT that counts as
-        /// congestion (the client's decoding included); four times as much is severe.
+        /// Multiples of the measured round-trip variation to allow on top of
+        /// the base RTT before a sample counts as queueing, where that is
+        /// more than the fixed limits above.
+        ///
+        /// The base RTT is the *lowest* round trip seen, so on a link that
+        /// varies -- mobile above all, and Wi-Fi -- an ordinary sample sits
+        /// well above it with nothing queued anywhere. A fixed 80 ms limit
+        /// against a link whose jitter is 50-80 ms reads as congestion
+        /// permanently, and the ladder then lives at its bottom tier on a
+        /// link with tens of Mbit/s to spare. Allowing for the variation the
+        /// link actually shows keeps the signal to real queueing.
+        unsigned jitter_allowance = 2;
+        /// Frame acknowledgement round trip above its own best case that
+        /// counts as congestion; four times as much is severe.
+        ///
+        /// Measured against the lowest acknowledgement round trip seen, not
+        /// against the base RTT: an acknowledgement covers the wire *and* the
+        /// client decoding the frame, so a phone that steadily needs 250 ms
+        /// to decode would otherwise be read as a permanently congested link.
+        /// What says a client is falling behind is that time growing.
         Clock::duration ack_delay_limit = std::chrono::milliseconds(250);
+        /// Acknowledgement samples the best case is the lowest of.
+        std::size_t base_ack_window = 120;
         /// Client queueDepth from which the client counts as behind.
         std::uint32_t queue_depth_limit = 3;
         /// Share of the measured bandwidth the graphics may use.
         double bandwidth_share = 0.8;
+        /// How long a bandwidth measurement is worth acting on.
+        ///
+        /// Continuous measurements ride on a burst of real output, so a
+        /// session sitting at a low tier sends too little to trigger one and
+        /// keeps whatever connect time measured. A reading that came out too
+        /// low then pins the picture for the whole session: the tier is too
+        /// low to produce a burst, and without a burst there is no new
+        /// reading. Past this age the number stops blocking a step up (and
+        /// stops forcing one down); the delay signals still say when the link
+        /// is really full, so the ladder probes upward and backs off, which
+        /// is also what produces the burst that measures it again.
+        Clock::duration bandwidth_freshness = std::chrono::seconds(15);
 
         /// What the H.264 tiers may spend, in kbit/s. The ladder works out a
         /// cap per tier from the surface, the frame rate and the tier's
@@ -147,13 +185,18 @@ public:
 private:
     enum class Verdict : std::uint8_t { clear, hold, congested, severe };
 
-    [[nodiscard]] Verdict classify(const Observation& o, std::string& reason, unsigned& fit_level) const;
+    [[nodiscard]] Verdict classify(const Observation& o, Clock::time_point now, std::string& reason,
+                                   unsigned& fit_level) const;
     [[nodiscard]] Change change_to(unsigned level, const Observation& o, std::string reason);
     /// The lowest level whose budget fits `bandwidth_kbps`.
     [[nodiscard]] unsigned fitting_level(std::uint32_t bandwidth_kbps) const noexcept;
 
     Config config_;
     QualityTier tier_;
+    /// The lowest acknowledgement round trip of the recent ones: what this
+    /// client costs when nothing is queued.
+    std::deque<Clock::duration> recent_acks_;
+    std::optional<Clock::duration> base_ack_;
     std::array<std::uint32_t, tier_count> budgets_{};
     std::optional<Clock::time_point> last_sample_;
     std::uint64_t last_bytes_ = 0;

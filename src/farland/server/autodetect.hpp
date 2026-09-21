@@ -47,6 +47,12 @@ struct NetworkEstimate {
     /// newest measurement.
     std::optional<std::uint32_t> bandwidth_kbps;
     std::optional<std::uint32_t> last_bandwidth_kbps;
+    /// When the newest bandwidth measurement was taken. Continuous
+    /// measurements ride on a burst of real output, so a session with little
+    /// to send keeps whatever connect time happened to measure -- which is
+    /// the least reliable reading there is. A reader can tell how old it is
+    /// and stop trusting it.
+    std::optional<Clock::time_point> bandwidth_at;
 
     std::uint64_t rtt_samples = 0;
     std::uint64_t bandwidth_samples = 0;
@@ -116,7 +122,7 @@ private:
 
     [[nodiscard]] std::uint16_t next_sequence() noexcept { return sequence_++; }
     void add_rtt_sample(Clock::duration sample);
-    void add_bandwidth_sample(std::uint32_t kbps);
+    void add_bandwidth_sample(std::uint32_t kbps, Clock::time_point now);
     void expire_probes(Clock::time_point now);
 
     Config config_;

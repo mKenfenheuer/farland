@@ -41,10 +41,17 @@ struct Trace {
     void rtt(Clock::duration value) { o.network.rtt = o.network.last_rtt = value; }
 
     /// `steps` samples of the current observation; `kbps` of output meanwhile.
+    /// A link with a bandwidth is one that keeps being measured, so the
+    /// reading stays fresh; `stale_bandwidth` leaves it to age instead.
+    bool stale_bandwidth = false;
+
     void run(int steps, std::uint32_t kbps = 1000)
     {
         for (int i = 0; i < steps; ++i) {
             now += 500ms;
+            if (o.network.bandwidth_kbps && !stale_bandwidth) {
+                o.network.bandwidth_at = now;
+            }
             o.bytes_sent += std::uint64_t{kbps} * 1000 / 8 / 2;
             if (auto change = controller.update(o, now)) {
                 reasons.push_back(change->reason);
@@ -79,6 +86,91 @@ QualityController::Config config_default()
 }
 
 }  // namespace
+
+TEST_CASE("A client that is simply slow to decode is not a congested link")
+{
+    // A phone: every frame acknowledgement costs ~300 ms because that is how
+    // long it takes to decode, steadily, with nothing queued anywhere. The
+    // old test measured this against the base RTT and read the decode time as
+    // congestion, which pinned such clients at the bottom tier.
+    Trace t;
+    t.o.network.base_rtt = 85ms;
+    t.o.network.jitter = 40ms;
+    t.o.network.bandwidth_kbps = 40000;
+    t.rtt(120ms);
+    t.o.ack_round_trip = 300ms;  // constant, not growing
+    t.run(40);
+    CHECK(t.level() == 0);
+}
+
+TEST_CASE("An acknowledgement round trip that grows still counts as congestion")
+{
+    Trace t;
+    t.o.network.base_rtt = 85ms;
+    t.o.network.jitter = 40ms;
+    t.o.network.bandwidth_kbps = 40000;
+    t.rtt(120ms);
+    t.o.ack_round_trip = 300ms;
+    t.run(6);                      // establish the client's best case
+    const unsigned settled = t.level();
+    t.o.ack_round_trip = 900ms;    // now it is falling behind
+    t.run(10);
+    CHECK(t.level() > settled);
+}
+
+TEST_CASE("A jittery link is not mistaken for a congested one")
+{
+    // A mobile link: the base RTT is the best case ever seen, and ordinary
+    // samples sit far above it because the link varies that much. Nothing is
+    // queued and there is bandwidth to spare, so the ladder must stay up --
+    // with a fixed limit this trace pinned it at the bottom tier.
+    Trace t;
+    t.o.network.base_rtt = 85ms;
+    t.o.network.jitter = 60ms;
+    t.o.network.bandwidth_kbps = 40000;
+    t.rtt(180ms);  // 95 ms above base: inside 2 x 60 ms of jitter
+    t.o.ack_round_trip = 300ms;
+    t.run(40);
+    CHECK(t.level() == 0);
+}
+
+TEST_CASE("Real queueing still steps the ladder down on a jittery link")
+{
+    // The same link, but now the round trip is far past what its jitter
+    // explains: that is queueing, and it must still be acted on.
+    Trace t;
+    t.o.network.base_rtt = 85ms;
+    t.o.network.jitter = 60ms;
+    t.o.network.bandwidth_kbps = 40000;
+    t.rtt(600ms);  // 515 ms above base, well past 120 ms
+    t.run(20);
+    CHECK(t.level() > 0);
+}
+
+TEST_CASE("A burst of severe samples costs one tier per settle time")
+{
+    // Three bad samples in a row used to walk the ladder from 0 to 3 inside a
+    // second, which is what a connect-time transient looks like.
+    Trace t;
+    t.o.network.base_rtt = 20ms;
+    t.o.network.jitter = 0ms;
+    t.rtt(2s);  // severe by any measure
+    t.run(3);   // 1.5 s of samples, under two settle times
+    CHECK(t.level() <= 1);
+}
+
+TEST_CASE("An unanswered probe holds the ladder back but does not crash it")
+{
+    // net.unanswered is a lower bound on the round trip, not a measurement;
+    // at connect it is routinely a client busy with the first full screen.
+    Trace t;
+    t.o.network.base_rtt = 20ms;
+    t.o.network.jitter = 0ms;
+    t.rtt(25ms);                     // the measured trip is fine
+    t.o.network.unanswered = 1200ms;  // but a probe is outstanding
+    t.run(2);
+    CHECK(t.level() <= 1);  // at most one step, never straight to the bottom
+}
 
 TEST_CASE("Quality: a slow link starts the ladder where the link is")
 {
@@ -277,10 +369,18 @@ TEST_CASE("Severe congestion steps down at the first sample")
 
 TEST_CASE("An unanswered RTT probe counts as a late answer")
 {
+    // A probe without an answer says the round trip is *at least* this long.
+    // That is a lower bound, not a measurement, so it counts as ordinary
+    // congestion: it needs downshift_samples in a row rather than stepping
+    // down off a single sample the way a measured collapse does. At connect
+    // an outstanding probe is routinely just a client busy with the first
+    // full-screen frame.
     Trace t;
     t.o.network.unanswered = 900ms;  // the link stalled
     t.run(1);
-    CHECK(t.level() == 1);
+    CHECK(t.level() == 0);  // one sample is not enough on its own
+    t.run(1);
+    CHECK(t.level() == 1);  // two in a row are
 }
 
 TEST_CASE("A bandwidth drop jumps straight to the tier that fits")
@@ -308,6 +408,23 @@ TEST_CASE("A bandwidth drop jumps straight to the tier that fits")
     CHECK(t.level() == 0);
 }
 
+TEST_CASE("A bandwidth reading nobody refreshes stops holding the tier down")
+{
+    // Continuous measurement rides on a burst of real output, so a session
+    // pinned at a low tier never produces one and keeps whatever connect time
+    // measured. If that reading was too low the picture stays bad for the
+    // whole session, with no way out. Once it is stale the ladder may climb
+    // again -- and the climb is what produces the burst that measures it.
+    Trace t;
+    t.o.network.bandwidth_kbps = 1500;  // far too low for tier 0
+    t.o.network.bandwidth_at = t.now;
+    t.stale_bandwidth = true;  // never measured again
+    t.run(10, 20);             // and too little output to trigger one
+    REQUIRE(t.level() > 0);    // while it is fresh it holds the tier down
+    t.run(80, 20);             // well past bandwidth_freshness
+    CHECK(t.level() == 0);
+}
+
 TEST_CASE("Sending close to the measured bandwidth counts as congestion")
 {
     Trace t;
@@ -323,6 +440,11 @@ TEST_CASE("Slow acknowledgements and a deep client queue step down without auto-
 {
     Trace acks;
     acks.o.network = NetworkEstimate{};  // no auto-detect
+    // A steady acknowledgement round trip is what this client costs to decode
+    // a frame, however long it is; only growth beyond that is congestion.
+    acks.o.ack_round_trip = 120ms;
+    acks.run(2);
+    REQUIRE(acks.level() == 0);
     acks.o.ack_round_trip = 400ms;
     acks.run(2);
     CHECK(acks.level() == 1);
@@ -334,7 +456,10 @@ TEST_CASE("Slow acknowledgements and a deep client queue step down without auto-
     CHECK(queue.level() == 1);
     CHECK(queue.reasons.back().find("queued") != std::string::npos);
 
-    // A full frame window alone is not congestion, but it keeps the tier from rising.
+    // A full frame window is not congestion and does not hold the tier down
+    // either: it is what the round trip and the frame rate make it, and on a
+    // link whose round trip exceeds a frame interval it is full whenever
+    // anything is being sent at all.
     Trace window;
     window.rtt(200ms);
     window.run(2);
@@ -342,7 +467,7 @@ TEST_CASE("Slow acknowledgements and a deep client queue step down without auto-
     window.rtt(20ms);
     window.o.frames_in_flight = 2;
     window.run(30);
-    CHECK(window.level() == 1);
+    CHECK(window.level() == 0);
     window.o.frames_in_flight = 1;
     window.run(10);
     CHECK(window.level() == 0);
