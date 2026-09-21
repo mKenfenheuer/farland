@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <format>
 #include <mutex>
 #include <utility>
 #include <vector>

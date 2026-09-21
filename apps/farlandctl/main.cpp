@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <optional>
 #include <span>

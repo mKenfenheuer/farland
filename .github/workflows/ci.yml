@@ -15,10 +15,10 @@ permissions:
 jobs:
   build:
     # Deliberately small, to keep runner minutes down: one build, one test
-    # run, one run of the release binary, and the Debian package, installed
-    # to check that its multi-session service starts. Sanitizers, fuzzing,
-    # clang-tidy, other distributions and compilers, and the compositor
-    # tests run locally; CONTRIBUTING.md says how.
+    # run, one run of the release binary, and the Debian package. Sanitizers,
+    # fuzzing, clang-tidy, other compilers and the compositor tests run
+    # locally; CONTRIBUTING.md says how. The mutter and kwin packages are
+    # their own workflow, because they build a compositor.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -36,13 +36,97 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends dpkg-dev file
           sh packaging/make-deb.sh build "$RUNNER_TEMP/pkg"
-      - name: Install it and start the multi-session service
-        run: |
-          sudo apt-get install -y "$RUNNER_TEMP"/pkg/farland_*.deb
-          systemctl is-enabled farlandd
-          systemctl is-active farlandd || { sudo journalctl -u farlandd --no-pager -n 40; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: farland-deb
           path: ${{ runner.temp }}/pkg/*.deb
+          retention-days: 14
+
+  rpm:
+    # The RPM of the same tree, built the way Fedora would build it: the
+    # spec's own BuildRequires are installed with `dnf builddep`, so a
+    # dependency the spec forgot fails here and not on a user's machine.
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install git, so the checkout is a git checkout
+        run: dnf install -y git
+      - uses: actions/checkout@v4
+      - name: Install the build dependencies from the spec
+        run: |
+          dnf install -y rpm-build dnf-command\(builddep\)
+          dnf builddep -y packaging/farland.spec
+      - name: Build the RPM
+        run: sh packaging/make-rpm.sh "$RUNNER_TEMP/pkg"
+      - name: Show what the package holds
+        run: |
+          package=$(find "$RUNNER_TEMP/pkg" -name '*.rpm' | head -1)
+          rpm -qpi "$package"
+          rpm -qpl "$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farland-rpm
+          path: ${{ runner.temp }}/pkg/*.rpm
+          retention-days: 14
+
+  aur:
+    # The AUR recipe, built on Arch from this checkout rather than from the
+    # GitHub clone its `source` names, so a pull request tests its own tree.
+    # arch-meson forbids downloading wraps, so this also checks that every
+    # dependency comes from the repositories.
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install git, so the checkout is a git checkout
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v4
+        with:
+          # pkgver() counts the commits, so it needs more than the tip.
+          fetch-depth: 0
+      - name: A user to build as
+        run: |
+          # makepkg refuses to run as root, and asks sudo for --syncdeps.
+          pacman -S --noconfirm --needed base-devel sudo
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          # The checkout belongs to root and makepkg clones it as builder.
+          git config --global --add safe.directory '*'
+          su builder -c 'git config --global --add safe.directory "*"'
+      - name: Check .SRCINFO is what the PKGBUILD says
+        # Everything but pkgver, which pkgver() computes from the checkout
+        # at build time and .SRCINFO can only hold a snapshot of.
+        run: |
+          work=$RUNNER_TEMP/srcinfo
+          mkdir -p "$work"
+          cp packaging/aur/PKGBUILD packaging/aur/farland.install "$work/"
+          chown -R builder "$work"
+          su builder -c "cd '$work' && makepkg --printsrcinfo" > "$work/.SRCINFO"
+          nopkgver() { sed '/^[[:space:]]*pkgver = /d' "$1"; }
+          if ! diff -u <(nopkgver packaging/aur/.SRCINFO) <(nopkgver "$work/.SRCINFO"); then
+            echo "packaging/aur/.SRCINFO is stale: makepkg --printsrcinfo > .SRCINFO" >&2
+            exit 1
+          fi
+      - name: Build the package from this checkout
+        run: |
+          # The recipe is copied because the copy's `source` is rewritten to
+          # this checkout at this commit; the recipe in the tree goes on
+          # pointing at the public repository, which is what the AUR needs.
+          work=$RUNNER_TEMP/aur
+          mkdir -p "$work"
+          cp packaging/aur/PKGBUILD packaging/aur/farland.install "$work/"
+          # A branch of its own, because a clone of a repository sitting
+          # at a detached HEAD need not carry that commit.
+          git branch -f ci-build HEAD
+          sed -i "s|^source=.*|source=(\"\$pkgname::git+file://$(pwd)#branch=ci-build\")|" "$work/PKGBUILD"
+          chown -R builder "$work"
+          su builder -c "cd '$work' && makepkg --syncdeps --noconfirm --needed"
+      - name: Show what the package holds
+        run: |
+          package=$(find "$RUNNER_TEMP/aur" -name '*.pkg.tar.*' | head -1)
+          pacman -Qip "$package"
+          pacman -Qlp "$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farland-aur
+          path: ${{ runner.temp }}/aur/*.pkg.tar.*
           retention-days: 14

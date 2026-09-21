@@ -1,110 +1,207 @@
 # farland
 
-A modern Remote Desktop Protocol stack for Linux and Wayland, meant to succeed FreeRDP. It is written in C++ on its own sans-IO protocol core.
+**A Remote Desktop Protocol server for Linux and Wayland.** Connect to a
+Linux machine with the Remote Desktop client you already have — Microsoft's
+mstsc or Windows App, FreeRDP, or any other RDP client — and get a Wayland
+desktop: your own, or a headless one that exists only for the connection.
 
-- **Server first:** a Wayland RDP server for any compositor, built on PipeWire, xdg-desktop-portal, libei and native Mutter/KWin/wlroots backends. Supports NLA (CredSSP with NTLMv2 or Kerberos), RDPGFX with ClearCodec, RFX Progressive, planar and AVC420/AVC444, clipboard, audio, multi-monitor and headless multi-session.
-- **Then a client:** a native Wayland client with dmabuf rendering, fractional scaling, pointer constraints, IME, and RemoteApp windows.
+farland is written in C++ on its own sans-IO protocol core, and is meant to
+succeed FreeRDP's server as the RDP stack on Linux.
 
-Status: M6 implemented (channels: resize and multi-monitor, clipboard, audio and microphone, touch and pen; tried with FreeRDP, not yet with mstsc or Windows App), on top of M5 (codecs and quality: AVC444, VA-API and NVENC, ClearCodec, network auto-detect with quality tiers), desktop sharing through xdg-desktop-portal, PipeWire and libei (M4, working on GNOME and Plasma), the Graphics Pipeline with Progressive, planar and AVC420, NLA and privilege-separated pre-authentication. The groundwork for headless multi-session (M7) is in. See:
-
-- [docs/PLAN.md](docs/PLAN.md): scope, architecture, reference material, testing, security, risks
-- [docs/ROADMAP.md](docs/ROADMAP.md): milestones M0–M8 (server 1.0), C1–C5 (client), phase 3
-
-## Building
-
-Requires GCC ≥ 13 or Clang ≥ 19 (on Ubuntu 24.04, `clang-19`), Meson ≥ 1.3 with Ninja, and OpenSSL ≥ 3.0 development files (`libssl-dev`, `openssl-devel`). Catch2 is fetched automatically if the system does not provide it. H.264 needs no library at build time: OpenH264 is loaded at runtime, and the x264 backend (`-Dx264=enabled`) is off by default because it makes the binaries GPL. H.264 on the GPU through VA-API is built when libva is installed (`libva-dev`, `libva-devel`; `-Dvaapi=disabled` turns it off). On macOS, point pkg-config at Homebrew's OpenSSL: `export PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig`.
-
-```sh
-meson setup build
-meson compile -C build
-meson test -C build
+```
+mstsc / Windows App / FreeRDP  ──RDP──▶  farlandd  ──▶  a desktop per user
+                                                        (GNOME, Plasma, sway,
+                                                         labwc, cage)
 ```
 
-## Trying the server
+## What it does
 
-farland-server serves a synthetic test desktop, or the running Wayland desktop with `--share` (below). Clients authenticate with NLA against a user file of NT hashes:
+- **Connect the way you already do.** NLA (CredSSP with NTLMv2 or Kerberos),
+  so clients ask for the password before the desktop appears, and a
+  workstation with a Kerberos ticket signs in without one.
+- **A desktop per user, behind one port.** `farlandd` gives each user their
+  own headless session on port 3389: GNOME through GDM, or Plasma, sway,
+  labwc and cage through farland's own logind sessions. Disconnect and the
+  session keeps running; reconnect and you are back in it.
+- **Or share the desktop that is running.** `farland-server --share` serves
+  the Wayland session in front of you, through xdg-desktop-portal, on any
+  compositor whose portal supports RemoteDesktop.
+- **A picture that holds up.** The RDP Graphics Pipeline with RemoteFX
+  Progressive, ClearCodec for text and UI, and H.264 (AVC420 and AVC444) for
+  moving picture — encoded on the GPU through NVENC or VA-API where there is
+  one. Text stays sharp, video stays smooth, and a desktop that stands still
+  ends up pixel-exact.
+- **The rest of a remote desktop.** Clipboard both ways (text, HTML, images,
+  files), audio out and microphone in, the client's camera as a local camera,
+  multi-monitor, resizing while connected, touch and pen.
+- **Adapts to the link.** Round trip and bandwidth are measured
+  continuously, and the frame rate, quantisation and bitrate follow.
+- **Built to be run on a server.** Each client is served by a separate,
+  sandboxed network process — `nobody`, Landlock, seccomp, no file system —
+  that never sees a password hash or a keytab. Upgrading `farlandd` does not
+  disconnect anybody.
 
-```sh
-./build/apps/farlandctl passwd alice                # asks for the password; add --domain to pin a domain
-./build/apps/farland-server --port 3389             # prints the certificate fingerprint
-xfreerdp3 /v:localhost:3389 /u:alice /p:'…' /cert:tofu   # or mstsc / Windows App
-```
+## Status
 
-- **Files:** the users live in `$XDG_CONFIG_HOME/farland/users` (mode 0600, `user:domain:NT hash`; an empty domain matches any), and the certificate and key in `$XDG_CONFIG_HOME/farland/tls/`. Both are created on first use. The server rereads the user file for every connection.
-- **`--allow-tls-only`** also admits clients without NLA, which then reach the session without logging in; use it only for testing.
-- **Privilege separation:** each client is served by a separate network process. That process handles TLS and NLA and, on Linux, runs as `nobody` when started as root, with Landlock and a seccomp filter. It asks the main process to verify NTLM responses and never sees a password hash. `--no-privsep` handles clients in the main process instead, for debugging.
-- **Graphics:** clients that run the Graphics Pipeline (mstsc, Windows App, FreeRDP with `/gfx`) get RDPGFX with RemoteFX Progressive tiles. `--gfx-codec planar` sends lossless planar tiles.
-  - **H.264:** `--gfx-codec avc420` sends H.264, and `--gfx-codec avc444` sends full-colour 4:4:4 H.264 (AVC444 and AVC444v2, checked against FreeRDP's decoder; not yet tried with mstsc).
-  - **Encoders:** H.264 runs on the GPU where one encodes it, through NVENC on NVIDIA or VA-API on AMD and Intel, and otherwise through OpenH264 loaded at runtime (`--openh264 FILE`; Cisco's prebuilt `libopenh264.so.8` works). `--h264-encoder auto|nvenc|vaapi|openh264|x264` and `--render-node PATH` choose explicitly. With `--share` and AVC420, the captured frames go to a GPU encoder as dmabufs, without a copy through CPU memory (`--no-zero-copy` turns that off).
-  - **Text, pictures and video:** on Progressive surfaces every 64x64 tile gets the codec its content and its behaviour ask for. Tiles with few colours (text, UI) go through ClearCodec and stay sharp. Tiles that keep changing and hold too many colours for that are moving picture and go through H.264 on the same surface, as an AVC420 picture whose region rectangles list only those tiles; when they stop moving they come back sharp through Progressive. Small damage (at most 12 tiles: a caret, a clock, a spinner) goes out at full Progressive quality at once rather than coarse-first, so what the eye rests on never lags behind the refinement. Everything else goes out coarse first and is refined while it stands still, and once a tile is at full quality and has stood still for three frames it is sent once more losslessly, so a still desktop ends up pixel-exact. `--no-clearcodec`, `--no-refine`, `--no-video-regions` and `--no-lossless-still` switch the parts off.
-  - **Fallbacks:** clients without GFX, or without H.264, fall back to Progressive or to planar bitmap updates.
-  - **Scrolling:** on Progressive and planar surfaces, a scrolled document is moved on the client and only the uncovered rows are encoded.
-  - **Monitors and resizing:** the client's monitors (CS_MONITOR: FreeRDP `/multimon` or `/monitors`, mstsc and Windows App with "use all my monitors") apply at connect time, and the Display Control channel ([MS-RDPEDISP]) resizes the desktop and changes the monitors while connected (FreeRDP `/dynamic-resolution`, a resized mstsc or Windows App window). A burst of layouts while a window edge is dragged is applied once it settles. GFX clients get one surface per monitor and a ResetGraphics with the monitor list; clients without GFX are reactivated at the new size. The test pattern shows on every monitor.
-  - **Network:** clients that support network auto-detect have their round trip and bandwidth measured (`--autodetect full|continuous|off`). Together with the frame acknowledgements, this picks one of four quality tiers (frame rate, Progressive quantisation, H.264 bitrate).
-  - **Log:** every 5 seconds it shows the GFX frame rate, the frames in flight, the round trip, the measured network and the tier.
-- **Sharing the desktop:** `--share` shows and controls the running Wayland desktop instead of the test pattern, and serves one session at a time. Every monitor picked in the portal dialog is shared, each on one of the client's monitors from left to right (a single one on the client's primary monitor). A client with one monitor and no display control sees the shared monitors side by side at their size. Where a monitor and the client's monitor differ in size, the picture is centred with black borders, and scaled down when it is larger (by the client where it supports MapSurfaceToScaledOutput, otherwise by farland); pointer input follows the picture. It uses xdg-desktop-portal: ScreenCast over PipeWire for the picture and the cursor, and RemoteDesktop with libei for input. It is tested on GNOME 50 and Plasma 6.6, and meant for any other compositor whose portal supports RemoteDesktop. The first start shows the portal's permission dialog on the desktop; farland then keeps a restore token in `$XDG_STATE_HOME/farland/portal-restore-token`, so later starts connect without asking. `--virtual-monitor` shares a new virtual monitor where the portal offers one: on GNOME it takes the size of the client's (primary) monitor and follows the client's window when it is resized, since Mutter sizes a virtual monitor to what its screen cast consumer asks for; KWin's portal creates it at 1920x1080 and keeps that size, so there it is scaled and centred. A portal session has one virtual monitor, so further client monitors stay black. It keeps its own token in `portal-restore-token-virtual`. This needs a Linux build with the portal backend (`libsystemd-dev`, `libpipewire-0.3-dev`, `libei-dev`).
-- **Headless GNOME:** `--headless gnome` runs a GNOME desktop that exists only for the RDP client, through Mutter's own remote desktop API as gnome-remote-desktop uses it: no portal and no permission dialog. farland starts a GNOME Shell (`gnome-shell --headless --no-x11`) on a D-Bus session bus of its own for the user it runs as, and stops it on exit. Each client monitor gets a virtual monitor at its size, which follows the client's window when it is resized and comes and goes with the client's monitors; input goes through libei, the clipboard through Mutter, and `--keymap LAYOUT` (an XKB layout such as `de` or `fr(azerty)`) sets the keyboard layout where farland was built with libxkbcommon. `--headless-attach` uses the GNOME session farland runs in (its session bus, for example a headless session GDM started) instead of starting a shell. The launched shell is a bare one, without gnome-session: no settings daemons, autostart applications or X11 applications. Tested with GNOME 50.1. It needs the portal backend's build dependencies; the multi-session daemon (M7) starts these desktops per user. Attaching takes the session over: the session shows exactly the monitors of this connection, with the client's first monitor as the session's primary one, so the panel, the dash and the overview are where the client looks, and the monitors of the local seat are switched off while the client holds it. GNOME draws only the session that is active on its seat, so attaching brings the session to its seat first (logind, and the seat's VT switch where that is not enough) and fails with a clear message when it cannot; someone switching the seat to another session afterwards ends the connection. Disconnecting switches the seat's monitors back on.
-- **Headless Plasma:** `--headless plasma` starts a Plasma desktop of its own for the user farland-server runs as, without a portal dialog, and serves one session at a time. KWin runs with its virtual backend (`kwin_wayland_wrapper --virtual`) and `plasma_session` inside it, on a private D-Bus bus, so a local Plasma session of the same user keeps running undisturbed; the desktop ends with the server. Its output takes the size of the client's monitor and follows the client's window (KWin custom modes), the picture comes from KWin's screen casting (`zkde_screencast_unstable_v1`) over PipeWire, input goes through KWin's EIS, and the clipboard through ext-data-control. `--keymap LAYOUT` sets the XKB layout (`de`, `de(nodeadkeys)`). `--attach` uses the KWin of the session farland-server runs in instead of starting one; its virtual outputs are resized, real monitors keep their size. KWin grants screen casting only to programs a desktop file names: a started session finds one farland writes under `$XDG_RUNTIME_DIR/farland/kwin-data`, and attaching needs `org.farland.server.desktop` installed (meson installs it into `share/applications`; for a build tree, copy it into `~/.local/share/applications` with `Exec=` set to the binary's full path). Screen casting needs KWin's OpenGL compositing, so a render node that can allocate buffers (a VM needs 3D acceleration, such as virgl). It is tested with Plasma 6.6 (a KWin without custom modes in `kde_output_management_v2` keeps the output at its first size) and needs a Linux build with the KWin backend (the portal backend's dependencies and `libwayland-dev`). The multi-user daemon starts it per user later (M7).
-- **Headless sway, labwc and cage:** `--headless sway|labwc|cage` starts that wlroots compositor for the user farland-server runs as, on its headless backend (`WLR_BACKENDS=headless`, rendering with pixman, or on `--render-node`), and serves it instead of the test pattern, one session at a time; it stops when farland-server exits. cage runs the application given after `--` (`farland-server --headless cage -- foot`). The output starts at `--headless-size WxH` (default 1920x1080) and follows the client's window through display control. `--headless-layout de` picks the XKB layout of the keymap farland gives the compositor (default us); characters a client types as Unicode that the layout lacks go on spare keys of that keymap. `--headless-attach` serves the compositor already running in this session (`$WAYLAND_DISPLAY`) instead, with its outputs as they are. No portal is involved: farland is a Wayland client of the compositor, with ext-image-copy-capture for the picture and the cursor (wlr-screencopy on cage, with the cursor drawn into the picture), the virtual keyboard and pointer protocols for input, ext- or wlr-data-control for the clipboard (cage has none) and wlr-output-management for sizes. There is no virtual touch protocol, so touch drives the pointer. Tested with sway 1.11, labwc 0.9.3 and cage 0.2.1 on Ubuntu 26.04. This needs a Linux build with the wlroots backend (`libwayland-dev`, `libxkbcommon-dev`, `wayland-protocols`), and the multi-session daemon (M7) uses the same backend.
-- **Touch and pen:** clients with a touchscreen or a pen (Windows App on a tablet, mstsc on a Surface) send their touch and pen frames over the RDPEI channel. With `--share`, fingers become libei touches on the compositor's touchscreen device (Plasma 6.6 and GNOME offer one), mapped like the pointer; where there is none, the first finger drives the pointer. libei has no tablet devices, so the pen moves the pointer and holds the left button while it touches (the right one with the barrel button pressed); pressure and tilt are dropped.
-- **The test desktop** shows color bars and a bouncing square. A crosshair follows the pointer and turns red while a button is held, keys show up as colored cells at the bottom, and touch and pen contacts as squares. `--log-level debug` logs every input event.
-- **Audio:** what the desktop plays goes to the client's speakers, and the client's microphone shows up as a local audio source named "farland microphone" (`farland-microphone`) while the client records. Both use the user's own PipeWire daemon, with `--share` and with the test desktop. Playback runs over the AUDIO_PLAYBACK_DVC dynamic channel, or the rdpsnd static channel where the client has no such channel. Clients that ask for dynamic or medium quality get Opus (libopus, loaded at runtime), and clients that ask for high quality (FreeRDP's default) or have no Opus get 16-bit PCM. Silence sends nothing, and the client's wave confirmations pace the stream: audio is dropped rather than queued when the network falls behind. `--no-audio` and `--no-microphone` turn either off; the client decides too (mstsc's "play on this computer" and "record from this computer", FreeRDP's `/sound` and `/microphone`).
-- **Clipboard:** with `--share`, text, HTML, images and files are copied both ways between the client and the desktop (cliprdr, through the portal's Clipboard interface), and only transferred when someone pastes. Files the client copies are fetched when the desktop pastes them, into a private directory under `$XDG_RUNTIME_DIR/farland/` (up to 1 GiB per paste), and removed when the session ends; files the desktop copies are read directly, symlinks inside folders are not followed. PNG images need zlib (`-Dpng`); without it images go as BMP. `--no-clipboard` turns the clipboard off. The test desktop has a loopback clipboard instead: what the client copies is fetched and offered back, so pasting it again shows the round trip through the server.
+Pre-release and unversioned: there is no tagged release yet, and the packages
+below are built from a checkout. The server is what works today (milestone M6
+of [docs/ROADMAP.md](docs/ROADMAP.md)); a native Wayland *client* is still to
+come. It is tested against FreeRDP; mstsc and Windows App are only partly
+tried, and the feature notes in the documentation say what each was tested
+with.
 
-## Multi-session: farlandd
+## Try it without installing anything
 
-farlandd gives every user their own desktop behind one port (docs/ROADMAP.md M7). It runs as root from `farlandd.service`.
-
-**Installing on Debian or Ubuntu:** `sh packaging/make-deb.sh build-deb .` builds `farland_<version>_<arch>.deb` from a release build (needs `dpkg-dev`). Installing it puts the binaries in place, enables and starts `farlandd.service` on port 3389 with `/etc/farland/farland.toml`, and keeps that file across upgrades. Enrol the first user with `farlandctl passwd`, and pick the desktop in the configuration. CI builds the package on every push and keeps it as an artifact. For each client a sandboxed network process does TLS and NLA, as in farland-server. farlandd then maps the NLA user to a local account and hands the decrypted connection to that account's `farland-agent`, which runs the desktop session as the user. A user has one session: disconnecting leaves it running, reconnecting lands in it again, and a second connection of the same user takes it over, after the person using it is asked (`[policy] takeover`), ending the first with "disconnected by another connection".
-
-**Other distributions:** `sh packaging/make-rpm.sh` builds the RPM from `packaging/farland.spec` (Fedora, openSUSE; needs `rpm-build`), and it behaves like the deb: the reference configuration stays in `/usr/share/farland/farland.toml`, `%post` copies it to `/etc/farland/farland.toml` the first time and leaves it alone afterwards, and the service is enabled on a first install and restarted on an upgrade. `packaging/aur/` is the AUR recipe (`farland-git`, since there is no tagged release yet); it follows Arch's convention instead and enables nothing, printing what to run. `packaging/container/Containerfile` builds an image of `farland-server` on the synthetic test desktop — a client to point at without installing anything:
+The container image serves a synthetic test desktop — colour bars, a bouncing
+square, a crosshair that follows your pointer — so you can point a client at
+it without a compositor, a GPU or a login:
 
 ```sh
 podman build -t farland -f packaging/container/Containerfile .
 podman run --rm -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret farland
+xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:ignore /gfx:progressive
 ```
 
-The image is not a way to run farlandd: a desktop per user wants PAM, logind, D-Bus and a machine.
+## Install
 
-- **Desktops:** `[session] desktop` in `/etc/farland/farland.toml` picks the desktop.
-  - `gnome`: GDM starts a headless GNOME session for the user (RemoteDisplayFactory.CreateUserDisplay, as `gnome-headless-session@.service` does). The agent runs in the user's service manager and attaches to its Mutter. GDM must be running.
-  - `plasma`, `sway`, `labwc` and `cage`: farlandd opens a PAM session of its own (service `farland`; pam_systemd registers a remote wayland session with logind), and the agent starts the compositor on its headless backend at the client's size. `cage` runs the application in `[session] command`. Tried on Kubuntu 26.04 with KWin 6.6, sway 1.11, labwc 0.9.3 and cage 0.2.1.
-  - `test`: the synthetic test pattern, whose frames and typed keys persist between connections.
-  - Which compositors a build can start is listed under "Headless desktops" in the `meson setup` summary; the others end the session with an error.
-- **Kerberos:** `[auth] keytab` makes farland accept Kerberos tickets beside NTLM; the client's SPNEGO picks, so a workstation with a ticket signs in without a password and one without falls back. The keytab needs a key for `TERMSRV/<the name the client connects to>`. `[auth] service_principal` picks one principal out of a keytab that holds several, and `[auth] mode = "kerberos"` refuses anyone without a ticket. A principal logs in as the local account of the same name unless the credential store maps it elsewhere. **The keytab stays in farlandd**: the sandboxed network process has no file system at all, so the whole security context lives in the daemon and the network process drives it over the control channel, one operation at a time — the same arrangement that keeps NT hashes out of it. Built where MIT krb5 is (`-Dkerberos`).
-- **Users:** users enrol themselves once with `farlandctl passwd` (no user name). farlandd asks polkit (`auth_self`) and checks the account password with PAM, then stores the NT hash NLA needs, with the local account, in `/var/lib/farland/users`. Afterwards users log in over RDP with their account name and password. An administrator can instead add entries directly: `farlandctl --file /var/lib/farland/users passwd NAME --local-account ACCOUNT`.
-- **Configuration:** `/etc/farland/farland.toml` configures everything; no unit file needs editing. `data/farland.toml` is the reference the packages install to `/usr/share/farland/farland.toml` and copy into `/etc` the first time; it lists every key with its default and a line saying what it does, and an upgrade never touches the file in `/etc`. Unknown sections and keys are errors with their line and column, and `farlandd --check-config` prints every setting as it will be used. `[server]`, `[auth]`, `[session]` and `[policy]` are farlandd's own; `[graphics]`, `[network]`, `[audio]` and `[clipboard]` are the session's, named after the farland-server options above and with the same defaults, so the daemon and the command line behave alike. farlandd sends them to each `farland-agent` over the broker protocol, so the agent needs no access to `/etc`.
-- **Policies** (`[policy]`, see `data/farland.toml`):
-  - `disconnected_timeout` ends a session nobody reconnected to; `idle_timeout` disconnects a client that sent no input.
-  - `activation_timeout` (default 60 s) drops a client that reaches no active connection in time; it counts from the TCP connection and includes starting the desktop.
-  - `max_sessions` limits the sessions on the host.
-  - `on_local_session`: what a user who is logged in at a local seat gets. `separate` (the default) leaves the local session running untouched and gives the client a second, headless desktop of its own; since GDM starts no second session for a user who already has one ("There's already an opened session"), that desktop is a bare GNOME Shell without gnome-session, so it has the top bar but no dock, extensions or settings daemons. `attach` hands the client that very session, with its windows. The screen at the machine shows a GDM login screen while the client holds it, and logging in there takes the session back: it goes to the seat with its windows, and the client is disconnected. Nobody is asked to hand over a session no client holds, but the person at the machine is (`takeover`), before their screen goes.
-
-    This needs a Mutter that keeps drawing a virtual monitor while the session is not active on its seat (`RecordVirtual`'s `keep-rendering-when-inactive`, ScreenCast version 5), which `packaging/make-mutter-deb.sh` builds from the fork in `packaging/mutter` until it is upstream. Without it, farland falls back to what it did before: the session stays on its seat, whose monitors are switched off while the client holds it and switched on again when it lets go; the screen at the machine then shows nothing, the keyboard and mouse there still reach the session, and something else taking the seat ends the connection. `replace` ends the local session — the applications running in it are lost — and then gives the client a full headless session through GDM, leaving the seat at the login screen for the next user. `refuse` turns the connection away. The trade-off comes from GNOME: one session per user, and only the session on the seat is drawn; different users can have a desktop each at the same time, one on the seat and any number headless.
-  - `takeover`: whoever is using a session is asked before another connection takes it away. `ask` (the default) puts "Hand over your session?" in that session as a desktop notification, with the connecting user, the client's address and its name, and two buttons; the countdown runs in the one `takeover_on_timeout` would press (`takeover_timeout`, default 30 s; `allow` by default). Cancel refuses the new connection. `always` takes the session over silently, `never` refuses while someone holds it. Nobody is asked for a session no client holds: reconnecting to your own disconnected session is unchanged. A session on a local seat counts as held by the person at the machine, so the first client to attach to it asks them too.
-  - `seat_takeover`: the other direction — what somebody logging in at the machine may do to a session a client holds. `ask` (the default) asks the client and holds the login until it answers; `always` lets the login through without asking; `never` refuses it. This needs `pam_farland.so` in the display manager's account stack (`packaging/pam/`); without it the login always goes ahead and the client simply loses the session. The module never keeps anyone out or waiting when farland is not there: no farlandd, no held session or any error at all lets the login through at once.
-  - Refused clients are told why (Set Error Info, for clients that support it).
-- **Camera:** the client's camera shows up in the session as a local camera named "farland-camera" ([MS-RDPECAM]), for video calls inside the session. farland asks the client for its cameras, takes the first one, picks the largest uncompressed picture it offers (YUY2, NV12, I420, RGB24 or RGB32, at most 1920x1080) and publishes the frames as a PipeWire `Video/Source` node while the client streams. It asks for one frame at a time, so a slow consumer slows the client down instead of building a queue. Applications that use PipeWire (browsers, anything on the portal's Camera interface) list it; those that insist on a `/dev/video` node do not, which would need v4l2loopback. H.264 and Motion JPEG media types are skipped because farland has no decoder for them, which costs nothing in practice: a client converts for the server, so FreeRDP offers uncompressed formats for a camera whose hardware produces MJPG. `--no-camera` turns it off, and so does the client (FreeRDP's `/camera`, mstsc's "Cameras" under Local Resources).
-- **Upgrades do not disconnect anybody:** restarting `farlandd` leaves the sessions running. The agent owns the desktop and holds the client's socket, so it keeps both, finds the new `farlandd` and greets it with the token it kept; the daemon writes its sessions down (`sessions` in the state directory, 0600) and picks them up again with the ids they had. A session whose agent never comes back is given up after two minutes, and an agent that finds no farlandd gives up after the same.
-- **Watching and ending sessions:** `farlandctl sessions` lists what `farlandd` runs — the account, the desktop, the client connected, and how long it has been up, disconnected or idle — and `farlandctl terminate ID` or `farlandctl terminate --user USER` ends one or all of an account's. Both go over the control API on the system bus. Your own sessions need no authorisation; anybody else's needs the polkit action `org.farland.Farland1.manage-sessions`, and without it the listing simply shows only your own.
-- **Metrics:** `[metrics] listen = "127.0.0.1:9128"` serves Prometheus metrics at `GET /metrics`: how many sessions there are and what state they are in, connections, sessions started, sessions ended by reason and connections refused by reason, and per session the uptime, idle time, frames, bytes both ways, round trip and the bandwidth auto-detect measured. Unset serves none, which is the default — it is a listening socket in a process running as root, so it is opened on purpose. Nothing but that one path is answered, and there is no keep-alive.
-- **Session settings:** `[graphics]` picks the GFX codec (`gfx_codec`, default `progressive`: no encoder per session, so it scales to many users), the bitmap codec, the H.264 encoder and its render node and OpenH264 library, `zero_copy`, `clearcodec`, `refine` and `frames_per_second`. `[graphics] h264_bitrate`, `h264_min_bitrate` and `h264_max_bitrate` bound what H.264 may spend in kbit/s (a target switches the encoder from constant quality to average bitrate; the floor and ceiling hold every quality tier inside them), which is for links whose capacity is known rather than discovered. `[network] autodetect` sets network detection, `[audio] playback` and `microphone` the sound channels, and `[clipboard] enabled` the clipboard.
-- **Reconnect:** the agent sends a fresh auto-reconnect cookie after every activation and checks the one a returning client presents. NLA still decides who logs in; a mismatch is only logged.
-- **Install** (Linux; needs `libsystemd-dev` and `libpam0g-dev` at build time):
+There is no apt or dnf repository yet, so the packages are built from a
+checkout. Every push builds the Debian, RPM and Arch packages in CI and keeps
+them as downloadable artifacts, if you would rather not build them yourself.
 
 ```sh
-meson setup build --prefix=/usr/local && meson compile -C build
-sudo meson install -C build     # farlandd, farland-agent, farlandctl, the unit, PAM, D-Bus and polkit files
-sudo install -D -m 0644 data/farland.toml /etc/farland/farland.toml    # then edit it
-sudo systemctl daemon-reload && sudo systemctl start farlandd
-farlandctl passwd               # as each user who may log in
+git clone https://github.com/mKenfenheuer/farland.git
+cd farland
 ```
 
-  With a prefix other than `/usr`, the PAM file installs under the prefix too, but PAM only reads `/etc/pam.d/farland`, and polkit and the D-Bus system bus only read their `/usr/share` and `/etc` directories. Copy those three files there (`data/pam/farland`, `data/polkit/org.farland.Farland1.policy`, `data/dbus/org.farland.Farland1.conf`). The PAM file is written for Debian and Ubuntu; its comments say what to use on Fedora and Arch.
-- **Development without root:** `farlandd --no-pam --config FILE` runs every session as the calling user, without PAM, logind or D-Bus. It keeps its agent socket in `$XDG_RUNTIME_DIR/farland/` and generates a certificate under `$XDG_STATE_HOME/farland/`. `--port`, `--runtime-dir`, `--state-dir` and `--agent` override the defaults, and `farlandd --check-config` checks a configuration. The end-to-end tests use this mode with `desktop = "test"`.
-- **Clients:** starting a GNOME session through GDM takes 10–20 seconds on first connect. FreeRDP gives up after 9 seconds by default, so use `/timeout:60000`.
+### Debian and Ubuntu
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for sanitizer and fuzzing builds and the coding rules. See [docs/SPECS.md](docs/SPECS.md) for the specifications farland implements.
+```sh
+sudo sh ci/install-deps.sh                  # the build dependencies
+sudo apt-get install -y dpkg-dev
+sh packaging/make-deb.sh build-deb .        # farland_<version>_<arch>.deb
+sudo apt-get install ./farland_*.deb
+```
+
+### Fedora and openSUSE
+
+```sh
+sudo dnf install -y rpm-build "dnf-command(builddep)"
+sudo dnf builddep -y packaging/farland.spec
+sh packaging/make-rpm.sh .                  # farland-<version>-<release>.rpm
+sudo dnf install ./farland-*.rpm
+```
+
+### Arch Linux
+
+The AUR recipe is `farland-git`, in [packaging/aur/](packaging/aur/):
+
+```sh
+cd packaging/aur && makepkg --syncdeps --install
+```
+
+### From source
+
+Nothing has to be packaged to run farland. It needs GCC ≥ 13 or Clang ≥ 19
+(on Ubuntu 24.04, `clang-19`), Meson ≥ 1.3 with Ninja, and OpenSSL ≥ 3.0
+development files. Catch2 is fetched automatically if the system does not
+provide it.
+
+```sh
+meson setup build --prefix=/usr/local
+meson compile -C build
+meson test -C build
+sudo meson install -C build
+```
+
+With a prefix other than `/usr`, three files have to be copied to where the
+system looks for them; the install notes in
+[docs/MULTI-SESSION.md](docs/MULTI-SESSION.md) say which.
+
+### What the packages do
+
+The Debian and RPM packages install `farlandd`, `farland-agent`,
+`farland-server` and `farlandctl`, the systemd service, and the PAM, D-Bus
+and polkit files. They enable and start `farlandd.service` on port 3389, copy
+the reference configuration to `/etc/farland/farland.toml` the first time,
+and never touch that file again on an upgrade. An upgrade restarts the daemon
+without disconnecting anyone.
+
+The Arch package follows Arch's convention instead: it writes nothing into
+`/etc` and enables nothing, and prints the three commands to run.
+
+## First connection
+
+After installing the deb or the RPM:
+
+```sh
+sudoedit /etc/farland/farland.toml   # pick [session] desktop, at least
+farlandctl passwd                    # as each user who may log in
+```
+
+`farlandctl passwd` asks for your own account password, checks it with PAM
+and stores the hash NLA needs, so you can then log in over RDP with your
+normal account name and password. Then, from another machine:
+
+```sh
+xfreerdp3 /v:SERVER:3389 /u:alice /p:"…" /cert:tofu /dynamic-resolution /timeout:60000
+```
+
+Or in mstsc or Windows App: the host name, your user name and your password.
+Starting a GNOME session through GDM takes 10–20 seconds on the first
+connect, which is longer than FreeRDP waits by default — hence
+`/timeout:60000`.
+
+`farlandctl sessions` lists what is running, and `farlandctl terminate` ends
+a session.
+
+### Choosing a desktop
+
+`[session] desktop` in `/etc/farland/farland.toml` picks what each user gets:
+`gnome` (through GDM), `plasma`, `sway`, `labwc`, `cage`, or `test` for the
+synthetic desktop. Which ones a build can start is listed under "Headless
+desktops" in the `meson setup` summary.
+[docs/MULTI-SESSION.md](docs/MULTI-SESSION.md) describes each, along with the
+policies for timeouts, session takeover, and what happens when the user is
+already logged in at the machine itself.
+
+### Patched mutter and kwin packages
+
+One setting needs more than the distributions ship. Handing a client the very
+session a user has open at the machine (`[policy] on_local_session =
+attach`) needs a Mutter that keeps drawing while the session is not active on
+its seat, and on Plasma it needs a KWin that goes on configuring its virtual
+outputs off-seat. Both fixes are waiting on upstream; until then these
+scripts build Debian packages that differ from the distribution's only by
+them. They need `deb-src` lines enabled, and Ubuntu 26.04 — the forks sit on
+mutter 50.1 and KWin 6.6.6.
+
+```sh
+git submodule update --init packaging/mutter    # or packaging/kwin
+sudo apt-get install -y dpkg-dev quilt
+sudo apt-get build-dep -y mutter                # or kwin
+sh packaging/make-mutter-deb.sh out             # or make-kwin-deb.sh
+sudo apt-get install ./out/libmutter-*.deb ./out/mutter-common*.deb
+sudo systemctl restart gdm                      # for a session to pick them up
+```
+
+Without them farland still works: it falls back to switching the seat's
+monitors off while the client holds the session. The `Compositor packages`
+workflow builds both on demand.
+
+## Documentation
+
+- **[docs/MULTI-SESSION.md](docs/MULTI-SESSION.md)** — `farlandd`: the
+  desktops, configuration, policies, Kerberos, users, metrics and upgrades.
+- **[docs/SERVER.md](docs/SERVER.md)** — `farland-server`: sharing a desktop,
+  the headless backends, and every graphics, audio, clipboard and input
+  option.
+- **[docs/PLAN.md](docs/PLAN.md)** — scope, architecture, testing, security,
+  risks.
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — milestones M0–M8 (server 1.0),
+  C1–C5 (client), phase 3.
+- **[docs/SPECS.md](docs/SPECS.md)** — the specifications farland implements.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — sanitizer and fuzzing builds, the
+  compositor tests, and the coding rules.
 
 ## License
 

@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <format>
 #include <optional>
 #include <poll.h>
 #include <sys/socket.h>

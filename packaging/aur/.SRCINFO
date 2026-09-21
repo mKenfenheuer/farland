@@ -27,6 +27,7 @@ pkgbase = farland-git
 	depends = wayland
 	depends = libxkbcommon
 	depends = pam
+	depends = krb5
 	optdepends = xdg-desktop-portal: sharing the running desktop (--share)
 	optdepends = gdm: headless GNOME sessions per user
 	optdepends = plasma-workspace: headless Plasma sessions per user

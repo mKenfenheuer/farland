@@ -59,8 +59,8 @@ void usage()
                  "  --hostname NAME      certificate and NTLM host name (default: this host's name)\n"
                  "  --log-level LEVEL    trace, debug, info, warn, error (default: [server] log_level)\n"
                  "\n"
-                 "Users enrol with farlandctl passwd (the credential store in [auth]). See the multi-session\n"
-                 "section of README.md.\n";
+                 "Users enrol with farlandctl passwd (the credential store in [auth]). See\n"
+                 "docs/MULTI-SESSION.md.\n";
 }
 
 bool set_log_level(const std::string& level)

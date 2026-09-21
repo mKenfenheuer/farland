@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# The patched mutter and kwin packages: the distribution's own source package
+# with the commits from the forks in packaging/mutter and packaging/kwin added
+# to its patch series (packaging/make-mutter-deb.sh, make-kwin-deb.sh). Each
+# one builds a compositor from source, which is an order of magnitude more
+# runner time than farland itself, so this does not run on every push: it
+# runs by hand, and when the packaging or the forks change.
+
+name: Compositor packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - packaging/make-mutter-deb.sh
+      - packaging/make-kwin-deb.sh
+      - packaging/mutter
+      - packaging/kwin
+      - .gitmodules
+      - .github/workflows/compositor-packages.yml
+  pull_request:
+    paths:
+      - packaging/make-mutter-deb.sh
+      - packaging/make-kwin-deb.sh
+      - packaging/mutter
+      - packaging/kwin
+      - .gitmodules
+      - .github/workflows/compositor-packages.yml
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        compositor: [mutter, kwin]
+    runs-on: ubuntu-latest
+    # The forks sit on mutter 50.1 and KWin 6.6.6, which is what Ubuntu 26.04
+    # packages; on an older release the scripts refuse, because the commits
+    # would apply to the wrong compositor. A container rather than a runner
+    # label, so this does not wait for a 26.04 runner image.
+    container: ubuntu:26.04
+    timeout-minutes: 150
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install git, so the checkout brings the fork with it
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          # The scripts look for the upstream release tag the fork's commits
+          # sit on, and for the commits themselves.
+          fetch-depth: 0
+          # Set SUBMODULE_TOKEN where the forks are not public: the workflow
+          # token only reaches this repository.
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
+      - name: Check the fork is there
+        run: |
+          if [ ! -d "packaging/${{ matrix.compositor }}/.git" ]; then
+            echo "packaging/${{ matrix.compositor }} is empty: the checkout could not" >&2
+            echo "reach the fork. If it is private, set the SUBMODULE_TOKEN secret" >&2
+            exit 1
+          fi
+      - name: Enable source packages
+        run: |
+          # The Ubuntu image carries deb lines only, and both scripts need
+          # `apt-get source` and `apt-get build-dep`.
+          if ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then
+            sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/*.sources
+          else
+            sed -i 's/^deb \(.*\)$/deb \1\ndeb-src \1/' /etc/apt/sources.list
+          fi
+          apt-get update
+      - name: Install the build dependencies
+        run: |
+          apt-get install -y --no-install-recommends dpkg-dev quilt
+          apt-get build-dep -y ${{ matrix.compositor }}
+      - name: Build the packages
+        run: |
+          sh packaging/make-${{ matrix.compositor }}-deb.sh \
+            "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/work"
+      - name: Show what was built
+        run: |
+          for deb in "$RUNNER_TEMP"/pkg/*.deb; do
+            dpkg-deb --field "$deb" Package Version
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.compositor }}-deb
+          path: ${{ runner.temp }}/pkg/*.deb
+          retention-days: 14
