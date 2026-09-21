@@ -44,6 +44,16 @@ constexpr std::string_view log_component = "app.session";
 constexpr std::size_t max_frames_in_flight = 2;
 /// Damage rectangles collected between two frames; more mean everything.
 constexpr std::size_t max_damage_rects = 64;
+
+/// How long a client that advertised the Graphics Pipeline may take to open
+/// it before the legacy bitmap path starts painting anyway. Bitmap updates
+/// carry the whole desktop, losslessly, with no quality ladder behind them,
+/// so on a slow link the first one is megabytes -- and the Graphics Pipeline's
+/// own negotiation queues up behind it on the same TCP connection, which is
+/// what turned a connect into a 30 s wait and then a session nobody stayed
+/// in. Waiting costs a blank screen for at most this long, and only for
+/// clients that said they would open it.
+constexpr std::chrono::seconds gfx_grace{5};
 /// Dmabufs the encoder refuses in a row before the session stops asking the
 /// capture for them. A single refusal costs only that frame's CPU copy.
 constexpr unsigned max_dmabuf_refusals = 3;
@@ -1277,6 +1287,11 @@ private:
                   e.reactivation ? "reactivated" : "active", session.desktop_width, session.desktop_height,
                   layout_->monitors().size(), layout_->monitors().size() == 1 ? "" : "s",
                   codec == server::BitmapCodec::planar ? "planar" : "uncompressed");
+        // A client that advertised GFX gets a moment to open it before the
+        // bitmap path floods the link (gfx_grace).
+        if (!gfx_ && session.supports_gfx()) {
+            gfx_wait_until_ = Clock::now() + gfx_grace;
+        }
         start_dynamic_channels();
         start_audio();
         start_clipboard();
@@ -1496,6 +1511,7 @@ private:
     void send_frame_if_due()
     {
         if (gfx_ready()) {
+            gfx_wait_until_.reset();
             send_gfx_frame_if_due();
             return;
         }
@@ -1503,6 +1519,15 @@ private:
             return;
         }
         const auto now = Clock::now();
+        if (gfx_wait_until_) {
+            if (now < *gfx_wait_until_) {
+                return;  // the Graphics Pipeline is still opening; do not flood the link
+            }
+            gfx_wait_until_.reset();
+            log::info(log_component, "{}: the client did not open the graphics pipeline within {} s; painting with "
+                                     "bitmap updates",
+                      peer_, gfx_grace.count());
+        }
         if (now < next_frame_) {
             return;
         }
@@ -1528,6 +1553,10 @@ private:
     std::optional<server::DynamicChannels> dvc_;
     std::uint16_t dvc_channel_ = 0;
     std::optional<server::GraphicsPipeline> gfx_;                  // after dvc_, which it uses
+    /// Set while a GFX-capable client is still opening the pipeline: until it
+    /// passes, the bitmap path stays quiet so the negotiation is not stuck
+    /// behind a full-desktop update (gfx_grace).
+    std::optional<Clock::time_point> gfx_wait_until_;
     std::optional<server::TouchInput> touch_;                      // after dvc_, which it uses
     std::optional<server::LoopbackClipboard> loopback_clipboard_;  // before clipboard_, which uses it
     platform::Clipboard* clipboard_source_ = nullptr;
