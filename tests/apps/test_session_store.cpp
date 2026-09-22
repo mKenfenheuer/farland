@@ -14,6 +14,7 @@
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>  // getpid
 #include <vector>
 
 using farland::daemon::decode_sessions;
