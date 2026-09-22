@@ -20,6 +20,12 @@ BuildRequires:  ninja-build
 BuildRequires:  gcc-c++
 BuildRequires:  pkgconfig
 BuildRequires:  systemd-rpm-macros
+# toml++ for farlandd's configuration. The meson wrap stands in where a
+# distribution has no package, but an RPM build has no network: without this
+# the build stops at "Automatic wrap-based subproject downloading is
+# disabled", and only in a clean checkout -- a tree that has built locally
+# already has the subproject unpacked and hides it.
+BuildRequires:  pkgconfig(tomlplusplus)
 BuildRequires:  pkgconfig(openssl)
 BuildRequires:  pkgconfig(libsystemd)
 BuildRequires:  pkgconfig(libei-1.0)
