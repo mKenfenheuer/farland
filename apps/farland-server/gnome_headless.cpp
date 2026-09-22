@@ -46,7 +46,13 @@ public:
     ~GnomeHeadlessDesktop() override
     {
         if (session_) {
-            attach_back();
+            // This desktop is going and its virtual monitors with it, so
+            // the layout names only the seat's own. Naming ours here is a
+            // race with Mutter removing them: it applies a configuration
+            // over a monitor it is taking apart and crashes reading a CRTC
+            // that is no longer assigned (fixed in packaging/mutter, but
+            // there is no reason to ask for it).
+            attach_back(false);
             log::info(log_component, "ending the Mutter remote desktop session");
         }
     }
@@ -181,7 +187,11 @@ private:
     [[nodiscard]] bool hand_the_seat_a_greeter();
     /// Gives the session back to what was attached before (the seat's
     /// screen), before our monitors go with us.
-    void attach_back();
+    /// Puts the seat's monitors back. `keep_ours`: name our virtual
+    /// monitors in the layout too, which is what a session being released
+    /// to the seat needs; a desktop that is going takes them with it and
+    /// must not name them (attach_back()).
+    void attach_back(bool keep_ours);
     /// [policy] seat_takeover: the seat came back right after a login at the
     /// machine was refused, because the display manager gave up the login
     /// screen it was showing. The seat gets one back and the client keeps
@@ -522,7 +532,10 @@ void GnomeHeadlessDesktop::set_held(bool held)
     // machine, so that whoever is there sees the session and not the last
     // picture a client left behind. Where the seat has a login screen, it
     // keeps it: logging in there brings the session back with its windows.
-    attach_back();
+    // The session stays, and so do our monitors: switching the seat's
+    // screens on and taking ours away in one step is what Mutter falls over
+    // (attach_back()).
+    attach_back(true);
     monitor_layout_.clear();
     detached_.clear();
     log::info(log_component, "no client holds the session: it is the seat's again");
@@ -590,7 +603,7 @@ bool GnomeHeadlessDesktop::hand_the_seat_a_greeter()
     return true;
 }
 
-void GnomeHeadlessDesktop::attach_back()
+void GnomeHeadlessDesktop::attach_back(bool keep_ours)
 {
     if (detached_.empty() || session_->closed()) {
         return;
@@ -618,13 +631,15 @@ void GnomeHeadlessDesktop::attach_back()
         const auto width = found != state->monitors.end() ? static_cast<std::int32_t>(found->width) : 0;
         x = std::max(x, entry.x + width);
     }
-    for (const auto& connector : state->virtual_connectors()) {
-        const auto found = std::ranges::find(state->monitors, connector, &mutter::Monitor::connector);
-        if (found == state->monitors.end()) {
-            continue;
+    if (keep_ours) {
+        for (const auto& connector : state->virtual_connectors()) {
+            const auto found = std::ranges::find(state->monitors, connector, &mutter::Monitor::connector);
+            if (found == state->monitors.end()) {
+                continue;
+            }
+            layout.push_back(mutter::LogicalMonitor{x, 0, 1.0, 0, false, found->connector, found->mode});
+            x += static_cast<std::int32_t>(found->width);
         }
-        layout.push_back(mutter::LogicalMonitor{x, 0, 1.0, 0, false, found->connector, found->mode});
-        x += static_cast<std::int32_t>(found->width);
     }
     if (auto applied = session_->set_monitors(state->serial, layout); !applied) {
         // The screen may be gone by now; Mutter lays the session out itself
