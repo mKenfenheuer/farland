@@ -1,8 +1,8 @@
 [submodule "packaging/mutter"]
 	path = packaging/mutter
-	url = git@github.com:mKenfenheuer/mutter.git
+	url = https://github.com/mKenfenheuer/mutter.git
 	branch = farland/create-view-null-crtc-50.1
 [submodule "packaging/kwin"]
 	path = packaging/kwin
-	url = git@github.com:mKenfenheuer/kwin.git
+	url = https://github.com/mKenfenheuer/kwin.git
 	branch = farland/virtual-outputs-off-seat-6.6.6
