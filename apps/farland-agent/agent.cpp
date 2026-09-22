@@ -378,14 +378,22 @@ broker::EndReason Agent::run(const std::atomic<bool>& stop)
             } else if (auto* connection = std::get_if<broker::NewConnection>(&*message)) {
                 const std::uint64_t id = connection->connection_id;
                 if (!on_new_connection(std::move(*connection), std::move((*received)->fd))) {
-                    if (!had_desktop_) {
+                    // A session locked at the machine is still there behind
+                    // the lock, with its windows: refuse this one connection
+                    // and keep it, and the client gets in once it is
+                    // unlocked. Every other failure means the desktop is not
+                    // coming back -- the compositor has exited and taken the
+                    // session with it -- and such a session must not go on
+                    // owning the account's one session slot, because every
+                    // later connection is handed to it and refused in turn.
+                    // That is worse than losing it: it locks the account out
+                    // until somebody ends the session by hand.
+                    if (!had_desktop_ || !platform::logind::user_session_locked()) {
                         return finish(broker::EndReason::desktop_failed, "the desktop did not start");
                     }
-                    // The session is still there with everything in it; only
-                    // this connection could not be given a desktop. Refusing
-                    // it leaves the session for whoever can -- the same
-                    // client once the screen at the machine is unlocked.
-                    log::warn(log_component, "session {}: connection {} gets no desktop; the session stays",
+                    log::warn(log_component,
+                              "session {}: connection {} gets no desktop while the screen at the machine is locked; "
+                              "the session stays",
                               config_.logon_id, id);
                     static_cast<void>(send(broker::Disconnect{id, proto::errinfo::server_denied_connection}));
                 }
