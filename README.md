@@ -166,14 +166,39 @@ already logged in at the machine itself.
 
 ### Patched mutter and kwin packages
 
-One setting needs more than the distributions ship. Handing a client the very
-session a user has open at the machine (`[policy] on_local_session =
-attach`) needs a Mutter that keeps drawing while the session is not active on
-its seat, and on Plasma it needs a KWin that goes on configuring its virtual
-outputs off-seat. Both fixes are waiting on upstream; until then these
-scripts build Debian packages that differ from the distribution's only by
-them. They need `deb-src` lines enabled, and Ubuntu 26.04 — the forks sit on
-mutter 50.1 and KWin 6.6.6.
+Two settings need more than the distributions ship, because a compositor
+will not draw a session that is not active on its seat — and a session held
+by a remote client is exactly that.
+
+**No distribution carries these patches.** Both fixes are waiting on
+upstream, so this applies to every stock install, whatever the
+distribution's version number suggests.
+
+What needs them:
+
+- **`[session] gdm_display = "seat"`** (the default), which gives each GNOME
+  session a virtual terminal so that logging in at the greeter comes back to
+  it. Without a Mutter that keeps drawing off the seat, farland has to bring
+  the session *to* the seat to get a picture at all: the desktop is on the
+  machine's screen for as long as the client holds it, and a second user's
+  session taking the seat ends the first client's connection. One client at a
+  time, in public.
+- **`[policy] on_local_session = "attach"`**, which hands a client the very
+  session a user has open at the machine. The same applies, and on Plasma it
+  also needs a KWin that goes on configuring its virtual outputs off-seat.
+
+**On a stock distribution, set `[session] gdm_display = "headless"`.** A
+headless session has no seat, so none of the above arises: sessions run
+side by side and nothing of them reaches the machine's screen. What it costs
+is the greeter — logging in at the machine starts a second, empty session
+rather than coming back to the one that is open. That is the trade until the
+patches land, and it is one line in `/etc/farland/farland.toml`.
+
+The patched packages are built by the `Compositor packages` workflow and
+published in the `continuous` prerelease beside farland's own, or build them
+yourself. The scripts want `deb-src` lines enabled and Ubuntu 26.04 — the
+forks sit on mutter 50.1 and KWin 6.6.6, and refuse to apply to another
+version rather than patch the wrong compositor.
 
 ```sh
 git submodule update --init packaging/mutter    # or packaging/kwin
@@ -183,10 +208,6 @@ sh packaging/make-mutter-deb.sh out             # or make-kwin-deb.sh
 sudo apt-get install ./out/libmutter-*.deb ./out/mutter-common*.deb
 sudo systemctl restart gdm                      # for a session to pick them up
 ```
-
-Without them farland still works: it falls back to switching the seat's
-monitors off while the client holds the session. The `Compositor packages`
-workflow builds both on demand.
 
 ## Documentation
 
