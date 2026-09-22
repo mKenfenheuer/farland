@@ -149,24 +149,28 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Every artifact the three builds uploaded, each in a directory of
+      # its own: the Debian package, the RPM and the Arch package.
       - uses: actions/download-artifact@v4
         with:
-          name: farland-deb
           path: pkg
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          deb=$(find pkg -name '*.deb' | head -1)
-          [ -n "$deb" ] || { echo "no .deb was built" >&2; exit 1; }
+          # One release carries what every distribution's build produced.
+          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) | sort)
+          [ -n "$packages" ] || { echo "the builds produced no packages" >&2; exit 1; }
+          echo "publishing:"; echo "$packages" | sed 's/^/  /'
           if [ "${GITHUB_REF_TYPE:-branch}" = tag ]; then
             # A tag is a release: it keeps its name and its assets, and
             # nothing later overwrites it.
             tag=${GITHUB_REF_NAME}
             gh release view "$tag" >/dev/null 2>&1 ||
               gh release create "$tag" --title "$tag" --generate-notes
-            gh release upload "$tag" "$deb" --clobber
+            # shellcheck disable=SC2086 # one argument per package
+            gh release upload "$tag" $packages --clobber
           else
             # Every other push to main replaces one rolling prerelease, so
             # "the current build of main" is one link that always works and
@@ -178,6 +182,7 @@ jobs:
             else
               gh release create "$tag" --target "$GITHUB_SHA" --prerelease --title "Continuous build (main)" --notes "$notes"
             fi
-            gh release upload "$tag" "$deb" --clobber
+            # shellcheck disable=SC2086 # one argument per package
+            gh release upload "$tag" $packages --clobber
           fi
-          echo "published $(basename "$deb") as $tag"
+          echo "published as $tag"
