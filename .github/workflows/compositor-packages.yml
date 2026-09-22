@@ -97,3 +97,44 @@ jobs:
           name: ${{ matrix.compositor }}-deb
           path: ${{ runner.temp }}/pkg/*.deb
           retention-days: 14
+
+  release:
+    # The compositor packages belong in the same rolling prerelease as
+    # farland's own: a machine needs the patched compositor and farland
+    # together, and hunting two places for them helps nobody. Only from
+    # this repository's own main -- a pull request from a fork publishes
+    # nothing.
+    needs: deb
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.repository == 'mKenfenheuer/farland' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: pkg
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          packages=$(find pkg -type f -name '*.deb' | sort)
+          [ -n "$packages" ] || { echo "the builds produced no packages" >&2; exit 1; }
+          echo "publishing:"; echo "$packages" | sed 's/^/  /'
+          tag=continuous
+          notes="Automatic build of main at ${GITHUB_SHA}. Not a release: the newest one replaces it."
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            # farland's own CI usually makes it first; this is for the run
+            # that gets there first instead.
+            gh release create "$tag" --target "$GITHUB_SHA" --prerelease --title "Continuous build (main)" --notes "$notes"
+          fi
+          # The compositor packages are added beside farland's; the rest of
+          # the release is left alone, because this workflow does not build
+          # it and a run of it must not take it away.
+          # shellcheck disable=SC2086 # one argument per package
+          gh release upload "$tag" $packages --clobber
+          echo "published the compositor packages as $tag"
