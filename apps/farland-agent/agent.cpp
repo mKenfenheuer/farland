@@ -52,6 +52,10 @@ std::string local_account()
 }
 using Clock = std::chrono::steady_clock;
 constexpr std::string_view log_component = "agent";
+/// How long the screen at the machine is given to finish unlocking after
+/// GDM has accepted the credentials, before the attach is tried anyway.
+constexpr auto unlock_settle_interval = std::chrono::milliseconds(250);
+constexpr int unlock_settle_polls = 40;  // 10 s
 constexpr std::uint32_t min_size = 64;
 constexpr std::uint32_t max_size = 8192;
 /// How long farlandd may take to finish a message it started.
@@ -562,6 +566,17 @@ bool Agent::on_new_connection(broker::NewConnection message, UniqueFd fd)
                       config_.logon_id);
             if (auto unlocked = unlock_the_session(local_account(), message.password, [this] { send_stats(); });
                 unlocked) {
+                // GDM accepting the credentials is not the shell having let
+                // go. It still has to take the lock screen down and drop the
+                // inhibitor, and until it does, Mutter answers exactly as it
+                // did before -- so an attach in the same instant is refused
+                // for a lock that is already over, and the client is turned
+                // away from a session it just unlocked. Wait for the screen
+                // to report itself unlocked before trying again.
+                for (int i = 0; i < unlock_settle_polls && platform::logind::user_session_locked(); ++i) {
+                    send_stats();  // farlandd is still counting
+                    std::this_thread::sleep_for(unlock_settle_interval);
+                }
                 desktop = config_.make_desktop(request);
             } else {
                 log::info(log_component, "session {}: the session stays locked: {}", config_.logon_id,
