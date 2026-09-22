@@ -1056,6 +1056,22 @@ void Daemon::Impl::handle(Authenticated client)
     switch (decision.admission) {
     case SessionRegistry::Admission::existing:
         if (Live* session = find(decision.session)) {
+            // A session whose login session has gone cannot serve anybody:
+            // its compositor died with it (GNOME Shell does crash), and
+            // there is no Mutter left to attach to. Handing this connection
+            // to it costs the client half a minute of waiting and then a
+            // refusal, and the account only gets in by trying again. End it
+            // here and give this connection a session that works.
+            if (!session->login_session.empty() && !options.no_pam &&
+                !login_session_exists(session->login_session)) {
+                const bool attach = registry.find(session->id) != nullptr && registry.find(session->id)->attached;
+                log::info(log_component, "{}: session {} of {} has lost its desktop (login session {} is gone); "
+                                         "starting a new one for this connection",
+                          client.peer, session->id, account, session->login_session);
+                end_session(*session, "its desktop is gone", "desktop_gone");
+                start_session(std::move(client), account, user, attach);
+                return;
+            }
             deliver(*session, std::move(client), at_the_machine);
         }
         return;

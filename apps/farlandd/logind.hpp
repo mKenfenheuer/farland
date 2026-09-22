@@ -55,6 +55,12 @@ struct LoginSession {
 /// somebody, and so whether they are asked first ([policy] takeover).
 [[nodiscard]] bool session_shows_at_the_machine(uid_t uid);
 
+/// Whether logind still knows the session with this id. A GNOME session
+/// whose compositor has died takes its logind session with it, and what is
+/// left of farland's session cannot serve anybody: there is no Mutter to
+/// attach to and never will be again.
+[[nodiscard]] bool login_session_exists(const std::string& id);
+
 /// logind's TerminateSession, as root.
 [[nodiscard]] Result<void> terminate_login_session(const std::string& id);
 

@@ -234,6 +234,12 @@ std::vector<LoginSession> user_sessions(uid_t uid)
     return sessions;
 }
 
+bool login_session_exists(const std::string& id)
+{
+    uid_t owner = 0;
+    return sd_session_get_uid(id.c_str(), &owner) >= 0;
+}
+
 bool session_locked_at_the_machine(uid_t uid)
 {
     const auto session = local_graphical_session(uid);
@@ -482,6 +488,11 @@ std::vector<LoginSession> user_sessions(uid_t /*uid*/)
 bool session_locked_at_the_machine(uid_t /*uid*/)
 {
     return false;
+}
+
+bool login_session_exists(const std::string& /*id*/)
+{
+    return true;  // nothing here can say otherwise; the agent finds out
 }
 
 Result<void> terminate_login_session(const std::string& /*id*/)
