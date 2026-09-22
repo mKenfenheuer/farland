@@ -1487,6 +1487,18 @@ TEST_CASE("GFX: tiles that keep changing go through H.264 on the Progressive sur
                             {64, 64, 128, 128},
                             {128, 64, 192, 128}}));
 
+    // The video shrinks to a caret: one tile blinking, with the encoder
+    // still running. That is not a moving picture, and it used to be enough
+    // to keep the encoder fed -- one moving tile passed the floor as long as
+    // an encoder existed, and the idle count never ran out -- so a terminal's
+    // cursor went on painting its own tile through 4:2:0, sessions long.
+    for (std::uint32_t n = 0; n < 6; ++n) {
+        repaint_tiles(pixels, 0, 0, 1, 1, 40 + n);
+        frame_id = pipeline.send_frame(big_view(pixels));
+        REQUIRE(frame_id.has_value());
+        CHECK(receive().avc.empty());
+    }
+
     // The video stops: the tiles cool down, go back to Progressive and end up
     // exact again, and the H.264 encoder is dropped.
     std::size_t progressive_after = 0;

@@ -34,6 +34,9 @@ constexpr std::uint8_t motion_rise = 2;
 constexpr std::uint8_t motion_fall = 1;
 constexpr std::uint8_t motion_max = 12;
 constexpr std::uint8_t motion_hot = 8;
+/// Moving tiles a running H.264 encoder needs to keep being fed. Below this
+/// the region goes back to Progressive, which is sharper at that size.
+constexpr std::uint32_t min_running_video_tiles = 3;
 /// Frames since a tile last changed, capped where nothing looks any further.
 constexpr std::uint8_t still_max = 250;
 
@@ -534,11 +537,14 @@ void GraphicsPipeline::add_frame(std::size_t index, const codec::ImageView& fram
                 continue;
             }
             if (!for_clear(i)) {
-                // Small damage goes out sharp at once; a tile that keeps
-                // changing takes the coarse-first ladder, which costs less
-                // per frame, and refinement catches up when it settles.
-                const bool hot = s.motion[at(tx, ty)] >= motion_hot;
-                (small && !hot ? direct : ladder).push_back(tile_rect(s, tx, ty));
+                // Small damage goes out sharp at once -- and a tile that
+                // keeps changing is the reason the direct pass exists, not a
+                // reason to skip it. `small` looks at the whole frame's
+                // damage, so a handful of tiles means a still screen with a
+                // caret or a spinner on it, never a video; the coarse-first
+                // ladder there never catches up, and leaves the quality of a
+                // TILE_FIRST pass exactly where the eye rests.
+                (small ? direct : ladder).push_back(tile_rect(s, tx, ty));
                 ++i;
                 continue;
             }
@@ -998,9 +1004,15 @@ GraphicsPipeline::TileList GraphicsPipeline::video_tiles(Screen& s, const TileLi
         }
     }
     // Below a handful of tiles the direct full-quality pass is both sharper
-    // and smaller than a whole H.264 picture; an encoder already running
-    // keeps its tiles, so a shrinking video does not flip back and forth.
-    if (moving.size() < options_.min_video_tiles && !s.video) {
+    // and smaller than a whole H.264 picture. An encoder already running
+    // keeps its tiles at a lower count, so a shrinking video does not flip
+    // back and forth -- but not down to nothing. A blinking caret is one
+    // tile moving for as long as the terminal is open: it would hold the
+    // encoder open for ever (the idle count never runs out) and paint text
+    // through 4:2:0, which is the worst thing to paint text with.
+    const std::uint32_t floor =
+        s.video ? std::max(options_.min_video_tiles / 2, min_running_video_tiles) : options_.min_video_tiles;
+    if (moving.size() < floor) {
         return {};
     }
     return moving;
@@ -1075,6 +1087,10 @@ bool GraphicsPipeline::reclaim_video_tiles(Screen& s, bool all)
             s.from_video[i] = false;
             s.dirty[i] = true;  // H.264 pixels: send them again, sharp
             s.exact[i] = false;
+            // Repainting them is not them moving. Left hot, a whole reclaimed
+            // region counts as motion on the very next frame and starts the
+            // encoder again -- which reclaims, which starts it again.
+            s.motion[i] = 0;
             any = true;
         }
     }
