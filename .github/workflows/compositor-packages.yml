@@ -17,6 +17,10 @@ on:
     paths:
       - packaging/make-mutter-deb.sh
       - packaging/make-kwin-deb.sh
+      - packaging/make-compositor-rpm.sh
+      - packaging/make-compositor-arch.sh
+      - packaging/fork-patches.sh
+      - packaging/patch-pkgbuild.py
       - packaging/mutter
       - packaging/kwin
       - .gitmodules
@@ -25,6 +29,10 @@ on:
     paths:
       - packaging/make-mutter-deb.sh
       - packaging/make-kwin-deb.sh
+      - packaging/make-compositor-rpm.sh
+      - packaging/make-compositor-arch.sh
+      - packaging/fork-patches.sh
+      - packaging/patch-pkgbuild.py
       - packaging/mutter
       - packaging/kwin
       - .gitmodules
@@ -101,13 +109,106 @@ jobs:
           path: ${{ runner.temp }}/pkg/*.deb
           retention-days: 14
 
+  rpm:
+    # The same commits in Fedora's own spec. Fedora is on its own release --
+    # 50.5 where Debian packages 50.1 -- so the patches are applied to what
+    # Fedora ships, and the build stops if they no longer fit.
+    strategy:
+      fail-fast: false
+      matrix:
+        compositor: [mutter, kwin]
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    timeout-minutes: 150
+    steps:
+      - name: Install git, so the checkout brings the fork with it
+        run: dnf install -y -q git
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
+      - name: Check the fork is there
+        run: |
+          if ! git -C "packaging/${{ matrix.compositor }}" rev-parse HEAD >/dev/null 2>&1; then
+            echo "packaging/${{ matrix.compositor }} is empty: the checkout could not" >&2
+            echo "reach the fork. If it is private, set the SUBMODULE_TOKEN secret" >&2
+            exit 1
+          fi
+      - name: Install the build dependencies
+        run: |
+          dnf install -y -q rpm-build rpmdevtools python3             'dnf-command(download)' 'dnf-command(builddep)'
+          dnf builddep -y -q ${{ matrix.compositor }}
+      - name: Build the packages
+        run: |
+          sh packaging/make-compositor-rpm.sh ${{ matrix.compositor }}             "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/work"
+      - name: Show what was built
+        run: |
+          for rpm in "$RUNNER_TEMP"/pkg/*.rpm; do
+            rpm -q --qf '%{name} %{version}-%{release}\n' -p "$rpm"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.compositor }}-rpm
+          path: ${{ runner.temp }}/pkg/*.rpm
+          retention-days: 14
+
+  arch:
+    # The same commits in Arch's own PKGBUILD. makepkg refuses to run as
+    # root, so the build runs as a user that may sudo for its dependencies.
+    strategy:
+      fail-fast: false
+      matrix:
+        compositor: [mutter, kwin]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 150
+    steps:
+      - name: Install git, so the checkout brings the fork with it
+        run: pacman -Syu --noconfirm --needed --quiet git
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
+      - name: Check the fork is there
+        run: |
+          if ! git -C "packaging/${{ matrix.compositor }}" rev-parse HEAD >/dev/null 2>&1; then
+            echo "packaging/${{ matrix.compositor }} is empty: the checkout could not" >&2
+            echo "reach the fork. If it is private, set the SUBMODULE_TOKEN secret" >&2
+            exit 1
+          fi
+      - name: A user to build as
+        run: |
+          pacman -S --noconfirm --needed --quiet base-devel devtools sudo python
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          git config --global --add safe.directory '*'
+          su builder -c "git config --global --add safe.directory '*'"
+      - name: Build the packages
+        run: |
+          work=$RUNNER_TEMP/work
+          mkdir -p "$RUNNER_TEMP/pkg" "$work"
+          chown -R builder "$RUNNER_TEMP" .
+          su builder -c "sh packaging/make-compositor-arch.sh ${{ matrix.compositor }} '$RUNNER_TEMP/pkg' '$work'"
+      - name: Show what was built
+        run: |
+          for pkg in "$RUNNER_TEMP"/pkg/*.pkg.tar.*; do
+            pacman -Qip "$pkg" | head -3
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.compositor }}-arch
+          path: ${{ runner.temp }}/pkg/*.pkg.tar.*
+          retention-days: 14
+
   release:
     # The compositor packages belong in the same rolling prerelease as
     # farland's own: a machine needs the patched compositor and farland
     # together, and hunting two places for them helps nobody. Only from
     # this repository's own main -- a pull request from a fork publishes
     # nothing.
-    needs: deb
+    needs: [deb, rpm, arch]
     if: >-
       github.event_name != 'pull_request' &&
       github.repository == 'mKenfenheuer/farland' &&
@@ -125,7 +226,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          packages=$(find pkg -type f -name '*.deb' | sort)
+          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) | sort)
           [ -n "$packages" ] || { echo "the builds produced no packages" >&2; exit 1; }
           echo "publishing:"; echo "$packages" | sed 's/^/  /'
           tag=continuous

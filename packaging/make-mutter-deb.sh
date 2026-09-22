@@ -50,32 +50,15 @@ if [ -z "$tree" ]; then
     exit 1
 fi
 
-# The upstream release the distribution packages, which is the release the
-# fork's commits sit on: anything else would apply to the wrong Mutter.
+# The release the distribution packages, as a hint for which tag the
+# fork's commits should come against. Where the fork sits on another
+# release the patches still have to apply to this source, and quilt
+# below says so if they do not.
 version=$(dpkg-parsechangelog -l"$tree/debian/changelog" -SVersion)
 upstream=${version%%-*}
 upstream=${upstream#*:}
-if ! git -C "$fork" rev-parse --verify --quiet "refs/tags/$upstream" >/dev/null; then
-    # A clone of one branch has no tags; the fork carries the release its
-    # commits sit on.
-    git -C "$fork" fetch --quiet origin "refs/tags/$upstream:refs/tags/$upstream" 2>/dev/null || true
-fi
-if ! git -C "$fork" rev-parse --verify --quiet "refs/tags/$upstream" >/dev/null; then
-    echo "the fork has no tag $upstream: it is not the release this distribution packages" >&2
-    exit 1
-fi
-if ! git -C "$fork" merge-base --is-ancestor "refs/tags/$upstream" HEAD; then
-    echo "the fork's branch is not based on $upstream, which this distribution packages" >&2
-    exit 1
-fi
-
-rm -rf "$work/patches"
-mkdir -p "$work/patches"
-git -C "$fork" format-patch --no-signature -o "$work/patches" "$upstream..HEAD" >/dev/null
-if [ -z "$(ls -A "$work/patches")" ]; then
-    echo "the fork has no commits on top of $upstream: nothing to add" >&2
-    exit 1
-fi
+base=$(sh "$source_dir/packaging/fork-patches.sh" "$fork" "$work/patches" "$upstream")
+echo "adding the farland patches, taken against $base"
 
 for patch in "$work/patches"/*.patch; do
     name=farland-$(basename "$patch")

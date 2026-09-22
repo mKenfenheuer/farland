@@ -194,19 +194,36 @@ is the greeter — logging in at the machine starts a second, empty session
 rather than coming back to the one that is open. That is the trade until the
 patches land, and it is one line in `/etc/farland/farland.toml`.
 
-The patched packages are built by the `Compositor packages` workflow and
-published in the `continuous` prerelease beside farland's own, or build them
-yourself. The scripts want `deb-src` lines enabled and Ubuntu 26.04 — the
-forks sit on mutter 50.1 and KWin 6.6.6, and refuse to apply to another
-version rather than patch the wrong compositor.
+The patched packages are built by the `Compositor packages` workflow for
+Debian, Fedora and Arch, and published in the `continuous` prerelease beside
+farland's own. Install them over the distribution's: each carries a version
+above it, so `apt policy`, `rpm -q` or `pacman -Qi` says which compositor a
+machine runs, and the distribution's own upgrade takes it back.
+
+To build them yourself — the commits are applied to whatever release your
+distribution packages, and the build stops if they no longer fit:
 
 ```sh
-git submodule update --init packaging/mutter    # or packaging/kwin
+git submodule update --init packaging/mutter          # or packaging/kwin
+
+# Debian and Ubuntu (needs deb-src lines)
 sudo apt-get install -y dpkg-dev quilt
-sudo apt-get build-dep -y mutter                # or kwin
-sh packaging/make-mutter-deb.sh out             # or make-kwin-deb.sh
+sudo apt-get build-dep -y mutter
+sh packaging/make-mutter-deb.sh out                   # or make-kwin-deb.sh
 sudo apt-get install ./out/libmutter-*.deb ./out/mutter-common*.deb
-sudo systemctl restart gdm                      # for a session to pick them up
+
+# Fedora
+sudo dnf install -y rpm-build rpmdevtools 'dnf-command(builddep)'
+sudo dnf builddep -y mutter
+sh packaging/make-compositor-rpm.sh mutter out        # or kwin
+sudo dnf install ./out/*.rpm
+
+# Arch (makepkg refuses to run as root)
+sudo pacman -S --needed base-devel devtools python
+sh packaging/make-compositor-arch.sh mutter out       # or kwin
+sudo pacman -U ./out/*.pkg.tar.zst
+
+sudo systemctl restart gdm     # or sddm, for a session to pick them up
 ```
 
 ## Documentation
