@@ -64,7 +64,10 @@ jobs:
           token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
       - name: Check the fork is there
         run: |
-          if [ ! -d "packaging/${{ matrix.compositor }}/.git" ]; then
+          # Not `-d .../.git`: a submodule's .git is a *file* holding
+          # "gitdir: ...", so that test failed on every checkout, however
+          # well it had gone. Ask git, which answers for either layout.
+          if ! git -C "packaging/${{ matrix.compositor }}" rev-parse HEAD >/dev/null 2>&1; then
             echo "packaging/${{ matrix.compositor }} is empty: the checkout could not" >&2
             echo "reach the fork. If it is private, set the SUBMODULE_TOKEN secret" >&2
             exit 1

@@ -29,7 +29,10 @@ work=${2:-build-mutter-deb}
 source_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fork=$source_dir/packaging/mutter
 
-if [ ! -d "$fork/.git" ]; then
+# Not `-d "$fork/.git"`: a submodule's .git is a *file* holding "gitdir:
+# ...", so that test fails on every correctly checked-out submodule. Ask git
+# instead, which answers for either layout and proves the fork is usable.
+if ! git -C "$fork" rev-parse HEAD >/dev/null 2>&1; then
     echo "packaging/mutter is not there: git submodule update --init packaging/mutter" >&2
     exit 1
 fi
