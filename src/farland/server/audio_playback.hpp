@@ -54,8 +54,16 @@ struct AudioPlaybackOptions {
     /// lowest amount is the client's own buffering (clients that confirm after
     /// playing) plus the network round trip.
     std::chrono::milliseconds max_backlog{100};
-    /// Unconfirmed audio allowed before the first confirmation, and ever.
-    std::chrono::milliseconds startup_limit{400};
+    /// Unconfirmed audio that is never dropped for, before the first
+    /// confirmation and after. Audio that was held back for a moment (by a
+    /// busy link, or by whatever else the sending thread had to do) goes out
+    /// in a burst. Meanwhile the confirmations run the backlog dry, so the
+    /// lowest amount seen is near zero and the burst would be dropped as a
+    /// link falling behind -- when audio went out between frames, over a WAN
+    /// link a third of the audio. A link that cannot carry the audio grows
+    /// the backlog without end, and still meets the limit.
+    std::chrono::milliseconds min_limit{400};
+    /// Unconfirmed audio allowed, ever.
     std::chrono::milliseconds hard_limit{1000};
     /// Samples unconfirmed for this long count as lost (the client never
     /// confirms them), so they stop holding back the stream.

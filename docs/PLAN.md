@@ -1,6 +1,6 @@
 # farland: project plan
 
-farland is a modern RDP implementation for Linux, meant to succeed FreeRDP on Wayland desktops. It is written in C++ with its own protocol core. It ships **server first**: a Wayland/PipeWire RDP server that works on any compositor. The native Wayland client is built second, on the same protocol core.
+farland is a modern RDP server for Linux, meant to succeed FreeRDP's server on Wayland desktops: a Wayland/PipeWire RDP server that works on any compositor, written in C++ with its own protocol core. It is a server only. Users connect with the RDP clients they already have (mstsc, Windows App, FreeRDP, Remmina and the others); farland does not include a client and none is planned.
 
 This document covers scope, architecture, reference material and risks. The phased milestones are in [ROADMAP.md](ROADMAP.md).
 
@@ -11,10 +11,9 @@ This document covers scope, architecture, reference material and risks. The phas
 | | FreeRDP 3.x (Sep 2026, v3.31) | gnome-remote-desktop / KRdp | **farland goal** |
 |---|---|---|---|
 | Wayland server | None in-tree. The shadow server supports X11, Mac and Windows only; there is no PipeWire or portal code | Tied to one desktop each; both built on `libfreerdp` peer APIs | Works on any compositor through portals, with native wlroots, Mutter and KWin backends |
-| Wayland client | `wlfreerdp` is deprecated (wl_shm only; no fractional scale, relative pointer or IME). The SDL3 client is the official path, but it gets its Wayland support indirectly through SDL | n/a | Native Wayland client: dmabuf rendering, fractional-scale, pointer-constraints, text-input-v3, RemoteApp windows as `xdg_toplevel` |
 | ClearCodec encoder | Stub (`clear.c:1273` "TODO: not implemented") | none | A real encoder for text and UI content |
 | AVC444 | Present | GRD: yes | True 4:4:4 (v1/v2), hardware encoded, zero-copy from dmabuf |
-| UDP transport (MS-RDPEUDP) | Not implemented; multitransport is always declined | none | Planned for phase 3 |
+| UDP transport (MS-RDPEUDP) | Not implemented; multitransport is always declined | none | Planned after 1.0 |
 | Codebase | About 104k lines of WinPR (Win32 emulation) plus about 92k lines of core. Around 55 CVEs in 2026, mostly in codec and parser bounds checks | — | No Win32 emulation; small sans-IO core, fuzzed from day one |
 
 **What sets farland apart:** it does not depend on any one compositor, it does not link `libfreerdp`, it treats content-aware mixed-codec encoding as a core feature, it includes a multi-session broker, and it enforces memory-safety discipline in C++.
@@ -25,7 +24,7 @@ This document covers scope, architecture, reference material and risks. The phas
 
 | Decision | Choice | Notes |
 |---|---|---|
-| First deliverable | **Server** | The client follows once the server has shipped (phase 2) |
+| Scope | **Server only** | No RDP client: farland serves the clients people already use |
 | Language | **C++23** (GCC ≥ 13, Clang ≥ 19) | `std::span`, `std::expected`, `std::byte`; see §6 on how memory-safety risk is handled |
 | Protocol core | **Our own**, sans-IO | ZeroVDI, macRDP, FreeRDP and IronRDP serve as behavioural references only |
 | Build | **Meson** (+ wraps) | Consistent with the PipeWire, libei and GNOME/wlroots ecosystems, and pkg-config native. Keep the set of build options small; FreeRDP has about 240 |
@@ -34,7 +33,7 @@ This document covers scope, architecture, reference material and risks. The phas
 | NTLM | **Our own implementation** | The server has to verify NTLMv2 against a stored NT hash; ports of macRDP's and ZeroVDI's code are available |
 | License | **Apache-2.0** | Compatible with reading and translating FreeRDP code; translated files keep FreeRDP's copyright notices and are marked as modified. An optional x264 backend makes that build's combined binary GPLv3, so x264 stays opt-in and is never the default |
 | Platform baseline | **2024-era distributions:** Debian 13, Ubuntu 24.04, Fedora 40, RHEL 10 and later | GCC ≥ 13 / Clang ≥ 19 (Clang 18 cannot use libstdc++'s `std::expected`), PipeWire ≥ 1.0, xdg-desktop-portal ≥ 1.18 (Clipboard portal), libei ≥ 1.0. RHEL 9 and Ubuntu 22.04 are not supported: no compatibility shims |
-| Public API | **No stable API until the client phase** | Internal C++ APIs can change freely during server 1.0. A versioned `libfarland` C API ships with the client (C5), for Remmina, GNOME Connections and KRDC plugins. The server is controlled through D-Bus and `farlandctl` only |
+| Public API | **None** | Internal C++ APIs can change freely. The server is controlled through D-Bus and `farlandctl` only |
 
 All foundational decisions are settled (2026-09-13).
 
@@ -59,23 +58,23 @@ All foundational decisions are settled (2026-09-13).
 
 ### 3.1 Libraries (one repo, several static/shared libs)
 
-| Library | Contents | Shared with the client? |
-|---|---|---|
-| `farland-base` | Bounded `Reader`/`Writer` over `std::span`, `expected<T, Error>`, BER/PER/DER codecs, logging, and small containers | yes |
-| `farland-proto` | **Sans-IO** PDU types (encode and decode) for BCGR, plus connection state machines for both roles: X.224, MCS/GCC, security headers, licensing, capability sets, fast-path, share/data PDUs, redirection, auto-detect and heartbeat. Bytes go in, events and bytes come out; it never touches sockets or threads | yes |
-| `farland-auth` | TLS wrapper (OpenSSL), CredSSP acceptor/initiator (TSRequest v2–6), NTLMv2 (server and client, with MIC and channel bindings), SPNEGO/Kerberos via GSSAPI, RDSTLS, and credential stores | yes |
-| `farland-channels` | Static virtual channel framing, the drdynvc multiplexer (v1–v3), and channel protocols, each split into a shared core and client/server roles: rdpgfx, disp, cliprdr, rdpsnd, audin, rdpei, rdpecam, and later rdpdr and rail | yes |
-| `farland-codec` | Encoders first, decoders in phase 2: planar, RFX progressive, ClearCodec, AVC420/444 bitstream wrapping, ZGFX, MPPC/NCRUSH/XCRUSH (decode only), plus colour conversion and SIMD primitives (Google Highway or hand-written SSE4/AVX2/NEON) | yes |
-| `farland-video` | H.264 encoder backends behind one interface: **VA-API** (zero-copy dmabuf → VASurface), NVENC, OpenH264 (runtime-loaded), and optionally x264. AV1 later | yes (decode in phase 2) |
-| `farland-server` | Session engine: surface model, damage tracker, region classifier, codec selection, frame scheduler with flow control, congestion control, and pointer/cursor pipeline | no |
-| `farland-platform-*` | Capture and input backends (§3.3) | no |
-| `farlandd` / `farlandctl` | Daemon, TOML config, systemd units, D-Bus control API, and CLI | no |
+| Library | Contents |
+|---|---|
+| `farland-base` | Bounded `Reader`/`Writer` over `std::span`, `expected<T, Error>`, BER/PER/DER codecs, logging, and small containers |
+| `farland-proto` | **Sans-IO** PDU types (encode and decode) for BCGR, plus the server's connection state machine: X.224, MCS/GCC, security headers, licensing, capability sets, fast-path, share/data PDUs, redirection, auto-detect and heartbeat. Bytes go in, events and bytes come out; it never touches sockets or threads |
+| `farland-auth` | TLS wrapper (OpenSSL), CredSSP acceptor (TSRequest v2–6), NTLMv2 verification with MIC and channel bindings, SPNEGO/Kerberos via GSSAPI, RDSTLS, and credential stores |
+| `farland-channels` | Static virtual channel framing, the drdynvc multiplexer (v1–v3), and channel protocols, each with its server role: rdpgfx, disp, cliprdr, rdpsnd, audin, rdpei, rdpecam, and later rdpdr and rail |
+| `farland-codec` | Encoders: planar, RFX progressive, ClearCodec, AVC420/444 bitstream wrapping, ZGFX, plus colour conversion and SIMD primitives (Google Highway or hand-written SSE4/AVX2/NEON) |
+| `farland-video` | H.264 encoder backends behind one interface: **VA-API** (zero-copy dmabuf → VASurface), NVENC, OpenH264 (runtime-loaded), and optionally x264. AV1 later |
+| `farland-server` | Session engine: surface model, damage tracker, region classifier, codec selection, frame scheduler with flow control, congestion control, and pointer/cursor pipeline |
+| `farland-platform-*` | Capture and input backends (§3.3) |
+| `farlandd` / `farlandctl` | Daemon, TOML config, systemd units, D-Bus control API, and CLI |
 
 ### 3.2 Core design rules
 
 1. **Sans-IO protocol core.** Each state machine exposes `feed(span<const byte>) → events` and `poll_transmit() → bytes`. Transport, TLS and threads live outside. That makes every protocol path unit-testable with recorded byte streams, and fuzzable. macRDP and ZeroVDI both mixed parsing with blocking I/O, and that made them hard to test.
 2. **One parser per structure, never byte-scanning.** Both earlier servers found CS_CORE/CS_NET by scanning for `01 C0`/`03 C0` bytes, and read optional CS_CORE fields at fixed offsets. farland parses GCC blocks by their headers and length, including every optional CS_CORE field (desktopScaleFactor and the others), plus CS_CLUSTER, CS_MONITOR, CS_MONITOR_EX, CS_MCS_MSGCHANNEL and CS_MULTITRANSPORT.
-3. **Structured concurrency.** Use an event loop per session (io_uring or epoll via a thin reactor; or Asio if we want it) plus a worker pool for encoding. Each channel has exactly one writer. Both macRDP and ZeroVDI had races where two DVC messages interleaved on the wire, and unlocked channel maps.
+3. **One thread, one job.** A session runs each of its jobs on a thread of its own, and a thread never does two jobs: the connection, the picture, input, audio (§3.6). Jobs share no state; they talk by queue, and each state machine has exactly one thread that owns it. No job waits for another, so a frame that takes 200 ms to encode delays neither the client's keystrokes nor its audio. Each channel has exactly one writer, the connection thread. Both macRDP and ZeroVDI had races where two DVC messages interleaved on the wire, and unlocked channel maps.
 4. **Opaque, typed configuration from day one.** FreeRDP v2→v3 had to replace a public struct of 387 settings. farland uses versioned config schemas and opaque handles in any public API.
 5. **Negotiate from the peer's capabilities; never echo them back blindly.** Both earlier servers echoed the client's GFX caps flags and ignored Confirm Active. farland stores the negotiated capabilities in a `Negotiated` object that the rest of the session reads.
 6. **Treat every client input as hostile**, including the ones that only appear before authentication: X.224 cookies and routing tokens, GCC, and NTLM AV pairs. All of them go through the pre-auth process, which runs unprivileged.
@@ -137,6 +136,28 @@ For multi-session, the system daemon (farlandd) keeps the single port, and its s
 
 ---
 
+### 3.6 Threads in a session
+
+A session is one client connection. Its jobs run on these threads, each started by the session and ended with it:
+
+| Thread | Its job | Owns |
+|---|---|---|
+| Connection | Reads and writes the socket, runs the RDP connection and every channel protocol, and hands each job what the client sent for it | `Transport`, `server::Connection`, `DynamicChannels`, Display Control, RDPEI, the rdpsnd and AUDIN channels, the camera channel, the cliprdr protocol (`SessionRunner`) |
+| Desktop | Captures the screens and the cursor, places them on the client's monitors, and encodes: the Graphics Pipeline with its encoders, or bitmap updates | The `Desktop` (or the test pattern), `GraphicsPipeline`, the frame scheduler and the quality ladder, the cursor encoder, the desktop's clipboard backend (`DesktopSession`) |
+| Input | Translates keyboard, mouse and touch and hands them to the compositor | The desktop's input connection, lent by the desktop for the session (`DesktopInput`), and the `InputTranslator` (`InputThread`) |
+| Audio | Captures the desktop's sound, negotiates the format, encodes and paces it | The audio capture and `server::AudioPlayback` (`PlaybackThread`) |
+
+Libraries add threads of their own behind their interfaces: PipeWire's loop for capture and audio, the H.264 encoders' slice threads. The farland-server monitor and the privilege-separated network process (§3) sit in front of all of this, and farland-agent runs one session like this per connection.
+
+**How the jobs talk.** Each thread polls a wake pipe beside its own descriptors. What a job asks of another goes into that one's queue, in order, and the call returns at once; replies travel the same way back. The connection thread carries the other jobs' output to the client: the desktop thread's graphics messages, pointer updates and bitmap updates, and the audio thread's rdpsnd messages. Input goes from the connection thread straight to the input thread and never passes the desktop thread. The Graphics Pipeline runs on the desktop thread against a channel the connection thread opened (`GraphicsPipeline(channel_id, ...)`): everything it sends waits in `take_output()` for the connection thread. The one call that waits for an answer is the desktop size at connect time, while the desktop thread has nothing else to do.
+
+**Where a job cannot have a thread to itself.** Two things share a connection with another job, and there the connection decides:
+
+- The desktop's clipboard runs over the same connection as its capture on every backend: Mutter's RemoteDesktop session and the portal's session over D-Bus, KWin's and a wlroots compositor's over Wayland. It runs on the desktop thread, and `ClipboardRelay` gives the connection thread's cliprdr code a stand-in that queues every call.
+- A portal without ConnectToEIS takes input as `Notify*` calls on the portal session's bus, so that input stays on the desktop thread.
+
+A backend lends its input connection to the input thread only where the connection is its own: libei's socket (GNOME, Plasma, the portal), and for wlroots a second Wayland connection that carries only the virtual keyboard and pointer.
+
 ## 4. Reference material and what to reuse
 
 | Source | Component | Verdict |
@@ -145,7 +166,7 @@ For multi-session, the system daemon (farlandd) keeps the single port, and its s
 | macRDP | `RfxProgressiveEncoder`, `RdpGfxServer`, `DvcServer`, `DisplayControlServer`, `RdpSndServer` | **Port** to C++. These parts are clean and callback-driven |
 | macRDP | Dropped-frame re-encode on ack, letterbox mapping, virtual-display + daemon concept | Keep the concepts |
 | **ZeroVDI server bridge** (`89d992d^:KSol.ZeroVDI/RDP/Bridge`) | Frame clock, frames-in-flight gate, congestion tiers (CRF ladder), libx264 settings (`threads=1`, AUD framing, idle flush, VBV-capped CRF), dirty bounding-box progressive | **Keep the design, rewrite the code.** Its front end only works with the rdpweb client (no X.224, TLS or NLA), so drop it |
-| **ZeroVDI client** (HEAD) | CredSSP/NTLM client (verifies pubKeyAuth, maps error codes), TOFU certificate pinning, ClearCodec/Progressive/ZGFX decoders (FreeRDP-faithful, ~95% complete), GFX command handling, server-redirection parser with tests | **Port for phase 2** (client), and use the decoders now as **server test oracles** |
+| **ZeroVDI client** (HEAD) | CredSSP/NTLM client (verifies pubKeyAuth, maps error codes), TOFU certificate pinning, ClearCodec/Progressive/ZGFX decoders (FreeRDP-faithful, ~95% complete), GFX command handling, server-redirection parser with tests | Use the decoders as **server test oracles** |
 | ZeroVDI client | `protocol.js` connection sequence (magic bytes copied from mstsc) | Only reference it for what mstsc actually sends |
 | **FreeRDP 3** (Apache-2.0) | nego/NLA/RDSTLS/AAD flows, rdpgfx server/client, codecs (including the AVC444 split and the planar encoder), channel servers, shadow encoder selection | Behavioural reference. Its decoders are the **interop test oracle**. Keep Apache notices on any translated code |
 | **FreeRDP 2** | How the settings API and channel APIs evolved into v3; CVE fixes (the ChangeLog lists 30) | Lessons only |

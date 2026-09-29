@@ -12,6 +12,7 @@
 #include <farland/platform/wlroots/wayland/data_control.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <ext-image-capture-source-v1-client-protocol.h>
 #include <ext-image-copy-capture-v1-client-protocol.h>
 #include <format>
@@ -28,6 +29,64 @@ using Clock = std::chrono::steady_clock;
 constexpr std::string_view log_component = "app.wlroots";
 constexpr auto resize_timeout = std::chrono::seconds(5);
 
+/// The virtual keyboard and pointer on a Wayland connection of their own,
+/// so that the session's input thread can own it: a connection is one
+/// thread's at a time (wayland::Connection), and the desktop's carries the
+/// captures, the outputs and the clipboard.
+class WlrootsInput final : public DesktopInput {
+public:
+    [[nodiscard]] static Result<std::unique_ptr<WlrootsInput>> connect(const std::string& socket,
+                                                                       std::chrono::milliseconds timeout,
+                                                                       std::string_view keymap_layout)
+    {
+        std::unique_ptr<WlrootsInput> input(new WlrootsInput());
+        FARLAND_TRY(input->connection_, wayland::Connection::connect(socket, timeout));
+        const auto* seat = input->connection_->find("wl_seat");
+        if (seat == nullptr) {
+            return fail(Errc::unsupported, "the compositor has no seat");
+        }
+        input->seat_ = input->connection_->bind<wl_seat>(*seat, &wl_seat_interface, 5);
+        FARLAND_TRY(input->input_, wlroots::VirtualInput::create(*input->connection_, input->seat_, keymap_layout));
+        // The virtual pointer makes the seat a pointer seat, which the
+        // desktop's connection asks for the cursor's wl_pointer next.
+        if (!input->connection_->roundtrip(timeout)) {
+            return fail(Errc::io, "the compositor stopped answering");
+        }
+        return input;
+    }
+    WlrootsInput(const WlrootsInput&) = delete;
+    WlrootsInput& operator=(const WlrootsInput&) = delete;
+    WlrootsInput(WlrootsInput&&) = delete;
+    WlrootsInput& operator=(WlrootsInput&&) = delete;
+    ~WlrootsInput() override
+    {
+        input_.reset();
+        if (seat_ != nullptr) {
+            wl_seat_release(seat_);
+        }
+        connection_.reset();
+    }
+
+    [[nodiscard]] wlroots::VirtualInput& virtual_input() noexcept { return *input_; }
+
+    [[nodiscard]] platform::InputSink& sink() override { return *input_; }
+    [[nodiscard]] std::vector<int> fds() const override { return {connection_->fd()}; }
+    void dispatch() override
+    {
+        connection_->dispatch();
+        closed_.store(connection_->closed());
+    }
+    [[nodiscard]] bool closed() const override { return closed_.load(); }
+
+private:
+    WlrootsInput() = default;
+
+    std::unique_ptr<wayland::Connection> connection_;
+    wl_seat* seat_ = nullptr;
+    std::unique_ptr<wlroots::VirtualInput> input_;
+    std::atomic<bool> closed_{false};
+};
+
 class WlrootsDesktop final : public Desktop {
 public:
     WlrootsDesktop() = default;
@@ -40,7 +99,7 @@ public:
         // Wayland objects before the connection, the connection before the compositor.
         clipboard_.reset();
         screens_.clear();
-        input_.reset();
+        drop_input();
         if (pointer_ != nullptr) {
             wl_pointer_release(pointer_);
         }
@@ -57,11 +116,17 @@ public:
 
     [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
     [[nodiscard]] platform::CursorSource* cursor() override { return screens_.front().capture->cursor(); }
-    [[nodiscard]] platform::InputSink& input() override { return *input_; }
-    [[nodiscard]] std::vector<int> dispatch_fds() const override { return {connection_->fd()}; }
+    [[nodiscard]] platform::InputSink& input() override { return held_sink(); }
+    [[nodiscard]] std::vector<int> dispatch_fds() const override
+    {
+        std::vector<int> fds = input_fds();
+        fds.push_back(connection_->fd());
+        return fds;
+    }
     void dispatch() override
     {
         connection_->dispatch();
+        dispatch_input();
         if (outputs_->generation() != outputs_generation_) {
             update_input_layout();
         }
@@ -120,7 +185,6 @@ private:
     wl_seat* seat_ = nullptr;
     wl_pointer* pointer_ = nullptr;
     wlroots::OutputCapture::Protocols protocols_;
-    std::unique_ptr<wlroots::VirtualInput> input_;
     std::vector<Screen> screens_;
     std::vector<std::optional<platform::Rect>> targets_;
     std::unique_ptr<platform::Clipboard> clipboard_;
@@ -172,7 +236,9 @@ Result<void> WlrootsDesktop::connect(const HeadlessOptions& options)
         return fail(Errc::unsupported, "the compositor has no screen capture protocol");
     }
     FARLAND_TRY(outputs_, wlroots::Outputs::create(*connection_));
-    FARLAND_TRY(input_, wlroots::VirtualInput::create(*connection_, seat_, options.keymap_layout));
+    FARLAND_TRY(auto input, WlrootsInput::connect(process_ ? process_->socket_path() : std::string(), timeout,
+                                                  options.keymap_layout));
+    keep_input(std::move(input));
     return {};
 }
 
@@ -294,7 +360,9 @@ void WlrootsDesktop::update_input_layout()
             mappings.push_back(wlroots::ScreenMapping{*targets_[i], output->logical});
         }
     }
-    input_->set_layout(std::move(mappings), wlroots::layout_box(outputs));
+    change_input([mappings = std::move(mappings), box = wlroots::layout_box(outputs)](DesktopInput& input) {
+        static_cast<WlrootsInput&>(input).virtual_input().set_layout(mappings, box);
+    });
 }
 
 }  // namespace

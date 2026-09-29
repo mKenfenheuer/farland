@@ -21,7 +21,7 @@ struct wl_registry;
 /// directly (docs/PLAN.md §3.3): the display, its globals, and dispatching
 /// that fits farland's poll loop.
 ///
-/// Threading: one thread at a time (the session's), like the backend
+/// Threading: one thread at a time (its owner's), like the backend
 /// interfaces. Nothing here blocks except roundtrip() and wait_until(),
 /// which are meant for setting up.
 namespace farland::platform::wayland {

@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <pwd.h>
@@ -21,6 +22,8 @@
 #include <unistd.h>
 
 #ifdef FARLAND_HAVE_PAM
+#include "pam_password.hpp"
+
 #include <grp.h>
 #include <security/pam_appl.h>
 #endif
@@ -66,22 +69,55 @@ int token_pipe(const server::broker::Token& token)
     return fds[0];
 }
 
+/// A pipe holding `password` (and nothing else), whose read end the child
+/// gets at descriptor 4. Returns the read end.
+int password_pipe(const SecretString& password)
+{
+    std::array<int, 2> fds{-1, -1};
+    if (::pipe(fds.data()) != 0) {
+        return -1;
+    }
+    ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    // At most broker::max_password bytes, far below a pipe's buffer, so
+    // this never blocks.
+    const auto text = password.view();
+    const bool written = ::write(fds[1], text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ::close(fds[1]);
+    if (!written) {
+        ::close(fds[0]);
+        return -1;
+    }
+    return fds[0];
+}
+
 Result<pid_t> spawn(const std::vector<std::string>& args, std::span<const std::string> environment,
-                    const server::broker::Token& token)
+                    const server::broker::Token& token, const SecretString* password = nullptr)
 {
     const int token_fd = token_pipe(token);
     if (token_fd < 0) {
         return fail(Errc::io, "cannot pass the session token");
+    }
+    const int secret_fd = password != nullptr && !password->empty() ? password_pipe(*password) : -1;
+    if (password != nullptr && !password->empty() && secret_fd < 0) {
+        ::close(token_fd);
+        return fail(Errc::io, "cannot pass the delegated password");
     }
     auto argv = pointers(args);
     auto envp = pointers(environment);
     posix_spawn_file_actions_t actions;
     ::posix_spawn_file_actions_init(&actions);
     ::posix_spawn_file_actions_adddup2(&actions, token_fd, agent_token_fd);
+    if (secret_fd >= 0) {
+        ::posix_spawn_file_actions_adddup2(&actions, secret_fd, helper_password_fd);
+    }
     pid_t pid = -1;
     const int rc = ::posix_spawn(&pid, args.front().c_str(), &actions, nullptr, argv.data(), envp.data());
     ::posix_spawn_file_actions_destroy(&actions);
     ::close(token_fd);
+    if (secret_fd >= 0) {
+        ::close(secret_fd);
+    }
     if (rc != 0) {
         log::error(log_component, "cannot start {}: {}", args.front(), std::strerror(rc));
         return fail(Errc::io, "cannot start the process");
@@ -234,7 +270,7 @@ Result<pid_t> spawn_agent(const AgentLaunch& launch, const server::broker::Token
 
 Result<pid_t> spawn_session_helper(const std::filesystem::path& self, const AgentLaunch& launch,
                                    const std::string& account, const std::string& rhost,
-                                   const server::broker::Token& token)
+                                   const server::broker::Token& token, const SecretString& password)
 {
     auto launch_fd = launch;
     launch_fd.token_on_fd = true;
@@ -242,12 +278,16 @@ Result<pid_t> spawn_session_helper(const std::filesystem::path& self, const Agen
                                   "--user",      account,
                                   "--desktop",   std::string(to_string(launch.desktop)),
                                   "--rhost",     rhost,
-                                  "--log-level", launch.log_level,
-                                  "--"};
+                                  "--log-level", launch.log_level};
+    if (!password.empty()) {
+        args.emplace_back("--password-fd");
+        args.push_back(std::to_string(helper_password_fd));
+    }
+    args.emplace_back("--");
     const auto agent = agent_arguments(launch_fd);
     args.insert(args.end(), agent.begin(), agent.end());
     const std::vector<std::string> env{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"};
-    return spawn(args, env, token);
+    return spawn(args, env, token, &password);
 }
 
 #ifdef FARLAND_HAVE_PAM
@@ -293,10 +333,26 @@ public:
         pam_end(handle_, last_);
     }
 
-    bool open(const std::string& user, const std::string& rhost, DesktopKind desktop)
+    /// `password`: what the client delegated over NLA, or empty. With one,
+    /// the auth stack runs first, so that its modules that keep the login
+    /// password for the session -- pam_gnome_keyring, pam_kwallet5 -- get
+    /// it and unlock the keyring as a login at a greeter would. NLA has
+    /// already decided who this is, so a stack that turns the password down
+    /// (an account password that is not the RDP one, say) only means a
+    /// locked keyring, never a refused session.
+    bool open(const std::string& user, const std::string& rhost, DesktopKind desktop, const std::string& password)
     {
-        const pam_conv conversation{no_conversation, nullptr};
-        last_ = pam_start("farland", user.c_str(), &conversation, &handle_);
+        // PAM keeps the conversation's pointer for the whole handle, and the
+        // session modules may still talk; the password is the caller's
+        // until pam_end.
+        if (password.empty()) {
+            conversation_ = pam_conv{no_conversation, nullptr};
+        } else {
+            // PAM's appdata_ptr is not const; the conversation only reads it.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+            conversation_ = pam_conv{farland_pam_password_conversation, const_cast<std::string*>(&password)};
+        }
+        last_ = pam_start("farland", user.c_str(), &conversation_, &handle_);
         if (last_ != PAM_SUCCESS) {
             log::error(log_component, "pam_start for {}: {}", user, error(last_));
             return false;
@@ -307,6 +363,14 @@ public:
         pam_set_item(handle_, PAM_RUSER, user.c_str());
         for (const auto& v : pam_session_variables(desktop)) {
             pam_putenv(handle_, v.c_str());
+        }
+        if (!password.empty()) {
+            if (const int rc = pam_authenticate(handle_, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK); rc != PAM_SUCCESS) {
+                log::warn(log_component,
+                          "PAM does not take the password {}'s client delegated ({}); the session "
+                          "opens with its keyring locked",
+                          user, error(rc));
+            }
         }
         if ((last_ = pam_acct_mgmt(handle_, 0)) != PAM_SUCCESS) {
             log::error(log_component, "PAM refuses the account {}: {}", user, error(last_));
@@ -345,6 +409,7 @@ private:
     [[nodiscard]] std::string error(int rc) const { return pam_strerror(handle_, rc); }
 
     pam_handle_t* handle_ = nullptr;
+    pam_conv conversation_{};
     int last_ = PAM_SUCCESS;
     bool credentials_ = false;
     bool opened_ = false;
@@ -361,6 +426,7 @@ int run_session_helper(std::span<char*> args)
 {
     std::string user;
     std::string rhost;
+    int password_fd = -1;
     DesktopKind desktop = DesktopKind::test;
     std::vector<std::string> agent;
     for (std::size_t i = 1; i < args.size(); ++i) {
@@ -373,6 +439,8 @@ int run_session_helper(std::span<char*> args)
             user = args[++i];
         } else if (arg == "--rhost" && has_value) {
             rhost = args[++i];
+        } else if (arg == "--password-fd" && has_value) {
+            password_fd = std::atoi(args[++i]);
         } else if (arg == "--desktop" && has_value) {
             const std::string_view name = args[++i];
             for (auto kind : {DesktopKind::gnome, DesktopKind::plasma, DesktopKind::sway, DesktopKind::labwc,
@@ -394,8 +462,33 @@ int run_session_helper(std::span<char*> args)
         return 2;
     }
 
+    // The delegated password, which farlandd hands over on its own pipe,
+    // never in the arguments or the environment; the agent does not inherit
+    // the pipe.
+    std::string password;
+    if (password_fd >= 0) {
+        std::array<char, server::broker::max_password + 1> buffer{};
+        std::size_t length = 0;
+        for (;;) {
+            const auto n = ::read(password_fd, buffer.data() + length, buffer.size() - length);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0 || (length += static_cast<std::size_t>(n)) == buffer.size()) {
+                break;
+            }
+        }
+        ::close(password_fd);
+        if (length <= server::broker::max_password) {
+            password.assign(buffer.data(), length);
+        }
+        secure_zero(std::as_writable_bytes(std::span(buffer)));
+    }
     PamSession pam;
-    if (!pam.open(account->name, rhost, desktop)) {
+    const bool opened = pam.open(account->name, rhost, desktop, password);
+    // PAM has it where it needs it by now, the keyring modules included.
+    secure_zero(std::as_writable_bytes(std::span(password)));
+    if (!opened) {
         return 1;
     }
     const auto environment = agent_environment(pam.environment(), *account, desktop);

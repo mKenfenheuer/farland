@@ -23,7 +23,7 @@ struct wl_seat;
 /// §3.3): the registry's globals, the outputs and the first seat. Nothing in
 /// it is specific to KWin.
 ///
-/// Threading: everything runs on the owner's thread (the session thread):
+/// Threading: everything runs on the owner's thread (the desktop thread):
 /// poll fd() and call dispatch() when it becomes readable.
 namespace farland::platform::kwin {
 

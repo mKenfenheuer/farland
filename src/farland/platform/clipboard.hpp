@@ -14,8 +14,10 @@
 /// §3.3): contents are MIME types, data is delay-rendered both ways. The
 /// portal backend implements it with org.freedesktop.portal.Clipboard.
 ///
-/// Threading: like the other backend interfaces, all calls come from the
-/// session thread; the session polls poll_fds() and calls dispatch().
+/// Threading: like the other backend interfaces, all calls come from one
+/// thread, which polls poll_fds() and calls dispatch(): in a session the
+/// desktop thread, whose connection the clipboard shares (the cliprdr code
+/// on the connection thread reaches it through app::ClipboardRelay).
 namespace farland::platform {
 
 namespace clipboard_event {

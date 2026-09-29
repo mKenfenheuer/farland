@@ -16,7 +16,8 @@
 #include <thread>
 
 #if defined(FARLAND_HAVE_LIBSYSTEMD) && defined(FARLAND_HAVE_PAM)
-#include <cstdlib>
+#include "pam_password.hpp"
+
 #include <cstring>
 #include <pwd.h>
 #include <security/pam_appl.h>
@@ -50,38 +51,10 @@ Result<void> store_enrolment(const std::filesystem::path& path, const std::strin
 
 #if defined(FARLAND_HAVE_LIBSYSTEMD) && defined(FARLAND_HAVE_PAM)
 
-namespace {
-
-/// Answers PAM's password prompts with the password; nothing else.
-extern "C" int password_conversation(int count, const pam_message** messages, pam_response** responses, void* data)
-{
-    if (count <= 0 || count > PAM_MAX_NUM_MSG) {
-        return PAM_CONV_ERR;
-    }
-    const auto* password = static_cast<const std::string*>(data);
-    // PAM frees the responses with free(), so they come from calloc/strdup.
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    auto* replies = static_cast<pam_response*>(std::calloc(static_cast<std::size_t>(count), sizeof(pam_response)));
-    if (replies == nullptr) {
-        return PAM_BUF_ERR;
-    }
-    const std::span message_list(messages, static_cast<std::size_t>(count));
-    const std::span reply_list(replies, static_cast<std::size_t>(count));
-    for (std::size_t i = 0; i < message_list.size(); ++i) {
-        if (message_list[i]->msg_style == PAM_PROMPT_ECHO_OFF) {
-            reply_list[i].resp = ::strdup(password->c_str());
-        }
-    }
-    *responses = replies;
-    return PAM_SUCCESS;
-}
-
-}  // namespace
-
 bool check_account_password(const std::string& account, std::string_view password)
 {
     std::string secret(password);
-    const pam_conv conversation{password_conversation, &secret};
+    const pam_conv conversation{farland_pam_password_conversation, &secret};
     pam_handle_t* handle = nullptr;
     int rc = pam_start("farland", account.c_str(), &conversation, &handle);
     if (rc == PAM_SUCCESS) {

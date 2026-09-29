@@ -73,7 +73,7 @@ void unpremultiply(std::span<std::byte> bgra) noexcept;
 /// replaced merges its damage into the newer one. Frames are XRGB8888 or
 /// ARGB8888, which are BGRX in memory.
 ///
-/// Threading: the session thread; events arrive through the connection's
+/// Threading: the desktop thread; events arrive through the connection's
 /// dispatch.
 class OutputCapture {
 public:

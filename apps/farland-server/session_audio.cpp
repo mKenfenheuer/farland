@@ -57,12 +57,6 @@ server::AudioPlaybackOptions playback_options()
     };
     return options;
 }
-
-std::string optional_ms(std::optional<std::chrono::milliseconds> d)
-{
-    return d ? std::format("{} ms", d->count()) : std::string("-");
-}
-
 }  // namespace
 
 SessionAudio::SessionAudio(std::string peer, AudioOptions options)
@@ -169,8 +163,9 @@ void SessionAudio::start_playback(Transport transport)
         return;
     }
     transport_ = transport;
-    playback_.emplace([this](std::span<const std::byte> message) { send_playback(message); }, playback_options());
-    playback_->start(Clock::now());
+    playback_ = std::make_unique<PlaybackThread>(
+        peer_, transport == Transport::dynamic ? std::string(playback_channel) : "the rdpsnd channel",
+        playback_options(), open_capture);
     statistics_since_ = Clock::now();
 }
 
@@ -187,36 +182,8 @@ void SessionAudio::send_playback(std::span<const std::byte> message)
 
 void SessionAudio::on_playback_message(std::span<const std::byte> message)
 {
-    if (!playback_) {
-        return;
-    }
-    if (auto received = playback_->receive(message, Clock::now()); !received) {
-        stop_playback(std::format("audio output protocol error: {}", received.error().message()));
-        return;
-    }
-    poll_playback();
-}
-
-void SessionAudio::poll_playback()
-{
-    while (playback_) {
-        auto event = playback_->poll_event();
-        if (!event) {
-            break;
-        }
-        if (const auto* ready = std::get_if<server::playback_event::Ready>(&*event)) {
-            auto capture = open_capture(ready->capture);
-            if (!capture) {
-                stop_playback(std::format("cannot capture the desktop's audio: {}", capture.error().message()));
-                return;
-            }
-            capture_ = std::move(*capture);
-            log::info(log_component, "{}: audio output over {}: {}", peer_,
-                      transport_ == Transport::dynamic ? playback_channel : "the rdpsnd channel", ready->codec);
-        } else if (const auto* unavailable = std::get_if<server::playback_event::Unavailable>(&*event)) {
-            stop_playback(unavailable->reason);
-            return;
-        }
+    if (playback_) {
+        playback_->receive(std::vector<std::byte>(message.begin(), message.end()));
     }
 }
 
@@ -226,7 +193,6 @@ void SessionAudio::stop_playback(const std::string& why)
         return;
     }
     log::info(log_component, "{}: audio output stopped: {}", peer_, why);
-    capture_.reset();
     playback_.reset();
     if (transport_ == Transport::dynamic && dvc_ != nullptr && playback_dvc_id_) {
         dvc_->close(*playback_dvc_id_);
@@ -269,48 +235,38 @@ void SessionAudio::poll_input()
 
 void SessionAudio::add_fds(std::vector<pollfd>& fds) const
 {
-    if (capture_) {
-        fds.push_back(pollfd{capture_->wake_fd(), POLLIN, 0});
+    if (playback_) {
+        fds.push_back(pollfd{playback_->wake_fd(), POLLIN, 0});
     }
 }
 
 void SessionAudio::service(std::optional<std::uint32_t> bandwidth_kbps)
 {
-    if (!playback_ || !capture_) {
-        return;
-    }
     const auto now = Clock::now();
-    samples_.clear();
-    capture_->read(samples_);
-    if (capture_->closed()) {
-        stop_playback(std::format("the audio capture ended: {}", capture_->error()));
+    log_microphone(now);
+    if (!playback_) {
         return;
     }
     playback_->set_bandwidth(bandwidth_kbps);
-    playback_->push(samples_, now);
-    log_statistics(now);
+    auto output = playback_->take_output();
+    for (const auto& message : output.messages) {
+        send_playback(message);
+    }
+    if (output.stopped) {
+        stop_playback(*output.stopped);
+    }
 }
 
-/// Every few seconds while sound plays: packets, drops and the delays the
-/// client's confirmations show.
-void SessionAudio::log_statistics(Clock::time_point now)
+/// Every few seconds while the client records: what reached the desktop.
+void SessionAudio::log_microphone(Clock::time_point now)
 {
     if (now - statistics_since_ < statistics_period) {
         return;
     }
-    const double seconds = std::chrono::duration<double>(now - statistics_since_).count();
     statistics_since_ = now;
-    const auto stats = playback_->take_stats(now);
-    if (stats.packets_sent == 0 && stats.packets_dropped == 0) {
-        return;
+    if (microphone_) {
+        log::info(log_component, "{}: microphone {} samples", peer_, std::exchange(microphone_samples_, 0));
     }
-    log::info(log_component,
-              "{}: audio {} packets ({:.0f} kbit/s), {} dropped, {} silent; confirmation within {}, client delay "
-              "up to {}, {} ms unconfirmed{}",
-              peer_, stats.packets_sent, static_cast<double>(stats.bytes_sent) * 8 / 1000 / seconds,
-              stats.packets_dropped, stats.packets_silent, optional_ms(stats.max_round_trip),
-              optional_ms(stats.max_client_delay), stats.unconfirmed.count(),
-              microphone_ ? std::format("; microphone {} samples", std::exchange(microphone_samples_, 0)) : "");
 }
 
 }  // namespace farland::app

@@ -21,9 +21,14 @@ struct AudioCaptureOptions {
     /// node.name and node.description of the capture stream.
     std::string node_name = "farland-audio-capture";
     std::string description = "farland audio output capture";
-    /// PipeWire quantum asked for (node.latency), which bounds the delay the
-    /// capture adds.
-    std::chrono::milliseconds quantum{10};
+    /// PipeWire quantum asked for (node.latency, rounded up to a power of
+    /// two), which bounds the delay the capture adds. One rdpsnd packet: a
+    /// shorter one gains nothing, as the audio goes out 20 ms at a time, and
+    /// it makes every node of the desktop's audio meet a deadline that short.
+    /// Without realtime scheduling (a container, a system without RTKit) the
+    /// graph then misses it again and again, and each miss is a click in the
+    /// sound itself: 10 ms, which PipeWire made 5.3 ms, did that.
+    std::chrono::milliseconds quantum{20};
     /// Samples the session has not read are dropped beyond this, oldest first.
     std::chrono::milliseconds max_buffered{200};
 };
@@ -37,7 +42,9 @@ struct VirtualSourceOptions {
     /// node.name and node.description, as applications list the microphone.
     std::string node_name = "farland-microphone";
     std::string description = "farland microphone";
-    std::chrono::milliseconds quantum{10};
+    /// As AudioCaptureOptions::quantum: the client sends 20 ms or more at a
+    /// time anyway.
+    std::chrono::milliseconds quantum{20};
     /// Queued samples beyond this are dropped, oldest first.
     std::chrono::milliseconds max_buffered{100};
     /// Samples collected before playout starts, against network jitter.

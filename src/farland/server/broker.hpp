@@ -176,14 +176,17 @@ struct NewConnection {
     /// `server::Connection` from it.
     Negotiation negotiation;
     /// The password the client delegated over NLA, where it delegated one
-    /// and farlandd checked it. It is here for one thing: a GNOME session
-    /// on a seat can be locked, and a locked session refuses to be shared
-    /// at all, so the agent puts this to GDM to unlock the session it is
-    /// about to attach to (apps/farland-agent/unlock.hpp). The agent runs
-    /// as the session's own user, and this is that user's own password, so
-    /// it crosses no boundary the client has not already crossed -- but it
-    /// is still the one secret farlandd hands out, and it is wiped on both
-    /// sides as soon as the connection has it.
+    /// and farlandd checked it. The agent uses it for what a login at the
+    /// machine would: a GNOME session on a seat can be locked, and a locked
+    /// session refuses to be shared at all, so the agent puts it to GDM to
+    /// unlock the session it is about to attach to; and a GNOME session GDM
+    /// started for a client ran no authentication, so the agent unlocks its
+    /// keyring with it (apps/farland-agent/unlock.hpp). farland's own
+    /// sessions get it earlier, in farlandd's PAM auth stack. The agent
+    /// runs as the session's own user, and this is that user's own
+    /// password, so it crosses no boundary the client has not already
+    /// crossed -- but it is still the one secret farlandd hands out, and it
+    /// is wiped on both sides as soon as the connection has it.
     ///
     /// Empty where the client delegated nothing (NLA without delegation, a
     /// smart card). A locked session then stays locked, and the agent says

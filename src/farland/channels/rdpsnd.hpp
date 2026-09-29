@@ -181,7 +181,7 @@ struct Wave {
 /// and its BodySize must fit 16 bits (at most 65527 bytes).
 [[nodiscard]] std::array<std::vector<std::byte>, 2> encode_wave(const Wave& wave);
 
-/// Decodes a server PDU (for tests, fuzzing and a future client). A Wave PDU
+/// Decodes a server PDU (for tests and fuzzing). A Wave PDU
 /// has no header of its own: after a WaveInfo, pass the next message to
 /// decode_wave_body instead.
 [[nodiscard]] Result<ServerPdu> decode_server_pdu(std::span<const std::byte> message);

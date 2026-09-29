@@ -43,10 +43,9 @@ Markdown copies of MS-RDPBCGR, -RDPEGFX, -RDPRFX, -RDPEDYC, -RDPECLIP and -RDPEV
 | MS-RDPEA, MS-RDPEAI | Audio output and input | M6 |
 | MS-RDPEI | Touch and pen input | M6 |
 | MS-RDPECAM | Camera redirection | M6 (optional) |
-| MS-RDPEFS | Device redirection (rdpdr) | phase 2 |
-| MS-RDPERP | RemoteApp (RAIL) | phase 2 |
-| MS-TSGU | RD Gateway | phase 2 |
-| MS-RDPEMT, MS-RDPEUDP, MS-RDPEUDP2 | Multitransport over UDP | phase 3 |
+| MS-RDPEFS | Device redirection (rdpdr) | after 1.0 |
+| MS-RDPERP | RemoteApp (RAIL) | after 1.0 |
+| MS-RDPEMT, MS-RDPEUDP, MS-RDPEUDP2 | Multitransport over UDP | after 1.0 |
 
 ## Linux platform interfaces
 

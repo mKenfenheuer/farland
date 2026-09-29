@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 namespace farland::app {
 
@@ -28,6 +29,7 @@ TestDesktop::TestDesktop(std::uint32_t width, std::uint32_t height, unsigned fra
     : pattern_(std::max(width, 1U), std::max(height, 1U)),
       interval_(std::chrono::microseconds(1'000'000 / std::max(frames_per_second, 1U)))
 {
+    keep_input(std::make_unique<InputConnection>(input_));
 }
 
 std::uint64_t TestDesktop::frame_number() const
@@ -41,6 +43,7 @@ void TestDesktop::request_screen_sizes(std::span<const std::pair<std::uint32_t, 
         return;
     }
     const auto [width, height] = sizes.front();
+    const std::scoped_lock lock(mutex_);
     if (width == 0 || height == 0 || (width == pattern_.width() && height == pattern_.height())) {
         return;
     }
@@ -51,6 +54,7 @@ void TestDesktop::request_screen_sizes(std::span<const std::pair<std::uint32_t, 
 std::optional<platform::Frame> TestDesktop::Frames::take_frame()
 {
     auto& d = desktop_;
+    const std::scoped_lock lock(d.mutex_);
     const std::uint64_t number = d.frame_number();
     if (d.shown_ == number && !d.changed_) {
         return std::nullopt;
@@ -65,6 +69,7 @@ std::optional<platform::Frame> TestDesktop::Frames::take_frame()
 
 std::pair<std::uint32_t, std::uint32_t> TestDesktop::Frames::size() const
 {
+    const std::scoped_lock lock(desktop_.mutex_);
     return {desktop_.pattern_.width(), desktop_.pattern_.height()};
 }
 
@@ -73,12 +78,14 @@ void TestDesktop::Input::key(std::uint32_t evdev_code, bool pressed)
     // The pattern shows a cell per key, coloured by its code; here that is
     // the evdev code the translator made of the client's scancode.
     const auto flags = pressed ? std::uint16_t{0} : proto::kbd_flags::release;
+    const std::scoped_lock lock(desktop_.mutex_);
     desktop_.pattern_.apply(proto::InputEvent{proto::KeyboardEvent{flags, static_cast<std::uint16_t>(evdev_code)}});
     desktop_.changed_ = true;
 }
 
 void TestDesktop::Input::pointer_motion_absolute(double x, double y)
 {
+    const std::scoped_lock lock(desktop_.mutex_);
     desktop_.pointer_x_ = x;
     desktop_.pointer_y_ = y;
     desktop_.pointer_event(proto::ptr_flags::move);
@@ -86,6 +93,7 @@ void TestDesktop::Input::pointer_motion_absolute(double x, double y)
 
 void TestDesktop::Input::pointer_motion_relative(double dx, double dy)
 {
+    const std::scoped_lock lock(desktop_.mutex_);
     desktop_.pointer_x_ += dx;
     desktop_.pointer_y_ += dy;
     desktop_.pointer_event(proto::ptr_flags::move);
@@ -103,10 +111,12 @@ void TestDesktop::Input::button(std::uint32_t evdev_button, bool pressed)
     } else {
         return;
     }
+    const std::scoped_lock lock(desktop_.mutex_);
     desktop_.button_down_ = pressed;
     desktop_.pointer_event(static_cast<std::uint16_t>(flags | (pressed ? proto::ptr_flags::down : 0U)));
 }
 
+/// With mutex_ held.
 void TestDesktop::pointer_event(std::uint16_t flags)
 {
     const proto::MouseEvent event{flags, coordinate(pointer_x_, pattern_.width()),

@@ -121,9 +121,9 @@ struct TlsClientOptions {
     std::string server_name;
 };
 
-/// Client side of one connection. Accepts any server certificate for now:
-/// verification against a trust store or a pinned fingerprint comes with the
-/// client in phase 2. Call process() once to produce the ClientHello.
+/// Client side of one connection, for the tests that connect to the server.
+/// Accepts any server certificate. Call process() once to produce the
+/// ClientHello.
 class TlsClient : public TlsConnection {
 public:
     explicit TlsClient(const TlsClientOptions& options = {});

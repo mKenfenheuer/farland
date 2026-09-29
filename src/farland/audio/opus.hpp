@@ -45,7 +45,7 @@ struct EncoderConfig {
 /// One Opus packet per encode() call.
 [[nodiscard]] Result<std::unique_ptr<Encoder>> create_encoder(const EncoderConfig& config);
 
-/// Decodes Opus packets, for tests and a future client.
+/// Decodes Opus packets, for tests.
 class Decoder {
 public:
     [[nodiscard]] static Result<std::unique_ptr<Decoder>> create(PcmFormat format);

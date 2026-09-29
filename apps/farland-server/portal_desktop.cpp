@@ -3,6 +3,8 @@
 
 #include "portal_desktop.hpp"
 
+#include "ei_desktop_input.hpp"
+
 #include <farland/base/log.hpp>
 #include <farland/platform/portal/ei_input.hpp>
 #include <farland/platform/portal/pipewire_capture.hpp>
@@ -55,37 +57,43 @@ std::vector<portal::PortalStream> in_screen_order(std::vector<portal::PortalStre
 
 class PortalDesktop final : public Desktop {
 public:
+    PortalDesktop() = default;
+    PortalDesktop(const PortalDesktop&) = delete;
+    PortalDesktop& operator=(const PortalDesktop&) = delete;
+    PortalDesktop(PortalDesktop&&) = delete;
+    PortalDesktop& operator=(PortalDesktop&&) = delete;
+    ~PortalDesktop() override { drop_input(); }  // before the session it came from
+
     [[nodiscard]] Result<void> start(const PortalDesktopOptions& options);
 
     [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
     [[nodiscard]] platform::CursorSource* cursor() override { return &screens_.front().capture->cursor(); }
+    /// With libei, the input goes to the session's input thread. The
+    /// portal's Notify* calls cannot: they go over the portal session's bus,
+    /// with everything else of it.
     [[nodiscard]] platform::InputSink& input() override
     {
-        if (ei_) {
-            return *ei_;
+        if (libei_) {
+            return held_sink();
         }
         return *notify_;
     }
     [[nodiscard]] std::vector<int> dispatch_fds() const override
     {
-        std::vector<int> fds{session_->fd()};
-        if (ei_) {
-            fds.push_back(ei_->fd());
-        }
+        std::vector<int> fds = input_fds();
+        fds.push_back(session_->fd());
         return fds;
     }
     void dispatch() override
     {
         session_->process();
-        if (ei_) {
-            ei_->dispatch();
-        }
+        dispatch_input();
     }
     [[nodiscard]] bool closed() const override
     {
         return session_->closed() || screens_.empty() ||
                std::ranges::any_of(screens_, [](const Screen& s) { return !s.capture || s.capture->closed(); }) ||
-               (ei_ && ei_->closed());
+               input_closed();
     }
     [[nodiscard]] platform::Clipboard* clipboard() override { return clipboard_.get(); }
 
@@ -116,7 +124,7 @@ private:
     // Declared first, destroyed last: the captures and the input need the session.
     std::unique_ptr<portal::PortalSession> session_ = std::make_unique<portal::PortalSession>();
     std::vector<Screen> screens_;
-    std::unique_ptr<portal::EiInput> ei_;
+    bool libei_ = false;
     std::unique_ptr<portal::PortalNotifyInput> notify_;
     bool virtual_monitor_ = false;
     std::unique_ptr<portal::PortalClipboard> clipboard_;
@@ -191,7 +199,7 @@ Result<void> PortalDesktop::start(const PortalDesktopOptions& options)
     }
     static_cast<void>(set_screen_targets(targets));
     log::info(log_component, "{} screen{}, input through {}", screens_.size(), screens_.size() == 1 ? "" : "s",
-              ei_ ? "libei" : "the portal");
+              libei_ ? "libei" : "the portal");
     return {};
 }
 
@@ -210,14 +218,16 @@ void PortalDesktop::request_screen_sizes(std::span<const std::pair<std::uint32_t
 
 bool PortalDesktop::set_screen_targets(std::span<const std::optional<platform::Rect>> targets)
 {
-    if (ei_) {
+    if (libei_) {
         std::vector<portal::EiInput::Output> outputs;
         for (std::size_t i = 0; i < std::min(targets.size(), screens_.size()); ++i) {
             if (targets[i]) {
                 outputs.push_back(portal::EiInput::Output{*targets[i], screens_[i].stream.mapping_id});
             }
         }
-        ei_->set_outputs(std::move(outputs));
+        change_input([outputs = std::move(outputs)](DesktopInput& input) {
+            static_cast<EiDesktopInput&>(input).ei().set_outputs(outputs);
+        });
         return true;
     }
     if (notify_) {
@@ -301,7 +311,8 @@ Result<void> PortalDesktop::connect_input()
             log::error(log_component, "libei: {}", ei.error().message());
             return fail(Errc::io, "cannot connect to the compositor's input (libei)");
         }
-        ei_ = std::move(*ei);
+        keep_input(std::make_unique<EiDesktopInput>(std::move(*ei)));
+        libei_ = true;
         return {};
     }
     notify_ = std::make_unique<portal::PortalNotifyInput>(*session_, portal::default_layout(session_->streams()));

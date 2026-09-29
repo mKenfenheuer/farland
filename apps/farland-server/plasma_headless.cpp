@@ -3,6 +3,8 @@
 
 #include "plasma_headless.hpp"
 
+#include "ei_desktop_input.hpp"
+
 #include <farland/base/log.hpp>
 #include <farland/platform/kwin/data_control_clipboard.hpp>
 #include <farland/platform/kwin/kwin_eis.hpp>
@@ -156,16 +158,18 @@ public:
         if (outputs_ && wayland_ && !wayland_->broken()) {
             outputs_->restore_layout(std::chrono::seconds(2));
         }
+        drop_input();  // while the KWin it came from is still there
     }
 
     [[nodiscard]] Result<void> start(const HeadlessOptions& options);
 
     [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
     [[nodiscard]] platform::CursorSource* cursor() override { return &screens_.front().capture->cursor(); }
-    [[nodiscard]] platform::InputSink& input() override { return *ei_; }
+    [[nodiscard]] platform::InputSink& input() override { return held_sink(); }
     [[nodiscard]] std::vector<int> dispatch_fds() const override
     {
-        std::vector<int> fds{wayland_->fd(), ei_->fd(), eis_->bus_fd()};
+        std::vector<int> fds = input_fds();
+        fds.push_back(wayland_->fd());
         if (seat_watch_) {
             fds.push_back(seat_watch_->fd());
         }
@@ -178,8 +182,7 @@ public:
     void dispatch() override
     {
         wayland_->dispatch();
-        eis_->dispatch();
-        ei_->dispatch();
+        dispatch_input();
         if (outputs_) {
             outputs_->check_timeouts();
         }
@@ -203,7 +206,7 @@ public:
             reason = "the connection to KWin broke";
         } else if (processes_ && processes_->exited()) {
             reason = "the KWin this desktop started ended";
-        } else if (ei_->closed()) {
+        } else if (input_closed()) {
             reason = "the input connection closed";
         } else if (seat_watch_ && keeps_rendering() && seat_watch_->returned_to_the_seat()) {
             reason = "somebody logged in at the machine and took the session back";
@@ -324,8 +327,6 @@ private:
     std::vector<Screen> screens_;
     /// Streamed, but without a first frame yet; they come after screens_.
     std::vector<Screen> pending_;
-    std::unique_ptr<kwin::KWinEis> eis_;
-    std::unique_ptr<portal::EiInput> ei_;
     std::unique_ptr<kwin::DataControlClipboard> clipboard_;
     std::vector<std::optional<platform::Rect>> targets_;
     /// Set while this connection took the session from a seat: it ends when
@@ -434,13 +435,20 @@ Result<void> PlasmaHeadlessDesktop::start(const HeadlessOptions& options)
     if (!eis) {
         return std::unexpected(eis.error());
     }
-    eis_ = std::move(*eis);
-    auto ei = portal::EiInput::connect_fd(eis_->release_socket());
+    // KWin takes the devices away when this bus connection ends, so it
+    // lives, and is serviced, with the libei connection.
+    std::shared_ptr<kwin::KWinEis> kwin_eis = std::move(*eis);
+    auto ei = portal::EiInput::connect_fd(kwin_eis->release_socket());
     if (!ei) {
         log::error(log_component, "libei: {}", ei.error().message());
         return fail(Errc::io, "cannot connect to KWin's input (libei)");
     }
-    ei_ = std::move(*ei);
+    keep_input(std::make_unique<EiDesktopInput>(
+        std::move(*ei), EiDesktopInput::Companion{
+                            .owner = kwin_eis,
+                            .fd = [bus = kwin_eis.get()] { return bus->bus_fd(); },
+                            .dispatch = [bus = kwin_eis.get()] { bus->dispatch(); },
+                        }));
     start_clipboard();
     FARLAND_TRY_VOID(wait_for_first_frames(deadline));
 
@@ -983,9 +991,6 @@ bool PlasmaHeadlessDesktop::set_screen_targets(std::span<const std::optional<pla
 
 void PlasmaHeadlessDesktop::apply_targets()
 {
-    if (!ei_) {
-        return;
-    }
     // KWin names each EIS region after its output.
     std::vector<portal::EiInput::Output> outputs;
     for (std::size_t i = 0; i < std::min(targets_.size(), screens_.size()); ++i) {
@@ -993,7 +998,9 @@ void PlasmaHeadlessDesktop::apply_targets()
             outputs.push_back(portal::EiInput::Output{*targets_[i], screens_[i].output});
         }
     }
-    ei_->set_outputs(std::move(outputs));
+    change_input([outputs = std::move(outputs)](DesktopInput& input) {
+        static_cast<EiDesktopInput&>(input).ei().set_outputs(outputs);
+    });
 }
 
 }  // namespace

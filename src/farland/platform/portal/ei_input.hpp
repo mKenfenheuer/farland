@@ -23,8 +23,8 @@ struct ei_touch;
 /// through the devices the compositor creates for it.
 ///
 /// Threading: libei is not thread-safe. Everything, including dispatch(),
-/// runs on the session thread: poll fd() and call dispatch() when it becomes
-/// readable.
+/// runs on its owner's thread, in a session the input thread: poll fd() and
+/// call dispatch() when it becomes readable.
 namespace farland::platform::portal {
 
 class EiInput final : public InputSink {

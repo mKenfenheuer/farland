@@ -146,8 +146,8 @@ struct MonitorState {
 /// A Mutter RemoteDesktop session with its ScreenCast session.
 ///
 /// Threading: not thread-safe; create() blocks, afterwards every call comes
-/// from one thread at a time (the session thread). sd-bus refuses to work
-/// after fork(), so create it in the process that uses it.
+/// from one thread at a time (in a session the desktop thread). sd-bus
+/// refuses to work after fork(), so create it in the process that uses it.
 class MutterSession {
 public:
     /// Connects to the bus, waits until Mutter's RemoteDesktop and ScreenCast

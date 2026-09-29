@@ -16,7 +16,8 @@
 
 namespace farland::app {
 
-/// The client's camera in one session ([MS-RDPECAM]), on the session thread.
+/// The client's camera in one session ([MS-RDPECAM]), on the connection
+/// thread.
 ///
 /// The camera channels open once the dynamic channels are ready. When the
 /// client offers a camera and a media type farland can carry, a Video/Source

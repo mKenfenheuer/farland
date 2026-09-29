@@ -3,7 +3,12 @@
 
 # The session loop lives in a library so the end-to-end test can drive it.
 app_sources = files(
+  'farland-server/clipboard_relay.cpp',
+  'farland-server/desktop.cpp',
+  'farland-server/desktop_session.cpp',
+  'farland-server/input_thread.cpp',
   'farland-server/nla.cpp',
+  'farland-server/playback_thread.cpp',
   'farland-server/privsep_process.cpp',
   'farland-server/sandbox.cpp',
   'farland-server/session.cpp',

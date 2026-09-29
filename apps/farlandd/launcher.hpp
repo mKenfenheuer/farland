@@ -4,6 +4,7 @@
 #pragma once
 
 #include <farland/base/error.hpp>
+#include <farland/base/text.hpp>
 #include <farland/server/broker.hpp>
 
 #include "config.hpp"
@@ -32,6 +33,9 @@
 namespace farland::daemon {
 
 inline constexpr int agent_token_fd = 3;
+/// Where the session helper reads the password a client delegated, when
+/// farlandd passes one (--password-fd).
+inline constexpr int helper_password_fd = 4;
 
 /// A new agent's command line.
 struct AgentLaunch {
@@ -79,12 +83,14 @@ struct Account {
 
 /// Starts `self --session-helper` (root) for `account`: a PAM session, and
 /// the agent in it as the user. Returns the helper's pid; SIGTERM to it
-/// ends the agent and closes the session.
+/// ends the agent and closes the session. `password`, where the client
+/// delegated one, reaches the helper on a pipe of its own, for the PAM auth
+/// stack and the keyring modules in it.
 [[nodiscard]] Result<pid_t> spawn_session_helper(const std::filesystem::path& self, const AgentLaunch& launch,
                                                  const std::string& account, const std::string& rhost,
-                                                 const server::broker::Token& token);
+                                                 const server::broker::Token& token, const SecretString& password);
 
-/// `farlandd --session-helper --user NAME --desktop KIND --rhost HOST -- AGENT ARGS...`,
+/// `farlandd --session-helper --user NAME --desktop KIND --rhost HOST [--password-fd 4] -- AGENT ARGS...`,
 /// with the token on descriptor 3. Returns the exit status.
 [[nodiscard]] int run_session_helper(std::span<char*> args);
 

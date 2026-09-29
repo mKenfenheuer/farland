@@ -79,6 +79,15 @@ GraphicsPipeline::GraphicsPipeline(DynamicChannels& channels, OutputLayout layou
     channel_id_ = channels_->open(std::string(channel_name));
 }
 
+GraphicsPipeline::GraphicsPipeline(std::uint32_t channel_id, OutputLayout layout,
+                                   channels::rdpgfx::GfxServerConfig config, TileCodec codec, H264Factory make_h264,
+                                   PipelineOptions options)
+    : channels_(nullptr), channel_id_(channel_id), gfx_(config), layout_(std::move(layout)), requested_codec_(codec),
+      options_(options), make_h264_(std::move(make_h264)), holding_(true)
+{
+    FARLAND_ASSERT(layout_.width > 0 && layout_.height > 0);
+}
+
 GraphicsPipeline::GraphicsPipeline(DynamicChannels& channels, std::uint16_t width, std::uint16_t height,
                                    channels::rdpgfx::GfxServerConfig config, TileCodec codec, H264Factory make_h264,
                                    PipelineOptions options)
@@ -276,10 +285,15 @@ void GraphicsPipeline::create_encoders(Screen& s)
         if (progressive_quant_) {
             s.progressive->set_quant(*progressive_quant_);
         }
-        // A new encoder starts the client's caches over with its first
-        // stream (CLEARCODEC_FLAG_CACHE_RESET).
+        // Not a new ClearCodec encoder, unlike the others: the client keeps
+        // one context for the channel, not one per surface, and a stream
+        // that starts over at seqNumber 0 makes Windows App drop the
+        // connection (FreeRDP lets it pass).
         if (options_.clearcodec && negotiated->allows(gfx::codec::clearcodec)) {
-            s.clear.emplace();
+            if (!clear_) {
+                clear_.emplace();
+            }
+            s.clear = true;
         }
     }
 }
@@ -377,8 +391,17 @@ void GraphicsPipeline::close(std::string reason)
     log::warn(log_component, "graphics pipeline closed: {}", reason);
     closed_ = true;
     laid_out_ = false;
-    channels_->close(channel_id_);
+    if (holding_) {
+        close_held_ = true;
+    } else {
+        channels_->close(channel_id_);
+    }
     events_.emplace_back(pipeline_event::Closed{std::move(reason)});
+}
+
+GraphicsPipeline::Output GraphicsPipeline::take_output()
+{
+    return Output{.messages = std::exchange(held_, {}), .close = std::exchange(close_held_, false)};
 }
 
 void GraphicsPipeline::begin_frame(std::uint32_t timestamp)
@@ -512,7 +535,7 @@ void GraphicsPipeline::add_frame(std::size_t index, const codec::ImageView& fram
         // Counting a tile's colours walks its pixels, so it is done once per
         // changed tile and kept, indexed like `tiles`.
         std::vector<char> few(tiles.size(), 0);
-        const bool classify = s.clear.has_value() || (options_.video_regions && !s.video_unavailable);
+        const bool classify = s.clear || (options_.video_regions && !s.video_unavailable);
         if (classify) {
             for (std::size_t i = 0; i < tiles.size(); ++i) {
                 few[i] = static_cast<char>(few_colours(s, frame, tiles[i].first, tiles[i].second));
@@ -527,7 +550,7 @@ void GraphicsPipeline::add_frame(std::size_t index, const codec::ImageView& fram
         std::vector<codec::progressive::Rect> direct;
         std::vector<codec::progressive::Rect> ladder;
         const auto for_clear = [&](std::size_t i) {
-            return s.clear.has_value() && few[i] != 0 && !to_video[at(tiles[i].first, tiles[i].second)];
+            return s.clear && few[i] != 0 && !to_video[at(tiles[i].first, tiles[i].second)];
         };
         const bool small = tiles.size() <= std::size_t{options_.direct_tiles};
         for (std::size_t i = 0; i < tiles.size();) {
@@ -863,14 +886,14 @@ bool GraphicsPipeline::few_colours(const Screen& s, const codec::ImageView& fram
 
 std::size_t GraphicsPipeline::send_clear(Screen& s, const codec::ImageView& frame, const codec::progressive::Rect& area)
 {
-    if (!s.clear) {
+    if (!s.clear || !clear_) {
         return 0;  // not reached: add_frame() only calls it with an encoder
     }
     const std::size_t offset = (area.y * frame.stride) + (std::size_t{area.x} * bytes_per_pixel);
     const codec::ImageView region{
         frame.data.subspan(offset, ((area.height - 1) * frame.stride) + (std::size_t{area.width} * bytes_per_pixel)),
         area.width, area.height, frame.stride};
-    const auto stream = s.clear->encode(region);
+    const auto stream = clear_->encode(region);
     gfx_.wire_to_surface_1(s.surface, gfx::codec::clearcodec, gfx::pixel_format::xrgb_8888, to_rect16(area), stream);
     return stream.size();
 }
@@ -1167,7 +1190,11 @@ void GraphicsPipeline::flush()
     std::vector<std::byte> batch;
     const auto send_batch = [&] {
         if (!batch.empty()) {
-            channels_->send(channel_id_, zgfx_.compress(batch));
+            if (holding_) {
+                held_.push_back(zgfx_.compress(batch));
+            } else {
+                channels_->send(channel_id_, zgfx_.compress(batch));
+            }
             batch.clear();
         }
     };

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# The host's own folders in the desktop's home, on top of compose.yaml: what
+# is saved to the desktop's Documents lands in the host's Documents.
+#
+#   docker compose -f packaging/container/compose.yaml \
+#       -f packaging/container/compose.home.yaml up -d
+#
+# Docker Desktop and Podman on macOS share the Mac's files with whoever
+# reads them inside, so the account reads and writes them as the Mac's own
+# user, and macOS asks once whether Docker (or Podman) may open the Desktop,
+# Documents and Downloads folders. On a Linux host the files keep their
+# owners, so the account's uid (FARLAND_USER's home) has to be the host
+# user's for it to write there. macOS calls the videos folder Movies; on
+# Linux, change that line to Videos.
+#
+# Folders of your own go in compose.local.yaml beside this file, which git
+# ignores, in the same form.
+
+x-home-folders: &home-folders
+  - ${HOME}/Desktop:/home/${FARLAND_USER:-farland}/Desktop
+  - ${HOME}/Documents:/home/${FARLAND_USER:-farland}/Documents
+  - ${HOME}/Downloads:/home/${FARLAND_USER:-farland}/Downloads
+  - ${HOME}/Pictures:/home/${FARLAND_USER:-farland}/Pictures
+  - ${HOME}/Music:/home/${FARLAND_USER:-farland}/Music
+  - ${HOME}/Movies:/home/${FARLAND_USER:-farland}/Videos
+
+services:
+  gnome:
+    volumes: *home-folders
+  plasma:
+    volumes: *home-folders

@@ -17,3 +17,8 @@ compile_commands.json
 .vscode/
 .idea/
 .DS_Store
+
+# The compose file's variables, with the account's password.
+/packaging/container/.env
+# Mounts of one's own for the desktop containers.
+/packaging/container/compose.local.yaml

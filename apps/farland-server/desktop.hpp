@@ -8,6 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -29,6 +32,28 @@ enum class DesktopEnd : std::uint8_t {
     taken_at_the_machine,
 };
 
+/// A desktop's input connection apart from the rest of it, so that one
+/// thread owns it: the session's input thread takes it for as long as the
+/// session runs (Desktop::take_input()) and gives it back. Only its owner
+/// calls it, apart from closed().
+class DesktopInput {
+public:
+    DesktopInput() = default;
+    DesktopInput(const DesktopInput&) = delete;
+    DesktopInput& operator=(const DesktopInput&) = delete;
+    DesktopInput(DesktopInput&&) = delete;
+    DesktopInput& operator=(DesktopInput&&) = delete;
+    virtual ~DesktopInput() = default;
+
+    [[nodiscard]] virtual platform::InputSink& sink() = 0;
+    /// Poll these for readability, then call dispatch().
+    [[nodiscard]] virtual std::vector<int> fds() const = 0;
+    virtual void dispatch() = 0;
+    /// The connection is gone for good. From any thread; as of the last
+    /// dispatch().
+    [[nodiscard]] virtual bool closed() const = 0;
+};
+
 /// A desktop that sessions show and control (docs/PLAN.md §3.3): frames, the
 /// cursor and an input sink, plus the descriptors the session loop polls.
 /// Without one, sessions show the synthetic test pattern.
@@ -37,7 +62,9 @@ enum class DesktopEnd : std::uint8_t {
 /// and cursor; frames() and cursor() are the first. The session puts them on
 /// the client's monitors (server::DisplayLayout).
 ///
-/// One session at a time uses a desktop, on the session's thread.
+/// One session at a time uses a desktop, on the session's desktop thread; its
+/// input goes to the session's input thread where the backend can let it
+/// (take_input(), docs/PLAN.md §3.6).
 class Desktop {
 public:
     Desktop() = default;
@@ -50,6 +77,8 @@ public:
     [[nodiscard]] virtual platform::FrameSource& frames() = 0;
     /// Null when the backend cannot deliver the cursor apart from the frames.
     [[nodiscard]] virtual platform::CursorSource* cursor() = 0;
+    /// The input sink, where the input cannot leave the desktop thread
+    /// (take_input() gave none).
     [[nodiscard]] virtual platform::InputSink& input() = 0;
     /// Descriptors, besides the sources' wake fds, whose readiness calls for
     /// dispatch() (the input connection, the portal's D-Bus connection).
@@ -127,6 +156,49 @@ public:
     /// The desktop's clipboard; null when the backend has none or was not
     /// granted access.
     [[nodiscard]] virtual platform::Clipboard* clipboard() { return nullptr; }
+
+    /// A change the desktop makes to its input connection (where the screens
+    /// are, for absolute motion), to run on the input's owner.
+    using InputChange = std::function<void(DesktopInput&)>;
+    /// Hands the input connection to the session's input thread, which owns
+    /// it until give_back_input(); `post` runs the desktop's changes to it
+    /// there meanwhile, from whichever thread makes them. Null when this
+    /// desktop's input cannot leave the desktop thread: input() then.
+    [[nodiscard]] std::unique_ptr<DesktopInput> take_input(std::function<void(InputChange)> post);
+    /// Takes the input connection back once the input thread stopped.
+    /// `catch_up` applies the changes posted after the thread stopped taking
+    /// them, under the lock change_input() posts under, so that none is lost.
+    void give_back_input(std::unique_ptr<DesktopInput> input, const InputChange& catch_up);
+
+protected:
+    /// Backends whose input can have a thread of its own keep it here.
+    void keep_input(std::unique_ptr<DesktopInput> input);
+    /// Runs `change` on the input connection: now while the desktop has it,
+    /// on the input thread while a session does.
+    void change_input(const InputChange& change);
+    /// The input connection's descriptors while the desktop has it, for
+    /// dispatch_fds(); none while a session's input thread does.
+    [[nodiscard]] std::vector<int> input_fds() const;
+    /// Services the input connection while the desktop has it, for
+    /// dispatch().
+    void dispatch_input();
+    /// The kept input connection's sink, for input(). Only while the desktop
+    /// has it: a session that took the input never calls input().
+    [[nodiscard]] platform::InputSink& held_sink();
+    /// Whether the input connection closed, wherever it is.
+    [[nodiscard]] bool input_closed() const { return input_view_ != nullptr && input_view_->closed(); }
+    /// Destroys the input connection first, where the backend's teardown
+    /// needs that. Only while the desktop has it.
+    void drop_input();
+
+private:
+    /// The handover: take_input() and change_input() come from different
+    /// threads (a session's, and farland-agent's own).
+    mutable std::mutex input_mutex_;
+    std::unique_ptr<DesktopInput> input_;
+    /// The input connection wherever it is, for closed().
+    DesktopInput* input_view_ = nullptr;
+    std::function<void(InputChange)> post_input_;
 };
 
 }  // namespace farland::app

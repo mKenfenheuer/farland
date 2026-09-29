@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+[Desktop Entry]
+Type=Application
+Name=farland keyboard layout
+Comment=Applies FARLAND_KEYBOARD to the session
+Exec=/usr/local/bin/farland-keyboard
+OnlyShowIn=GNOME;
+NoDisplay=true

@@ -273,7 +273,7 @@ struct PipeWireCapture::Impl {
     pw_registry* registry = nullptr;
     pw_stream* stream = nullptr;
     spa_source* renegotiate_event = nullptr;
-    /// Requeues the buffers in `returned`; signalled by the session thread.
+    /// Requeues the buffers in `returned`; signalled by the desktop thread.
     spa_source* release_event = nullptr;
     spa_hook core_listener{};
     spa_hook registry_listener{};
@@ -304,7 +304,7 @@ struct PipeWireCapture::Impl {
     bool warned_few_buffers = false;
     bool logged_held = false;
 
-    // Shared between the loop thread and the session thread. Lock order: the
+    // Shared between the loop thread and the desktop thread. Lock order: the
     // loop lock (held in every callback) before `mutex`.
     mutable std::mutex mutex;
     FrameAccess wanted_access = FrameAccess::cpu;

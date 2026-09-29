@@ -36,6 +36,15 @@ using pw_host::UniqueFd;
 // SPA_AUDIO_FORMAT_S16_LE samples are copied as int16_t.
 static_assert(std::endian::native == std::endian::little, "farland's PipeWire audio assumes a little-endian host");
 
+/// node.latency for a quantum of at least `quantum`. PipeWire rounds the
+/// latency a node asks for down to a power of two, so 10 ms at 48 kHz (480)
+/// would run the whole graph every 256 frames, 5.3 ms: round up instead, so
+/// that the graph gets at least what was asked for.
+std::string node_latency(const audio::PcmFormat& format, std::chrono::milliseconds quantum)
+{
+    return std::format("{}/{}", std::bit_ceil(std::max<std::size_t>(format.frames(quantum), 1)), format.rate);
+}
+
 /// Drops the oldest whole frames of `ring` beyond `max_samples`.
 void trim(std::vector<std::int16_t>& ring, std::size_t max_samples, std::uint16_t channels)
 {
@@ -91,7 +100,7 @@ public:
             return fail(Errc::io, "cannot create an eventfd");
         }
         FARLAND_TRY_VOID(host_.connect("farland-audio-out", wake_.get()));
-        const std::string latency = std::format("{}/{}", format_.frames(options_.quantum), format_.rate);
+        const std::string latency = node_latency(format_, options_.quantum);
         const std::array<spa_dict_item, 7> items{{
             {PW_KEY_MEDIA_TYPE, "Audio"},
             {PW_KEY_MEDIA_CATEGORY, "Capture"},
@@ -203,7 +212,7 @@ public:
     [[nodiscard]] Result<void> start()
     {
         FARLAND_TRY_VOID(host_.connect("farland-microphone", -1));
-        const std::string latency = std::format("{}/{}", format_.frames(options_.quantum), format_.rate);
+        const std::string latency = node_latency(format_, options_.quantum);
         const std::array<spa_dict_item, 7> items{{
             {PW_KEY_MEDIA_TYPE, "Audio"},
             // Audio/Source/Virtual, as virtual devices of PipeWire modules have it,

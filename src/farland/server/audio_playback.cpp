@@ -243,7 +243,8 @@ bool AudioPlayback::should_drop(Clock::time_point now)
         floor = floor_previous_;
     }
     const milliseconds limit =
-        floor ? std::min(*floor + options_.max_backlog, options_.hard_limit) : options_.startup_limit;
+        floor ? std::min(std::max(*floor + options_.max_backlog, options_.min_limit), options_.hard_limit)
+              : options_.min_limit;
     return backlog > std::max(limit, options_.packet_duration);
 }
 

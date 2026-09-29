@@ -5,14 +5,26 @@
 
 #include <farland/base/log.hpp>
 
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <functional>
+#include <poll.h>
+#include <span>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 #ifdef FARLAND_HAVE_LIBSYSTEMD
-#include <cstdint>
-#include <cstring>
 #include <memory>
 #include <systemd/sd-bus.h>
 #endif
@@ -23,7 +35,169 @@ namespace {
 
 [[maybe_unused]] constexpr std::string_view log_component = "agent.unlock";
 
+// gnome-keyring's control protocol, as pam/gkr-pam-client.c speaks it: one
+// credentials byte, then a packet of [u32 length][u32 operation] and each
+// argument as [u32 length][bytes], all big-endian; the answer is
+// [u32 8][u32 result].
+constexpr std::uint32_t keyring_op_unlock = 1;
+constexpr std::uint32_t keyring_result_ok = 0;
+constexpr std::uint32_t keyring_result_denied = 1;
+
+void put_u32(std::vector<std::byte>& out, std::uint32_t value)
+{
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<std::byte>((value >> static_cast<unsigned>(shift)) & 0xFFU));
+    }
+}
+
+/// Closes on scope exit.
+class Socket {
+public:
+    explicit Socket(int fd) noexcept : fd_(fd) {}
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    Socket(Socket&&) = delete;
+    Socket& operator=(Socket&&) = delete;
+    ~Socket()
+    {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    [[nodiscard]] int get() const noexcept { return fd_; }
+
+private:
+    int fd_;
+};
+
+bool write_all(int fd, std::span<const std::byte> data)
+{
+    while (!data.empty()) {
+        const auto n = ::send(fd, data.data(), data.size(), MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        data = data.subspan(static_cast<std::size_t>(n));
+    }
+    return true;
+}
+
+bool read_all(int fd, std::span<std::byte> data, std::chrono::milliseconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!data.empty()) {
+        const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+        if (left.count() <= 0 || ::poll(&pfd, 1, static_cast<int>(left.count())) <= 0) {
+            return false;
+        }
+        const auto n = ::recv(fd, data.data(), data.size(), 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        data = data.subspan(static_cast<std::size_t>(n));
+    }
+    return true;
+}
+
 }  // namespace
+
+Result<void> unlock_the_keyring(const SecretString& password, std::chrono::milliseconds timeout,
+                                const std::function<void()>& still_waiting)
+{
+    if (password.empty()) {
+        return fail(Errc::io, "the client delegated no password to unlock the keyring with");
+    }
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (runtime == nullptr || *runtime == '\0') {
+        return fail(Errc::io, "no XDG_RUNTIME_DIR");
+    }
+    const std::filesystem::path control = std::filesystem::path(runtime) / "keyring" / "control";
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string path = control.string();
+    if (path.size() >= sizeof(address.sun_path)) {
+        return fail(Errc::io, "the keyring's control socket path is too long");
+    }
+    std::memcpy(static_cast<char*>(address.sun_path), path.c_str(), path.size() + 1);
+
+    // gnome-session starts the daemon beside the shell, so it can still be
+    // on its way when the desktop is.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int fd = -1;
+    for (;;) {
+        fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            log::warn(log_component, "socket: {}", std::strerror(errno));
+            return fail(Errc::io, "cannot make a socket for the keyring daemon");
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0) {
+            break;
+        }
+        const int error = errno;
+        ::close(fd);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (error == ENOENT || error == ECONNREFUSED) {
+                return fail(Errc::io, "no GNOME Keyring daemon in this session");
+            }
+            log::warn(log_component, "{}: {}", path, std::strerror(error));
+            return fail(Errc::io, "cannot reach the keyring daemon");
+        }
+        if (still_waiting) {
+            still_waiting();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    const Socket socket(fd);
+
+    const auto secret = password.view();
+    std::vector<std::byte> packet;
+    packet.reserve(1 + 12 + secret.size());
+    packet.push_back(std::byte{0});  // the credentials byte; the daemon checks our uid itself
+    put_u32(packet, static_cast<std::uint32_t>(12 + secret.size()));
+    put_u32(packet, keyring_op_unlock);
+    put_u32(packet, static_cast<std::uint32_t>(secret.size()));
+    for (const char c : secret) {
+        packet.push_back(static_cast<std::byte>(c));
+    }
+    const bool sent = write_all(socket.get(), packet);
+    secure_zero(std::span(packet));
+    if (!sent) {
+        return fail(Errc::io, "cannot talk to the keyring daemon");
+    }
+    std::array<std::byte, 8> reply{};
+    if (!read_all(socket.get(), reply, std::chrono::seconds(10))) {
+        return fail(Errc::io, "the keyring daemon did not answer");
+    }
+    const auto u32 = [&reply](std::size_t at) {
+        std::uint32_t value = 0;
+        for (std::size_t i = 0; i < 4; ++i) {
+            value = (value << 8U) | std::to_integer<std::uint32_t>(reply.at(at + i));
+        }
+        return value;
+    };
+    if (u32(0) != 8) {
+        return fail(Errc::io, "the keyring daemon answered something else");
+    }
+    switch (u32(4)) {
+    case keyring_result_ok:
+        log::info(log_component, "the login keyring is unlocked");
+        return {};
+    case keyring_result_denied:
+        return fail(Errc::invalid_value, "the keyring does not take this password (it was made with another one)");
+    default:
+        log::warn(log_component, "the keyring daemon answered UNLOCK with result {}", u32(4));
+        return fail(Errc::io, "the keyring daemon could not unlock the keyring");
+    }
+}
 
 #ifdef FARLAND_HAVE_LIBSYSTEMD
 

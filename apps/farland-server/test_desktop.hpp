@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 
 namespace farland::app {
@@ -21,7 +22,9 @@ namespace farland::app {
 /// last keys, the pointer's crosshair) stays until the next connection. Its
 /// one screen is virtual and takes the client's size.
 ///
-/// Used on one thread at a time, like every Desktop.
+/// Used on the session's desktop thread, like every Desktop, and its input
+/// on the session's input thread: the pattern that frames show and input
+/// draws on is behind a mutex.
 class TestDesktop final : public Desktop {
 public:
     using Clock = std::chrono::steady_clock;
@@ -75,8 +78,24 @@ private:
         TestDesktop& desktop_;
     };
 
+    /// Hands input to the session's input thread; it has nothing to poll.
+    class InputConnection final : public DesktopInput {
+    public:
+        explicit InputConnection(Input& input) : input_(input) {}
+        [[nodiscard]] platform::InputSink& sink() override { return input_; }
+        [[nodiscard]] std::vector<int> fds() const override { return {}; }
+        void dispatch() override {}
+        [[nodiscard]] bool closed() const override { return false; }
+
+    private:
+        Input& input_;
+    };
+
     void pointer_event(std::uint16_t flags);
 
+    /// The pattern and what input left on it; frames read it on the session
+    /// thread, input writes it on the input thread.
+    mutable std::mutex mutex_;
     server::TestPattern pattern_;
     Clock::time_point started_ = Clock::now();
     Clock::duration interval_;

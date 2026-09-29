@@ -3,12 +3,19 @@
 #
 # PAM configuration for farlandd (Debian and Ubuntu layout).
 #
-# farlandd opens a session here for users whom NLA already authenticated, so
-# a login never runs the auth stack; it is used only when farlandctl passwd
-# checks an account's password for self-enrolment. The account stack decides
+# farlandd opens a session here for users whom NLA already authenticated.
+# Where the client delegated its password over NLA, farlandd first runs the
+# auth stack with it, so that the keyring modules below keep the login
+# password and unlock the user's keyring, as a login at a greeter does; a
+# password the stack turns down only leaves the keyring locked, and the
+# session opens all the same. farlandctl passwd also uses the auth stack, to
+# check an account's password for self-enrolment. The account stack decides
 # whether the account may log in at all (expired, locked). The session stack
 # must include pam_systemd, which registers the remote wayland session with
 # logind and starts the user's service manager and XDG_RUNTIME_DIR.
+#
+# The keyring lines start with "-": PAM skips a module that is not
+# installed (libpam-gnome-keyring, libpam-kwallet5).
 #
 # Fedora and Arch: replace the @include lines with
 #   auth     include system-remote-login
@@ -16,6 +23,8 @@
 #   session  include system-remote-login
 
 @include common-auth
+-auth     optional  pam_gnome_keyring.so
+-auth     optional  pam_kwallet5.so
 @include common-account
 session  required  pam_loginuid.so
 session  optional  pam_keyinit.so force revoke
@@ -23,3 +32,5 @@ session  required  pam_limits.so
 session  required  pam_env.so readenv=1
 session  required  pam_env.so readenv=1 envfile=/etc/default/locale
 @include common-session
+-session  optional  pam_gnome_keyring.so auto_start
+-session  optional  pam_kwallet5.so auto_start

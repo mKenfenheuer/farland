@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# .containerignore for Docker, which reads only this name: a build directory
+# of a host with a different libc is both large and useless inside the
+# image, and one named "build" would stand where the image builds.
+.git
+build
+build-*
+subprojects/*/
+!subprojects/*.wrap
+!subprojects/packagefiles
+packaging/kwin
+packaging/mutter
+*.deb
+*.rpm
+# The compose variables, with the account's password.
+packaging/container/.env

@@ -19,10 +19,11 @@
 /// libei) and the test backend implement them.
 ///
 /// Threading: a backend may run threads of its own (PipeWire's loop, say).
-/// The session runs a single poll loop: each source has a `wake_fd()` that
-/// becomes readable when something new is pending, and the session then calls
-/// the `take_*` method on its own thread. Input goes the other way, always
-/// from the session thread.
+/// Its owner runs a poll loop: each source has a `wake_fd()` that becomes
+/// readable when something new is pending, and the owner then calls the
+/// `take_*` method on its own thread. In a session the sources belong to the
+/// desktop thread and input to the input thread, each of which calls only
+/// what it owns (docs/PLAN.md §3.6).
 namespace farland::platform {
 
 /// A rectangle in desktop pixels.

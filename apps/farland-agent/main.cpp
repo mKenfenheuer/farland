@@ -229,6 +229,10 @@ int main(int argc, char** argv)
         headless.kind = *app::parse_headless_kind(options.desktop);
         headless.attach = options.attach;
         headless.cage_command = options.cage_command;
+        // GDM starts a GNOME session without authenticating anybody, so its
+        // keyring is the agent's to unlock (unlock.hpp). farland's own
+        // sessions had the PAM auth stack do it.
+        config.unlock_keyring = headless.kind == app::HeadlessKind::gnome;
         config.make_desktop = [headless](const farland::agent::DesktopRequest& request) mutable {
             headless.width = request.width;
             headless.height = request.height;

@@ -65,7 +65,8 @@ These rules exist because most FreeRDP CVEs are missing bounds checks in parsers
 4. **Every new parser gets a fuzz target** in `fuzz/`, with seeds in `fuzz/corpus/<target>/`. Where encoder and decoder both exist, the target checks that values round-trip.
 5. **Cite the specification section** next to each structure (docs/SPECS.md).
 6. **Protocol code is sans-IO:** no sockets, threads or clocks in `proto`, `auth` or `channels`. Bytes and events in, bytes and events out.
-7. **Pre-authentication runs sandboxed.** Everything a client sends before NLA succeeds is parsed in the network process (`apps/farland-server/privsep_process.cpp`). That process cannot open files, create sockets or start processes, and gets randomness only from OpenSSL's `RAND_bytes`. Code on that path that needs another system call must add it to the seccomp allowlist in `apps/farland-server/sandbox.cpp`, with a comment saying why. Without that, the call fails with `EPERM`. Test it with the privilege-separation tests on Linux.
+7. **One thread, one job** in a session (docs/PLAN.md §3.6): a new job gets a thread of its own and talks to the others by queue, and code that runs on one job's thread does not reach into another's state. Where a backend makes two jobs share a connection, say so where the class is declared.
+8. **Pre-authentication runs sandboxed.** Everything a client sends before NLA succeeds is parsed in the network process (`apps/farland-server/privsep_process.cpp`). That process cannot open files, create sockets or start processes, and gets randomness only from OpenSSL's `RAND_bytes`. Code on that path that needs another system call must add it to the seccomp allowlist in `apps/farland-server/sandbox.cpp`, with a comment saying why. Without that, the call fails with `EPERM`. Test it with the privilege-separation tests on Linux.
 
 ## Style
 

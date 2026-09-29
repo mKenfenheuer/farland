@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ssh -o ConnectTimeout=8 max@10.1.250.18 'hostname; uname -a; kwin_wayland --version 2>/dev/null; ls ~/ ; ls ~/farland 2>/dev/null | head')"
+      "Bash(ssh -o ConnectTimeout=8 max@10.1.250.18 'hostname; uname -a; kwin_wayland --version 2>/dev/null; ls ~/ ; ls ~/farland 2>/dev/null | head')",
+      "WebFetch(domain:handbook.gnome.org)",
+      "WebFetch(domain:discourse.gnome.org)",
+      "Bash(git submodule *)",
+      "Bash(diskutil list *)",
+      "Bash(diskutil apfs *)"
     ]
   }
 }

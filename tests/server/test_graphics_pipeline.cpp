@@ -346,6 +346,52 @@ TEST_CASE("GFX: Progressive frames decode to the picture")
     }
 }
 
+TEST_CASE("GFX: a pipeline without the channels leaves everything it sends to their thread")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    gfx::GfxServerConfig config;
+    config.avc420 = config.avc444 = config.avc444v2 = false;
+    // The channels' thread opens the channel; the pipeline only knows its ID.
+    const auto opened = channels.open(std::string(GraphicsPipeline::channel_name));
+    const std::array one{std::pair<std::uint32_t, std::uint32_t>{width, height}};
+    GraphicsPipeline pipeline(opened, farland::server::DisplayLayout::single(width, height).place(one), config,
+                              TileCodec::progressive, {},
+                              farland::server::PipelineOptions{.clearcodec = false, .refine = false});
+    CHECK(pipeline.channel_id() == opened);
+    const auto carry = [&] {
+        auto output = pipeline.take_output();
+        for (const auto& message : output.messages) {
+            REQUIRE(channels.send(opened, message));
+        }
+        if (output.close) {
+            channels.close(opened);
+        }
+    };
+
+    const auto id = std::get<dyn::CreateRequest>(client.take().at(0)).channel_id;
+    REQUIRE(id == opened);
+    send(channels, dyn::CreateResponse{id, 0});
+    dispatch(channels, pipeline);
+    const gfx::CapsAdvertise advertise{{gfx::make_capability_set(gfx::cap_version::v10_7, 0)}};
+    send(channels, dyn::Data{id, gfx::encode(gfx::Pdu{advertise})});
+    dispatch(channels, pipeline);
+    REQUIRE(pipeline.ready());
+    CHECK(client.take_gfx(id).empty());  // nothing went out by itself
+    carry();
+    CHECK(client.take_gfx(id).size() == 4);  // the surface setup, once carried
+
+    farland::server::TestPattern pattern(width, height);
+    REQUIRE(pipeline.send_frame(pattern.render(0)).has_value());
+    CHECK(client.take_gfx(id).empty());
+    carry();
+    const auto pdus = client.take_gfx(id);
+    REQUIRE_FALSE(pdus.empty());
+    CHECK(std::holds_alternative<gfx::StartFrame>(pdus.front()));
+    CHECK(std::holds_alternative<gfx::EndFrame>(pdus.back()));
+}
+
 TEST_CASE("GFX: thin clients get planar instead of Progressive")
 {
     Client client;
@@ -1007,6 +1053,62 @@ TEST_CASE("GFX: text through ClearCodec, pictures through Progressive, refined w
     // A picture that stands still ends up exact: ClearCodec for the text,
     // the lossless pass for what Progressive left quantized.
     CHECK(fine == pixels);
+}
+
+TEST_CASE("GFX: ClearCodec carries on across a new layout, as the client's one context does")
+{
+    Client client;
+    DynamicChannels channels(client.sink());
+    start_channels(client, channels);
+    gfx::GfxServerConfig config;
+    config.avc420 = config.avc444 = config.avc444v2 = false;
+    GraphicsPipeline pipeline(channels, width, height, config, TileCodec::progressive);
+    const auto id = establish(client, channels, pipeline);
+
+    // Black strokes on white everywhere: every tile goes through ClearCodec.
+    const auto text = [](std::uint32_t w, std::uint32_t h) {
+        Bytes pixels(std::size_t{w} * h * 4);
+        for (std::uint32_t y = 0; y < h; ++y) {
+            for (std::uint32_t x = 0; x < w; ++x) {
+                const auto at = ((std::size_t{y} * w) + x) * 4;
+                const auto ink = static_cast<std::byte>(((x / 3) + (y / 5)) % 4 == 0 ? 0x00 : 0xFF);
+                pixels[at] = pixels[at + 1] = pixels[at + 2] = ink;
+                pixels[at + 3] = std::byte{0xFF};
+            }
+        }
+        return pixels;
+    };
+    // The client, with one ClearCodec context for the channel: it follows
+    // the sequence number exactly and is never reset, as Windows App's.
+    farland::codec::clear::Decoder decoder;
+    const auto clear_regions = [&](std::uint32_t w, std::uint32_t h) {
+        Bytes surface(std::size_t{w} * h * 4);
+        std::size_t regions = 0;
+        for (const auto& pdu : client.take_gfx(id)) {
+            if (const auto* w1 = std::get_if<gfx::WireToSurface1>(&pdu); w1 && w1->codec_id == gfx::codec::clearcodec) {
+                const auto r = w1->dest_rect;
+                const auto out = std::span(surface).subspan(((std::size_t{r.top} * w) + r.left) * 4);
+                REQUIRE(decoder.decode(w1->bitmap_data, r.width(), r.height(), out, std::size_t{w} * 4).has_value());
+                ++regions;
+            }
+        }
+        return regions;
+    };
+
+    const auto before = text(width, height);
+    REQUIRE(pipeline.send_frame({before, width, height, std::size_t{width} * 4}).has_value());
+    CHECK(clear_regions(width, height) > 0);
+
+    // A new size, as when the client's window is not the desktop's: new
+    // surfaces after ResetGraphics, and the ClearCodec streams on them go on
+    // from the sequence number the old ones left.
+    constexpr std::uint32_t new_width = 200;
+    constexpr std::uint32_t new_height = 120;
+    const std::array one{std::pair<std::uint32_t, std::uint32_t>{new_width, new_height}};
+    pipeline.set_layout(farland::server::DisplayLayout::single(new_width, new_height).place(one));
+    const auto after = text(new_width, new_height);
+    REQUIRE(pipeline.send_frame({after, new_width, new_height, std::size_t{new_width} * 4}).has_value());
+    CHECK(clear_regions(new_width, new_height) > 0);
 }
 
 TEST_CASE("GFX: frames without a picture refine what a desktop standing still left coarse")

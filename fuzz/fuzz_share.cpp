@@ -3,7 +3,8 @@
 
 // Everything that arrives on the MCS I/O channel after the connection is
 // set up: share control and data PDUs, capability sets, Client Info and
-// licensing; plus the output-side decoders a future client will run.
+// licensing; plus the output-side decoders the tests read the server's
+// output with.
 
 #include <farland/proto/bitmap.hpp>
 #include <farland/proto/capabilities.hpp>

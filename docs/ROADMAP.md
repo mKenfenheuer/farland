@@ -1,11 +1,10 @@
 # farland: roadmap
 
-The phases follow the decisions in [PLAN.md](PLAN.md): the server first, in C++, on our own protocol core. Durations are rough estimates for 1–2 full-time engineers and assume the macRDP and ZeroVDI code can be ported. Every milestone ends with a tagged pre-release and a passing interop matrix.
+The milestones follow the decisions in [PLAN.md](PLAN.md): an RDP server, in C++, on our own protocol core. Durations are rough estimates for 1–2 full-time engineers and assume the macRDP and ZeroVDI code can be ported. Every milestone ends with a tagged pre-release and a passing interop matrix.
 
 ```
-Phase 1: server 1.0                                         Phase 2: client          Phase 3
-M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► server 1.0     C1 ─ C2 ─ C3 ─ C4 ─ C5 ─► 1.0   U1 UDP, AV1, RAIL server
-~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)       (≈ 9 months)
+M0 ─ M1 ─ M2 ─ M3 ─ M4 ─ M5 ─ M6 ─ M7 ─ M8 ─► 1.0      after 1.0: UDP, AV1, RemoteApp
+~2   ~5   ~4   ~7   ~6   ~7   ~7   ~7   ~4  weeks (≈ 12 months)
 ```
 
 **Status (2026-09-19):** M0 to M3 are done; each has a status note below that lists what differs from the plan and what is still untested. M4 is implemented and works on GNOME and Plasma; its latency is measured and the codecs are the whole budget, so the 50 ms target needs the GPU encoder neither test machine has. M5 and M6 are implemented; what is left of both needs mstsc, Windows App or hardware the test machines do not have. M7's multi-session daemon works, with headless GNOME, Plasma, sway, labwc and cage sessions per user, sessions that survive a farlandd restart, `farlandctl sessions`/`terminate`, Prometheus metrics, Kerberos, and packaging as deb, rpm, an AUR recipe and a container image, and it has been reached from mstsc and Windows App (S0, S1, S3, S4, S5 and the GNOME half of S2).
@@ -14,7 +13,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 
 ---
 
-## Phase 1: server
+## Milestones to 1.0
 
 ### M0: Foundations (~2 weeks): done
 - Set up the repo with Meson, clang-format/clang-tidy and a pre-commit hook. CI on GCC and Clang: debug, ASan+UBSan, TSan and hardened-release builds.
@@ -303,7 +302,7 @@ Some milestones can overlap: once M3 is done, M5 (codecs) and M6 (channels) can 
 - **rdpsnd (MS-RDPEA):** PipeWire monitor capture; PCM, then Opus/AAC formats where the client supports them. Wave-confirm flow control.
   - **Status: implemented, tried with FreeRDP only.**
     - Sans-IO codec and server (`channels::rdpsnd`, `RdpsndServer`): formats, quality mode, training, Wave2 for version 8 clients and WaveInfo/Wave for older ones, wave confirm, close, volume. UDP (Crypt Key, Wave Encrypt, UDP Wave) is not implemented.
-    - Transport: AUDIO_PLAYBACK_DVC first, as Windows servers and gnome-remote-desktop do, and the "rdpsnd" static channel when the client refuses it or has no drdynvc. AUDIO_PLAYBACK_LOSSY_DVC needs UDP (phase 3).
+    - Transport: AUDIO_PLAYBACK_DVC first, as Windows servers and gnome-remote-desktop do, and the "rdpsnd" static channel when the client refuses it or has no drdynvc. AUDIO_PLAYBACK_LOSSY_DVC needs UDP (after 1.0).
     - Formats: Opus 48 kHz stereo (libopus loaded at runtime, BSD) for clients asking for dynamic or medium quality, PCM 48/44.1/22.05 kHz stereo otherwise. FreeRDP decodes Opus when built with it; Windows clients do not take Opus. AAC (0xA106), which Windows clients decode, would need an AAC encoder: fdk-aac's licence is not Apache-compatible and FFmpeg's is LGPL, so it is left for an optional runtime-loaded backend.
     - Capture: the default sink's monitor (`stream.capture.sink`) in the user's PipeWire, only while a client plays; PipeWire resamples.
     - Flow control: 20 ms packets; audio unconfirmed beyond the lowest backlog of the last seconds plus 100 ms is dropped, not queued (400 ms before the first confirmation, 1 s at most). 1 s of digital silence stops the stream with a Close PDU. In dynamic quality the Opus bitrate follows the auto-detected bandwidth.
@@ -523,33 +522,20 @@ Multi-session with headless desktops behind one port (decided 2026-09-14).
 
 ---
 
-## Phase 2: native Wayland client (~9 months)
-
-| Milestone | Content |
-|---|---|
-| **C1: Client core** | The client role of the sans-IO state machines. CredSSP initiator with NTLM (port ZeroVDI `NtlmClient`, plus channel bindings and flag intersection) and **Kerberos/SPNEGO via GSSAPI**. TLS verification with a known_hosts/TOFU store (the ZeroVDI `HostCertificatePolicy` model). Correct GCC/Client Info (time zone, ARC cookie), licensing, server redirection (port ZeroVDI's parser and tests), auto-reconnect |
-| **C2: Decoders and presentation** | Decoders: planar, interleaved RLE, ClearCodec and Progressive (port ZeroVDI's C#/JS, the FreeRDP-faithful versions), ZGFX/MPPC/NCRUSH/XCRUSH, AVC420/444 through **VA-API** (FFmpeg fallback) with GPU YUV444 composition. Wayland presentation via **linux-dmabuf-v1** + Vulkan or EGL, `wp_fractional_scale_v1` + viewporter, `wp_presentation` timing. The decoders get fuzzed from day one; this is the area where FreeRDP's CVEs cluster |
-| **C3: Wayland-native input and UX** | xkb keymap → scancodes, `keyboard-shortcuts-inhibit`, `relative-pointer` + `pointer-constraints`, `text-input-v3` (IME → Unicode events), `xdg-decoration`, `color-management-v1`, tablet and touch → rdpei, multimon (fullscreen per output + disp layout), a GTK4 or Qt connection manager |
-| **C4: Channels** | cliprdr (text/HTML/images/files via `wl_data_device` + primary selection), rdpsnd/audin (PipeWire), rdpdr drive and smartcard (PC/SC), rdpecam, USB (urbdrc, stretch goal) |
-| **C5: Enterprise** | RD Gateway (RDG over HTTP + WebSocket only, no RPC-over-HTTP), **Entra ID/RDSAAD** login, RDSTLS, Restricted Admin / Remote Credential Guard, **RemoteApp (RAIL) with each window as its own `xdg_toplevel`**, `.rdp` file import, and a `libfarland` C API for Remmina/GNOME Connections/KRDC plugins |
-
-**Client 1.0 exit:** daily-drivable against Windows 11/Server 2025 and farland servers, with feature parity with `sdl-freerdp` on the commonly used channels, and better Wayland integration.
-
----
-
-## Phase 3: beyond parity
-- **U1: UDP transport:** MS-RDPEUDP (reliable and lossy) and MS-RDPEMT multitransport, for both roles. Neither FreeRDP version has this.
-- **AV1** GFX codec (encode with VA-API/NVENC, decode with dav1d).
-- Server-side **RemoteApp** (RAIL) for Wayland applications in headless sessions.
-- Server-side rdpdr: client drives mounted with FUSE.
+## After 1.0
+- **UDP transport:** MS-RDPEUDP (reliable and lossy) and MS-RDPEMT multitransport. FreeRDP's server does not have it.
+- **AV1** GFX codec, encoded with VA-API or NVENC.
+- **RemoteApp** (RAIL) for Wayland applications in headless sessions.
+- rdpdr: the client's drives in the session, mounted with FUSE.
 - HDR and wide-gamut paths, where the protocol allows them.
 
 ---
 
 ## Not in scope (deliberately)
+- An RDP client. farland is a server for the clients people already use.
 - Standard RDP security (RC4) and FIPS mode.
-- Legacy GDI drawing orders (primary/secondary/alternate) and glyph/bitmap caches in the client.
-- RemoteFX classic as a server codec (NSCodec decode only if a client-side need appears).
+- Legacy GDI drawing orders (primary/secondary/alternate) and glyph/bitmap caches.
+- RemoteFX classic and NSCodec as codecs.
 - TSMF.
 - RPC-over-HTTP gateway (TSG).
 - X11 capture backends. Use Xwayland-in-headless-compositor or the existing tools instead.

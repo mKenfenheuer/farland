@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# The desktop images (Containerfile.desktop) with what outlives a rebuild on
+# volumes of their own: GNOME on port 3389, Plasma on 3390. Plasma needs a
+# GPU render node, which Docker Desktop on macOS does not have and Podman's
+# libkrun machine does; docs/CONTAINERS.md has the details. Both, or one:
+#
+#   FARLAND_USER=alice FARLAND_PASSWORD=secret \
+#       docker compose -f packaging/container/compose.yaml up -d [gnome|plasma]
+#   xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:tofu /dynamic-resolution /timeout:60000
+#
+# That runs the images CI publishes. --build builds them from this checkout
+# instead, which is how packages beyond the desktop go in: the variable
+# FARLAND_PACKAGES, and a new list takes another --build:
+#
+#   FARLAND_PACKAGES="code dotnet-sdk-10.0 git build-essential" \
+#   FARLAND_USER=alice FARLAND_PASSWORD=secret \
+#       docker compose -f packaging/container/compose.yaml up -d --build
+#
+# Compose also reads the variables from packaging/container/.env.
+#
+# The account itself is made again at every start, with the uid its home
+# already has and the password from the environment: a password changed
+# inside the desktop lasts until the next start. Packages installed with apt
+# go with the container: name them in FARLAND_PACKAGES, or install
+# applications from Flathub.
+
+name: farland
+
+x-desktop: &desktop
+  # systemd as PID 1.
+  privileged: true
+  tmpfs:
+    - /run
+    - /run/lock
+  # Firefox and GTK share pictures through /dev/shm; Docker's 64 MB is too
+  # little for a browser.
+  shm_size: 2g
+  environment:
+    FARLAND_USER: ${FARLAND_USER:-farland}
+    FARLAND_PASSWORD: ${FARLAND_PASSWORD:?set FARLAND_PASSWORD, the account's RDP and login password}
+    # Language and formats (de_DE.UTF-8), time zone (Europe/Berlin) and
+    # keyboard layout (de, de(nodeadkeys)); empty: the image's defaults.
+    FARLAND_LOCALE: ${FARLAND_LOCALE:-}
+    FARLAND_TIMEZONE: ${FARLAND_TIMEZONE:-}
+    FARLAND_KEYBOARD: ${FARLAND_KEYBOARD:-}
+  restart: unless-stopped
+
+x-build: &build
+  context: ../..
+  dockerfile: packaging/container/Containerfile.desktop
+  args:
+    # Packages the image carries beyond the desktop, from Ubuntu's,
+    # Mozilla's or Microsoft's repository; empty: none.
+    FARLAND_PACKAGES: ${FARLAND_PACKAGES:-}
+    # Languages the image carries translations for, as codes ("de fr");
+    # FARLAND_LOCALE then picks one at start.
+    FARLAND_LANGUAGES: ${FARLAND_LANGUAGES:-}
+
+services:
+  gnome:
+    <<: *desktop
+    build:
+      <<: *build
+      target: gnome
+    image: ghcr.io/mkenfenheuer/farland-gnome:latest
+    # The name the desktop shows and the certificate was made for, so that
+    # it stays the same from one container to the next.
+    hostname: farland
+    ports:
+      - "3389:3389"
+    volumes:
+      # The users' files, settings, Firefox profile and Flatpak apps
+      # installed for themselves.
+      - home:/home
+      # The TLS certificate, so clients do not ask again, and the NLA
+      # credential store.
+      - state:/var/lib/farland
+      # farland.toml; like the packages, a new image never overwrites it.
+      - config:/etc/farland
+      # Flatpak apps installed for every user, and the Flathub catalogue.
+      - flatpak:/var/lib/flatpak
+      # The users' pictures and languages as the login and Settings show them.
+      - accounts:/var/lib/AccountsService
+      # systemd's own state, such as logind's lingering users. On a volume
+      # rather than the image's file system because under Podman systemd
+      # cannot set up a service's state directory on the container's
+      # overlay (ENODEV), which leaves logind -- and every session -- out.
+      - systemd:/var/lib/systemd
+
+  plasma:
+    <<: *desktop
+    build:
+      <<: *build
+      target: plasma
+    image: ghcr.io/mkenfenheuer/farland-plasma:latest
+    hostname: farland-plasma
+    ports:
+      - "3390:3389"
+    # The same, apart from GNOME's: the two desktops keep different settings
+    # in the same places.
+    volumes:
+      - plasma-home:/home
+      - plasma-state:/var/lib/farland
+      - plasma-config:/etc/farland
+      - plasma-flatpak:/var/lib/flatpak
+      - plasma-accounts:/var/lib/AccountsService
+      - plasma-systemd:/var/lib/systemd
+
+volumes:
+  home:
+  state:
+  config:
+  flatpak:
+  accounts:
+  systemd:
+  plasma-home:
+  plasma-state:
+  plasma-config:
+  plasma-flatpak:
+  plasma-accounts:
+  plasma-systemd:

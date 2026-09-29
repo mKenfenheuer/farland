@@ -4,8 +4,11 @@
 # Process glue under apps/: local sockets and farlandd's configuration.
 unit_test_sources += files(
   'test_agent.cpp',
+  'test_clipboard_relay.cpp',
   'test_consent.cpp',
   'test_daemon_config.cpp',
+  'test_input_thread.cpp',
+  'test_playback_thread.cpp',
   'test_launcher.cpp',
   'test_metrics.cpp',
   'test_session_store.cpp',

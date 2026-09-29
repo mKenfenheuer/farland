@@ -7,9 +7,10 @@
 #include <farland/channels/svc.hpp>
 #include <farland/platform/audio.hpp>
 #include <farland/server/audio_input.hpp>
-#include <farland/server/audio_playback.hpp>
 #include <farland/server/connection.hpp>
 #include <farland/server/dynamic_channels.hpp>
+
+#include "playback_thread.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -30,7 +31,9 @@ struct AudioOptions {
     bool microphone = true;
 };
 
-/// The audio of one session, on the session thread.
+/// The audio of one session. Playback runs on a thread of its own
+/// (PlaybackThread); this carries its messages over the channels, on the
+/// connection thread, and runs the microphone.
 ///
 /// Playback goes over the AUDIO_PLAYBACK_DVC dynamic channel, as Windows
 /// servers and gnome-remote-desktop do, or over the "rdpsnd" static channel
@@ -57,7 +60,8 @@ public:
 
     /// Descriptors whose readiness calls for service().
     void add_fds(std::vector<pollfd>& fds) const;
-    /// Moves captured audio to the client. `bandwidth_kbps` is auto-detect's measurement.
+    /// Sends what the playback thread produced. `bandwidth_kbps` is
+    /// auto-detect's measurement.
     void service(std::optional<std::uint32_t> bandwidth_kbps);
 
 private:
@@ -67,9 +71,8 @@ private:
     void stop_playback(const std::string& why);
     void send_playback(std::span<const std::byte> message);
     void on_playback_message(std::span<const std::byte> message);
-    void poll_playback();
     void poll_input();
-    void log_statistics(std::chrono::steady_clock::time_point now);
+    void log_microphone(std::chrono::steady_clock::time_point now);
 
     std::string peer_;
     AudioOptions options_;
@@ -81,9 +84,7 @@ private:
     server::DynamicChannels* dvc_ = nullptr;
     std::optional<std::uint32_t> playback_dvc_id_;
     Transport transport_ = Transport::none;
-    std::optional<server::AudioPlayback> playback_;
-    std::unique_ptr<platform::AudioSource> capture_;
-    std::vector<std::int16_t> samples_;
+    std::unique_ptr<PlaybackThread> playback_;
     std::optional<server::AudioInput> input_;
     std::unique_ptr<platform::AudioSink> microphone_;
     std::uint64_t microphone_samples_ = 0;

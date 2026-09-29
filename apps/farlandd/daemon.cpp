@@ -1211,7 +1211,8 @@ void Daemon::Impl::start_session(Authenticated client, const std::string& accoun
         }).detach();
         started = -1;
     } else {
-        started = spawn_session_helper(options.self, launch, account, rhost, session->token);
+        started =
+            spawn_session_helper(options.self, launch, account, rhost, session->token, session->waiting->password);
     }
     if (!started) {
         Live& s = *session;

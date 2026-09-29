@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+// SPDX-License-Identifier: Apache-2.0
+//
+// The account of the container is its administrator (group sudo), and a
+// software store asks for its password at every step of an installation:
+// installing, updating and removing software needs none. Everything else
+// still asks.
+
+polkit.addRule(function (action, subject) {
+    if ((action.id.indexOf("org.freedesktop.Flatpak.") === 0 ||
+         action.id.indexOf("org.freedesktop.packagekit.") === 0) &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});

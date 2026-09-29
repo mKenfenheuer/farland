@@ -3,6 +3,8 @@
 
 #include "gnome_headless.hpp"
 
+#include "ei_desktop_input.hpp"
+
 #include <farland/base/log.hpp>
 #include <farland/platform/logind/seat.hpp>
 #include <farland/platform/mutter/headless_shell.hpp>
@@ -45,6 +47,7 @@ public:
     GnomeHeadlessDesktop& operator=(GnomeHeadlessDesktop&&) = delete;
     ~GnomeHeadlessDesktop() override
     {
+        drop_input();  // before the session it came from
         if (session_) {
             // This desktop is going and its virtual monitors with it, so
             // the layout names only the seat's own. Naming ours here is a
@@ -61,10 +64,11 @@ public:
 
     [[nodiscard]] platform::FrameSource& frames() override { return screens_.front().capture->frames(); }
     [[nodiscard]] platform::CursorSource* cursor() override { return &screens_.front().capture->cursor(); }
-    [[nodiscard]] platform::InputSink& input() override { return *ei_; }
+    [[nodiscard]] platform::InputSink& input() override { return held_sink(); }
     [[nodiscard]] std::vector<int> dispatch_fds() const override
     {
-        std::vector<int> fds{session_->fd(), ei_->fd()};
+        std::vector<int> fds = input_fds();
+        fds.push_back(session_->fd());
         if (seat_watch_) {
             fds.push_back(seat_watch_->fd());
         }
@@ -77,7 +81,7 @@ public:
     void dispatch() override
     {
         session_->process();
-        ei_->dispatch();
+        dispatch_input();
         if (seat_watch_) {
             seat_watch_->process();
             keep_the_seat_after_a_refusal();
@@ -117,7 +121,7 @@ public:
         } else if (std::ranges::any_of(screens_, [](const Screen& s) { return s.capture->closed(); })) {
             reason = "a screen's stream closed";
             end_ = DesktopEnd::sharing_stopped;
-        } else if (ei_->closed()) {
+        } else if (input_closed()) {
             // The input connection goes with the compositor, so this is
             // what a logout looks like from here.
             reason = "the input connection closed";
@@ -207,7 +211,6 @@ private:
     std::vector<Screen> screens_;
     /// Recorded, but without a first frame yet; they come after screens_.
     std::vector<Screen> pending_;
-    std::unique_ptr<portal::EiInput> ei_;
     std::unique_ptr<mutter::MutterClipboard> clipboard_;
     std::vector<std::optional<platform::Rect>> targets_;
     /// The screens ensure_monitor_layout() last laid the session out for.
@@ -258,7 +261,7 @@ Result<void> GnomeHeadlessDesktop::start(const HeadlessOptions& options)
         log::error(log_component, "libei: {}", ei.error().message());
         return fail(Errc::io, "cannot connect to Mutter's input (libei)");
     }
-    ei_ = std::move(*ei);
+    keep_input(std::make_unique<EiDesktopInput>(std::move(*ei)));
     start_input_and_keymap();
 
     auto clipboard = mutter::MutterClipboard::create(*session_);
@@ -752,16 +755,15 @@ bool GnomeHeadlessDesktop::set_screen_targets(std::span<const std::optional<plat
 
 void GnomeHeadlessDesktop::apply_targets()
 {
-    if (!ei_) {
-        return;
-    }
     std::vector<portal::EiInput::Output> outputs;
     for (std::size_t i = 0; i < std::min(targets_.size(), screens_.size()); ++i) {
         if (targets_[i]) {
             outputs.push_back(portal::EiInput::Output{*targets_[i], screens_[i].mapping_id});
         }
     }
-    ei_->set_outputs(std::move(outputs));
+    change_input([outputs = std::move(outputs)](DesktopInput& input) {
+        static_cast<EiDesktopInput&>(input).ei().set_outputs(outputs);
+    });
 }
 
 }  // namespace

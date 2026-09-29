@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# /var/lib/flatpak is a volume, which keeps the catalogue it was first
+# filled with: bring it up to date at every start, so that GNOME Software
+# lists what Flathub has now.
+
+[Unit]
+Description=Refresh the Flathub catalogue
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flatpak update --appstream --noninteractive
+
+[Install]
+WantedBy=multi-user.target

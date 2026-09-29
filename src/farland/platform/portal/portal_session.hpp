@@ -154,7 +154,7 @@ struct PortalStream {
 /// A portal RemoteDesktop session with screen cast sources.
 ///
 /// Threading: not thread-safe. start() blocks the calling thread; afterwards
-/// every call must come from one thread at a time (normally the session
+/// every call must come from one thread at a time (in a session the desktop
 /// thread), except cancel(), which any thread and signal handlers may call.
 /// sd-bus refuses to be used after fork(), so create the session in the
 /// process that uses it.

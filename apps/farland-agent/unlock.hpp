@@ -6,6 +6,7 @@
 #include <farland/base/error.hpp>
 #include <farland/base/text.hpp>
 
+#include <chrono>
 #include <functional>
 #include <string>
 
@@ -44,6 +45,25 @@ namespace farland::agent {
 /// can sit on a wrong password for seconds, and the agent's loop is held
 /// for all of it.
 [[nodiscard]] Result<void> unlock_the_session(const std::string& user, const SecretString& password,
+                                              const std::function<void()>& still_waiting = {});
+
+/// Unlocks the session's GNOME Keyring with `password`, as a login at the
+/// greeter does: a session GDM starts for a client (CreateUserDisplay) runs
+/// no authentication, so pam_gnome_keyring never saw a password and the
+/// login keyring stays locked -- and every application that keeps a secret
+/// asks for it. This hands the daemon the password the client delegated,
+/// over the control socket in $XDG_RUNTIME_DIR/keyring/control and with
+/// the operation pam_gnome_keyring itself uses (UNLOCK). The daemon unlocks
+/// the login keyring, or creates it with that password where there is none;
+/// a wrong password leaves it locked, and is Errc::invalid_value, where
+/// trying again with the same password is pointless. farland's own sessions (Plasma, sway,
+/// ...) need none of this: farlandd runs the PAM auth stack for them, where
+/// pam_gnome_keyring and pam_kwallet5 take the password themselves.
+///
+/// Waits up to `timeout` for the daemon, which gnome-session starts beside
+/// the shell; `still_waiting` is called meanwhile.
+[[nodiscard]] Result<void> unlock_the_keyring(const SecretString& password,
+                                              std::chrono::milliseconds timeout = std::chrono::seconds(10),
                                               const std::function<void()>& still_waiting = {});
 
 }  // namespace farland::agent

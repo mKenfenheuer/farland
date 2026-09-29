@@ -46,7 +46,7 @@ enum class CaptureState : std::uint8_t {
 [[nodiscard]] std::string_view to_string(CaptureState state) noexcept;
 
 /// A PipeWire video consumer. It runs its own pw_thread_loop; conversion to
-/// BGRX happens there, into buffers the capture owns, and the session thread
+/// BGRX happens there, into buffers the capture owns, and the desktop thread
 /// picks up the results through frames() and cursor(), which follow the
 /// threading model of backend.hpp.
 ///

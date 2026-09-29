@@ -11,8 +11,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <deque>
+#include <map>
 #include <numbers>
 #include <vector>
 
@@ -193,23 +195,99 @@ TEST_CASE("Audio output drops packets when confirmations fall behind")
     CHECK(stats.packets_dropped == 30);
 
     // The client confirms everything at once, 10 ms later, with nothing in
-    // flight: from now on the backlog may grow to 100 ms only.
+    // flight. That backlog plus 100 ms is less than a WAN link needs while it
+    // keeps up, so the backlog may still grow to 400 ms.
     now += milliseconds(10);
     const auto last = std::get<rdpsnd::Wave2>(pdus.back());
     REQUIRE(playback.receive(rdpsnd::encode_client_pdu(rdpsnd::WaveConfirm{last.timestamp, last.block_no}), now));
     stats = playback.take_stats(now);
     CHECK(stats.unconfirmed == milliseconds(0));
     CHECK(stats.max_round_trip == milliseconds(10));
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 30; ++i) {
         playback.push(chunk, now);
     }
-    CHECK(client.take().size() == 5);
-    CHECK(playback.take_stats(now).packets_dropped == 5);
+    CHECK(client.take().size() == 20);
+    CHECK(playback.take_stats(now).packets_dropped == 10);
 
     // Unconfirmed samples stop counting after two seconds.
     now += milliseconds(2500);
     playback.push(tone(format, milliseconds(40)), now);
     CHECK(client.take().size() == 2);
+}
+
+namespace {
+
+/// Plays `seconds` of sound, captured 20 ms at a time, to a client that
+/// confirms packet i `delay(i)` after it was sent. Every `stall_every` ticks
+/// the session thread is busy for `stall` ticks (encoding a frame, say) and
+/// then pushes what the capture held meanwhile at once. Returns the totals.
+template <typename Delay>
+farland::server::PlaybackStats play_to(Delay delay, int seconds, int stall_every = 0, int stall = 0)
+{
+    auto now = Clock::now();
+    Client client;
+    auto playback = client.playback(true);
+    negotiate(playback, client, now, rdpsnd::quality::dynamic, {48000}, false);
+    static_cast<void>(playback.poll_event());
+    const auto chunk = tone(*playback.capture_format(), milliseconds(20));
+    struct Sent {
+        std::uint16_t timestamp;
+        std::uint8_t block_no;
+    };
+    std::multimap<Clock::time_point, Sent> confirms;  // by when the client confirms
+    int sent = 0;
+    int held = 0;
+    farland::server::PlaybackStats total;
+    for (int tick = 0; tick < seconds * 50; ++tick) {
+        now += milliseconds(20);
+        while (!confirms.empty() && confirms.begin()->first <= now) {
+            const auto& wave = confirms.begin()->second;
+            REQUIRE(playback.receive(
+                rdpsnd::encode_client_pdu(rdpsnd::WaveConfirm{wave.timestamp, wave.block_no}), now));
+            confirms.erase(confirms.begin());
+        }
+        ++held;
+        if (stall_every > 0 && tick % stall_every < stall) {
+            continue;
+        }
+        for (; held > 0; --held) {
+            playback.push(chunk, now);
+        }
+        for (const auto& pdu : client.take()) {
+            if (const auto* wave = std::get_if<rdpsnd::Wave2>(&pdu)) {
+                confirms.emplace(now + delay(sent++), Sent{wave->timestamp, wave->block_no});
+            }
+        }
+        const auto stats = playback.take_stats(now);
+        total.packets_sent += stats.packets_sent;
+        total.packets_dropped += stats.packets_dropped;
+        total.unconfirmed = std::max(total.unconfirmed, stats.unconfirmed);
+    }
+    return total;
+}
+
+}  // namespace
+
+TEST_CASE("Audio output keeps the packets a busy session thread sends late, over a WAN link")
+{
+    // What Windows App saw over a VPN: the session thread is busy with a
+    // frame for 160 ms twice a second, and then sends what it captured
+    // meanwhile in one go. The client confirms 120 ms after a packet went out
+    // and plays in real time throughout. While nothing goes out the backlog
+    // runs dry, and the burst that follows must not count as a link falling
+    // behind.
+    const auto stats = play_to([](int) { return milliseconds(120); }, 10, 25, 8);
+    CHECK(stats.packets_dropped == 0);
+    CHECK(stats.packets_sent == 500);
+}
+
+TEST_CASE("Audio output still drops for a link that cannot carry the audio")
+{
+    // Every confirmation 4 ms later than the one before: the client falls
+    // behind by a fifth of real time, and the backlog would grow for ever.
+    const auto stats = play_to([](int i) { return milliseconds(100 + (i * 4)); }, 10);
+    CHECK(stats.packets_dropped > 0);
+    CHECK(stats.unconfirmed <= milliseconds(1000));
 }
 
 TEST_CASE("Audio output stops during silence and says so with a Close PDU ([MS-RDPEA] 3.3.5.2.1.7)")

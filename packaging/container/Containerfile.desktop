@@ -1,0 +1,222 @@
+# SPDX-FileCopyrightText: 2026 Maximilian Kenfenheuer
+# SPDX-License-Identifier: Apache-2.0
+#
+# farlandd with a whole desktop, as on a host: systemd, logind and the
+# farland package in one image, so that a client gets the desktop a user
+# logging in would get -- a user manager, the settings daemons, Settings, a
+# software store. Two targets:
+#
+#   gnome   Ubuntu's GNOME session, started by GDM
+#   plasma  Kubuntu's Plasma session, started by farlandd itself; needs a
+#           DRM render node, as KWin casts its screen only when it
+#           composites with OpenGL. Docker Desktop on macOS has none;
+#           Podman's libkrun machine has one (docs/CONTAINERS.md).
+#
+#   docker build --target gnome -t farland-gnome -f packaging/container/Containerfile.desktop .
+#
+# compose.yaml says how to run them: privileged, and with the homes, the
+# certificate, the configuration and Flatpak on volumes. More packages go in
+# with the build argument FARLAND_PACKAGES:
+#
+#   FARLAND_PACKAGES="code dotnet-sdk-10.0 git build-essential" ... up -d --build
+#
+# systemd runs as PID 1, which needs --privileged. Every session is
+# headless: the container has no seat. The host's GPU is used where it has
+# one (--privileged shows /dev/dri); GNOME renders with llvmpipe without. Ubuntu's App Center is
+# a snap, and snapd does not run in a container, so GNOME Software or
+# Discover with Flathub stands in for it, and Firefox comes from Mozilla's
+# repository.
+
+FROM docker.io/library/ubuntu:26.04 AS build
+
+COPY ci/install-deps.sh /tmp/install-deps.sh
+RUN sh /tmp/install-deps.sh \
+    && apt-get install -y --no-install-recommends dpkg-dev file \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /src
+# The package the README builds, without the tests.
+RUN meson setup /tmp/build /src -Dtests=disabled >/dev/null \
+    && sh /src/packaging/make-deb.sh /tmp/build /out
+
+# What both desktops share: systemd, sound, Flatpak, Firefox. farland itself
+# comes last in each desktop, so that a change to it rebuilds no desktop.
+FROM docker.io/library/ubuntu:26.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive container=docker LANG=C.UTF-8
+# No meta-packages, which pull in snapd, NetworkManager and the rest of what
+# a container has no use for.
+# Ubuntu's container image drops every package's translations; a desktop
+# in another language needs them (FARLAND_LANGUAGES, FARLAND_LOCALE).
+RUN sed -i 's|^path-exclude=/usr/share/locale/\*/LC_MESSAGES/\*\.mo|# & (kept: farland desktops)|' \
+        /etc/dpkg/dpkg.cfg.d/excludes \
+    && ! grep -q '^path-exclude=/usr/share/locale' /etc/dpkg/dpkg.cfg.d/excludes
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus dbus-user-session libpam-systemd polkitd accountsservice \
+        sudo locales ca-certificates xdg-user-dirs fonts-noto-color-emoji \
+        libgl1-mesa-dri libegl-mesa0 pipewire pipewire-pulse wireplumber flatpak \
+    && rm -rf /var/lib/apt/lists/*
+
+# Firefox from Mozilla's repository, pinned above Ubuntu's firefox package,
+# which only installs the snap.
+#
+# Mozilla's index of its language packs (binary-all) is often out of step
+# with its Release file ("File has unexpected size ... Mirror sync in
+# progress?"), which fails apt-get update as a whole although every other
+# index arrived. So apt-get update may fail here and below: a package that
+# is really missing still fails apt-get install.
+ADD https://packages.mozilla.org/apt/repo-signing-key.gpg /etc/apt/keyrings/packages.mozilla.org.asc
+RUN chmod 0644 /etc/apt/keyrings/packages.mozilla.org.asc \
+    && printf '%s\n' 'Types: deb' 'URIs: https://packages.mozilla.org/apt' 'Suites: mozilla' 'Components: main' \
+        'Signed-By: /etc/apt/keyrings/packages.mozilla.org.asc' > /etc/apt/sources.list.d/mozilla.sources \
+    && printf '%s\n' 'Package: *' 'Pin: origin packages.mozilla.org' 'Pin-Priority: 1000' > /etc/apt/preferences.d/mozilla \
+    && { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+    && apt-get install -y --no-install-recommends firefox \
+    && rm -rf /var/lib/apt/lists/*
+
+# Microsoft's repository, for VS Code (code) in FARLAND_PACKAGES. Its
+# package would add the repository itself on installation; it is here
+# already.
+ADD https://packages.microsoft.com/keys/microsoft.asc /etc/apt/keyrings/packages.microsoft.com.asc
+RUN chmod 0644 /etc/apt/keyrings/packages.microsoft.com.asc \
+    && printf '%s\n' 'Types: deb' 'URIs: https://packages.microsoft.com/repos/code' 'Suites: stable' 'Components: main' \
+        'Architectures: amd64 arm64 armhf' 'Signed-By: /etc/apt/keyrings/packages.microsoft.com.asc' \
+        > /etc/apt/sources.list.d/vscode.sources \
+    && echo 'code code/add-microsoft-repo boolean false' | debconf-set-selections
+
+# Flathub with its catalogue: the software stores list nothing until the
+# appstream data is there, and do not fetch it for a system remote by
+# themselves. /var/lib/flatpak is a volume, so a service refreshes it at
+# every start.
+COPY packaging/container/flathub-appstream.service /etc/systemd/system/
+RUN flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo \
+    && flatpak update --appstream --noninteractive \
+    && systemctl enable flathub-appstream.service
+
+# What a container must not start: udev would manage the host's devices,
+# and there is no console to put a login prompt on.
+RUN systemctl mask systemd-udevd.service systemd-udevd-kernel.socket systemd-udevd-control.socket \
+        systemd-udev-trigger.service getty.target console-getty.service \
+        systemd-remount-fs.service apt-daily.timer apt-daily-upgrade.timer motd-news.timer e2scrub_all.timer
+
+# The account may install software without a password prompt at every
+# step.
+COPY packaging/container/49-farland-software.rules /etc/polkit-1/rules.d/
+# An audio output for the session, as there is no sound card.
+COPY packaging/container/50-farland-remote-audio.conf /etc/pipewire/pipewire.conf.d/
+EXPOSE 3389
+STOPSIGNAL SIGRTMIN+3
+ENTRYPOINT ["/usr/local/bin/entrypoint"]
+
+# Ubuntu's GNOME session through GDM, headless: GDM's remote display
+# factory, as the container has no seat.
+FROM base AS gnome
+
+RUN { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+    && apt-get install -y --no-install-recommends \
+        gdm3 ubuntu-session gnome-shell-ubuntu-extensions ubuntu-settings xdg-user-dirs-gtk gnome-keyring \
+        yaru-theme-gnome-shell yaru-theme-gtk yaru-theme-icon yaru-theme-sound \
+        fonts-ubuntu fonts-cantarell adwaita-icon-theme \
+        gnome-control-center gnome-software gnome-software-plugin-flatpak \
+        ptyxis nautilus gnome-text-editor gnome-system-monitor gnome-calculator loupe \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY packaging/container/90_farland-container.gschema.override /usr/share/glib-2.0/schemas/
+RUN glib-compile-schemas /usr/share/glib-2.0/schemas \
+    && systemctl enable gdm.service \
+    && systemctl set-default graphical.target \
+    && mkdir -p /etc/skel/.config && echo yes > /etc/skel/.config/gnome-initial-setup-done
+
+# What else the image carries, as package names from Ubuntu's, Mozilla's or
+# Microsoft's repository. Last, so that a new list only redoes this layer.
+# The languages the desktop can speak (FARLAND_LOCALE picks one at start):
+# Ubuntu's language packs and Firefox's, each only where the language has
+# one. FARLAND_LANGUAGES holds language codes, such as "de fr".
+ARG FARLAND_PACKAGES=""
+ARG FARLAND_LANGUAGES=""
+RUN if [ -n "$FARLAND_PACKAGES$FARLAND_LANGUAGES" ]; then \
+        { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+        && packs= \
+        && for l in $FARLAND_LANGUAGES; do \
+            for p in language-pack-$l language-pack-gnome-$l firefox-l10n-$l; do \
+                if apt-cache show "$p" >/dev/null 2>&1; then packs="$packs $p"; \
+                else echo "no $p; going on without it" >&2; fi; \
+            done; \
+        done \
+        && apt-get install -y --no-install-recommends $packs $FARLAND_PACKAGES \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Every session headless, on GDM's remote display factory: the container
+# has no seat.
+# farland, from this checkout: after everything that does not change with
+# it, so that a change to farland redoes only this and the build stage.
+COPY --from=build /out/*.deb /tmp/
+RUN { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+    && apt-get install -y --no-install-recommends /tmp/*.deb \
+    && rm -rf /var/lib/apt/lists/* /tmp/*.deb \
+    && systemctl enable farlandd.service \
+    && sed -i 's/^# gdm_display = "seat"/gdm_display = "headless"/' /etc/farland/farland.toml \
+    && grep -q '^gdm_display = "headless"' /etc/farland/farland.toml
+
+# The entrypoint (ENTRYPOINT in base), last so that changing it rebuilds
+# nothing else.
+COPY --chmod=0755 packaging/container/desktop-entrypoint.sh /usr/local/bin/entrypoint
+# FARLAND_KEYBOARD for GNOME, which keeps its layouts where only the session
+# can write them.
+COPY --chmod=0755 packaging/container/farland-keyboard.sh /usr/local/bin/farland-keyboard
+COPY packaging/container/farland-keyboard.desktop /etc/xdg/autostart/
+
+# Kubuntu's Plasma session, which farlandd starts itself: its own PAM and
+# logind session, and KWin on its virtual backend. No display manager.
+FROM base AS plasma
+
+RUN { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+    && apt-get install -y --no-install-recommends \
+        plasma-desktop plasma-workspace kwin-wayland xwayland kubuntu-settings-desktop \
+        breeze breeze-gtk-theme kde-config-gtk-style fonts-noto-core fonts-hack \
+        plasma-pa kscreen systemsettings kio-extras polkit-kde-agent-1 xdg-desktop-portal-kde libpam-kwallet5 \
+        plasma-discover plasma-discover-backend-flatpak \
+        konsole dolphin kate ark gwenview okular kde-spectacle plasma-systemmonitor \
+    && rm -rf /var/lib/apt/lists/*
+
+# Firefox draws its own title bar by default, which under Plasma on a
+# software renderer comes out black and without its buttons; KWin's title
+# bar has neither problem. A default, so a user can switch back.
+RUN printf '%s\n' '// KWin draws the title bar (farland container).' \
+        'pref("browser.tabs.inTitlebar", 0);' > /usr/lib/firefox/defaults/pref/farland-container.js
+
+# What else the image carries, as package names from Ubuntu's, Mozilla's or
+# Microsoft's repository. Last, so that a new list only redoes this layer.
+# The languages the desktop can speak (FARLAND_LOCALE picks one at start):
+# Ubuntu's language packs and Firefox's, each only where the language has
+# one. FARLAND_LANGUAGES holds language codes, such as "de fr".
+ARG FARLAND_PACKAGES=""
+ARG FARLAND_LANGUAGES=""
+RUN if [ -n "$FARLAND_PACKAGES$FARLAND_LANGUAGES" ]; then \
+        { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+        && packs= \
+        && for l in $FARLAND_LANGUAGES; do \
+            for p in language-pack-$l language-pack-kde-$l firefox-l10n-$l; do \
+                if apt-cache show "$p" >/dev/null 2>&1; then packs="$packs $p"; \
+                else echo "no $p; going on without it" >&2; fi; \
+            done; \
+        done \
+        && apt-get install -y --no-install-recommends $packs $FARLAND_PACKAGES \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# farland, from this checkout: after everything that does not change with
+# it, so that a change to farland redoes only this and the build stage.
+COPY --from=build /out/*.deb /tmp/
+RUN { apt-get update || echo 'apt-get update failed for some index; going on' >&2; } \
+    && apt-get install -y --no-install-recommends /tmp/*.deb \
+    && rm -rf /var/lib/apt/lists/* /tmp/*.deb \
+    && systemctl enable farlandd.service \
+    && sed -i 's/^desktop = "gnome"/desktop = "plasma"/' /etc/farland/farland.toml \
+    && grep -q '^desktop = "plasma"' /etc/farland/farland.toml
+
+# The entrypoint (ENTRYPOINT in base), last so that changing it rebuilds
+# nothing else.
+COPY --chmod=0755 packaging/container/desktop-entrypoint.sh /usr/local/bin/entrypoint

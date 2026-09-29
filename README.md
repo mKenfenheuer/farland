@@ -14,6 +14,63 @@ mstsc / Windows App / FreeRDP  ──RDP──▶  farlandd  ──▶  a deskto
                                                          labwc, cage)
 ```
 
+## Quick start
+
+### In a container
+
+A whole GNOME desktop, with nothing to install but Docker or Podman:
+
+```sh
+docker run -d --name farland-gnome --privileged --tmpfs /run --tmpfs /run/lock --shm-size 2g \
+    -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret \
+    -v farland-home:/home -v farland-state:/var/lib/farland \
+    -v farland-systemd:/var/lib/systemd -v farland-accounts:/var/lib/AccountsService \
+    ghcr.io/mkenfenheuer/farland-gnome
+```
+
+Then connect to `localhost` as `alice` with the password `secret`: in mstsc
+or Windows App, or with
+`xfreerdp3 /v:localhost /u:alice /p:secret /cert:tofu /dynamic-resolution /timeout:60000`.
+The first connection takes 10–20 seconds while GDM starts the session.
+
+- **Podman:** the same command with `podman` (a rootful machine on macOS).
+- **Plasma:** `ghcr.io/mkenfenheuer/farland-plasma` instead. It needs a GPU
+  render node, which any Linux host with a GPU has; on a Mac, Podman's
+  libkrun machine has one and Docker Desktop does not.
+- **More:** a compose file that runs both, adding software, and a test
+  pattern image that needs no privileges at all:
+  [docs/CONTAINERS.md](docs/CONTAINERS.md).
+
+### On your GNOME or Plasma machine
+
+On Debian or Ubuntu (amd64), install the package from the latest build of
+main, here with the [GitHub CLI](https://cli.github.com), or from the
+[continuous release](https://github.com/mKenfenheuer/farland/releases/tag/continuous):
+
+```sh
+gh release download continuous -R mKenfenheuer/farland -p 'farland_*_amd64.deb'
+sudo apt install ./farland_*_amd64.deb
+```
+
+The package starts `farlandd` on port 3389. Tell it which desktop to give
+each user, then enrol yourself:
+
+```sh
+# GNOME
+sudo sed -i 's/^# gdm_display = "seat"/gdm_display = "headless"/' /etc/farland/farland.toml
+# Plasma
+sudo sed -i 's/^desktop = "gnome"/desktop = "plasma"/' /etc/farland/farland.toml
+
+sudo systemctl restart farlandd
+farlandctl passwd        # as each user who may log in; asks for the account's password
+```
+
+Then connect from another machine with your account name and password, to
+the machine's name or address. Every client gets a desktop of its own,
+beside whatever is open at the machine itself, and finds it again when it
+reconnects. Other distributions are under [Install](#install), and
+[First connection](#first-connection) says what the two settings above mean.
+
 ## What it does
 
 - **Connect the way you already do.** NLA (CredSSP with NTLMv2 or Kerberos),
@@ -44,23 +101,10 @@ mstsc / Windows App / FreeRDP  ──RDP──▶  farlandd  ──▶  a deskto
 ## Status
 
 Pre-release and unversioned: there is no tagged release yet, and the packages
-below are built from a checkout. The server is what works today (milestone M6
-of [docs/ROADMAP.md](docs/ROADMAP.md)); a native Wayland *client* is still to
-come. It is tested against FreeRDP; mstsc and Windows App are only partly
-tried, and the feature notes in the documentation say what each was tested
-with.
-
-## Try it without installing anything
-
-The container image serves a synthetic test desktop — colour bars, a bouncing
-square, a crosshair that follows your pointer — so you can point a client at
-it without a compositor, a GPU or a login:
-
-```sh
-podman build -t farland -f packaging/container/Containerfile .
-podman run --rm -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret farland
-xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:ignore /gfx:progressive
-```
+below are built from a checkout. It is at milestone M6 of
+[docs/ROADMAP.md](docs/ROADMAP.md). It is tested against FreeRDP; mstsc and
+Windows App are only partly tried, and the feature notes in the
+documentation say what each was tested with.
 
 ## Install
 
@@ -230,13 +274,16 @@ sudo systemctl restart gdm     # or sddm, for a session to pick them up
 
 - **[docs/MULTI-SESSION.md](docs/MULTI-SESSION.md)** — `farlandd`: the
   desktops, configuration, policies, Kerberos, users, metrics and upgrades.
+- **[docs/CONTAINERS.md](docs/CONTAINERS.md)** — the container images: the
+  test pattern, and GNOME and Plasma desktops; persistence, the GPU, and
+  Docker versus Podman.
 - **[docs/SERVER.md](docs/SERVER.md)** — `farland-server`: sharing a desktop,
   the headless backends, and every graphics, audio, clipboard and input
   option.
 - **[docs/PLAN.md](docs/PLAN.md)** — scope, architecture, testing, security,
   risks.
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — milestones M0–M8 (server 1.0),
-  C1–C5 (client), phase 3.
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — milestones M0–M8 (1.0) and what
+  comes after.
 - **[docs/SPECS.md](docs/SPECS.md)** — the specifications farland implements.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — sanitizer and fuzzing builds, the
   compositor tests, and the coding rules.

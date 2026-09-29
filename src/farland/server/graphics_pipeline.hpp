@@ -142,6 +142,16 @@ public:
                      channels::rdpgfx::GfxServerConfig config = {}, TileCodec codec = TileCodec::progressive,
                      H264Factory make_h264 = {}, PipelineOptions options = {});
 
+    /// A pipeline on another thread than the channels': `channel_id` is the
+    /// graphics channel, opened there (open(channel_name)). Everything it
+    /// would send, and closing the channel, waits in take_output() for that
+    /// thread to carry out; events for the channel come to handle() as ever.
+    GraphicsPipeline(std::uint32_t channel_id, OutputLayout layout, channels::rdpgfx::GfxServerConfig config = {},
+                     TileCodec codec = TileCodec::progressive, H264Factory make_h264 = {},
+                     PipelineOptions options = {});
+
+    [[nodiscard]] std::uint32_t channel_id() const noexcept { return channel_id_; }
+
     /// Handles `event` if it concerns the graphics channel. False otherwise.
     bool handle(const channels::DvcEvent& event);
     [[nodiscard]] std::optional<PipelineEvent> poll_event();
@@ -195,6 +205,15 @@ public:
     /// would stay at the quality their TILE_FIRST pass had.
     [[nodiscard]] std::optional<std::uint32_t> end_frame();
 
+    /// What a pipeline without channels has for the channel since the last
+    /// call: messages in order, then whether to
+    /// close it.
+    struct Output {
+        std::vector<std::vector<std::byte>> messages;
+        bool close = false;
+    };
+    [[nodiscard]] Output take_output();
+
     /// A frame of the first screen alone: add_frame(0, frame).
     [[nodiscard]] std::optional<std::uint32_t> send_frame(const codec::ImageView& frame, std::uint32_t timestamp = 0);
     /// A frame of the first screen alone: add_dmabuf_frame(0, ...). Returns
@@ -231,8 +250,9 @@ private:
         std::uint32_t tiles_x = 0;
         std::uint32_t tiles_y = 0;
         std::optional<codec::progressive::Encoder> progressive;
-        /// ClearCodec for text and UI tiles of a Progressive surface.
-        std::optional<codec::clear::Encoder> clear;
+        /// Text and UI tiles of this Progressive surface go through ClearCodec
+        /// (clear_).
+        bool clear = false;
         std::unique_ptr<video::H264Encoder> h264;
         std::optional<codec::Yuv420Frame> yuv;
         std::optional<video::Avc444Encoder> avc444;
@@ -342,7 +362,7 @@ private:
     /// The one Progressive codec context of each surface.
     static constexpr std::uint32_t progressive_context = 1;
 
-    DynamicChannels* channels_;  ///< never null
+    DynamicChannels* channels_;  ///< null for a pipeline without channels
     std::uint32_t channel_id_ = 0;
     channels::rdpgfx::GfxServer gfx_;
     codec::ZgfxCompressor zgfx_;
@@ -351,6 +371,11 @@ private:
     PipelineOptions options_;
     bool laid_out_ = false;
     std::vector<std::unique_ptr<Screen>> screens_;
+    /// The client's one ClearCodec context for the channel, which every
+    /// surface shares and which ResetGraphics leaves alone: its sequence
+    /// number and V-bar storages carry on from surface to surface. Created
+    /// with the first surface that uses it.
+    std::optional<codec::clear::Encoder> clear_;
     /// Black surfaces: borders and monitors without a picture.
     std::vector<std::uint16_t> fill_surfaces_;
     H264Factory make_h264_;
@@ -362,6 +387,10 @@ private:
     std::optional<std::uint32_t> frame_id_;
     std::deque<PipelineEvent> events_;
     bool closed_ = false;
+    /// Without channels: what flush() and close() leave for take_output().
+    bool holding_ = false;
+    std::vector<std::vector<std::byte>> held_;
+    bool close_held_ = false;
 };
 
 }  // namespace farland::server

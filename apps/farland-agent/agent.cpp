@@ -592,6 +592,18 @@ bool Agent::on_new_connection(broker::NewConnection message, UniqueFd fd)
         had_desktop_ = true;
         log::info(log_component, "session {}: desktop started at {}x{}", config_.logon_id, width, height);
     }
+    if (config_.unlock_keyring && !keyring_answered_ && !message.password.empty()) {
+        // As a login at the greeter would have (unlock.hpp). A keyring that
+        // stays locked is no reason to turn the client away.
+        if (auto unlocked = unlock_the_keyring(message.password, std::chrono::seconds(10), [this] { send_stats(); });
+            unlocked) {
+            keyring_answered_ = true;
+        } else {
+            keyring_answered_ = unlocked.error().code == Errc::invalid_value;
+            log::info(log_component, "session {}: the keyring stays locked: {}", config_.logon_id,
+                      unlocked.error().message());
+        }
+    }
 
     auto connection = std::make_unique<Connection>();
     connection->id = message.connection_id;

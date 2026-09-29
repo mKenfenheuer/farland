@@ -82,7 +82,7 @@ const spa_pod* format_pod(pw::PodBuilder& b, const VideoMode& mode)
 }
 
 /// A Video/Source node whose frames come from the client's camera. The
-/// session thread hands whole frames to write(); PipeWire's thread copies the
+/// connection thread hands whole frames to write(); PipeWire's thread copies the
 /// newest one into each buffer it asks for. A frame that is never asked for
 /// is simply replaced, so a slow consumer falls behind in time, never in
 /// memory.

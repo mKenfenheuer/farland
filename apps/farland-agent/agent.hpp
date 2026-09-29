@@ -90,6 +90,10 @@ struct AgentConfig {
     /// Asks the person using the session whether a new connection may take
     /// it over ([policy] takeover); unset: a desktop notification.
     ConsentAsker ask_consent;
+    /// Unlock the session's GNOME Keyring with the password a client
+    /// delegated (unlock_the_keyring()): GNOME, whose session GDM started
+    /// without authenticating anybody.
+    bool unlock_keyring = false;
 };
 
 class Agent {
@@ -149,6 +153,10 @@ private:
     /// session and the windows in it. Only the connection that was to start
     /// the session in the first place is worth ending it for.
     bool had_desktop_ = false;
+    /// The keyring daemon answered an unlock (config_.unlock_keyring): the
+    /// keyring is unlocked, or holds another password. Until then every
+    /// connection that brings a password tries again.
+    bool keyring_answered_ = false;
     std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::unique_ptr<Connection> current_;
     std::unique_ptr<Prompt> prompt_;
