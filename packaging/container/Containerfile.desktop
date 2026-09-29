@@ -123,7 +123,11 @@ RUN { apt-get update || echo 'apt-get update failed for some index; going on' >&
     && rm -rf /var/lib/apt/lists/*
 
 COPY packaging/container/90_farland-container.gschema.override /usr/share/glib-2.0/schemas/
+# Color profiles and batteries mean nothing to a remote session, and both
+# daemons want state directories that systemd cannot make on Podman's
+# overlay (docs/CONTAINERS.md), where they fail at every start.
 RUN glib-compile-schemas /usr/share/glib-2.0/schemas \
+    && systemctl mask colord.service upower.service \
     && systemctl enable gdm.service \
     && systemctl set-default graphical.target \
     && mkdir -p /etc/skel/.config && echo yes > /etc/skel/.config/gnome-initial-setup-done

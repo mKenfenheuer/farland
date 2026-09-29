@@ -24,7 +24,7 @@ jobs:
     # their own workflow, because they build a compositor.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: sudo sh ci/install-deps.sh
       - name: Build (release, warnings as errors)
@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends dpkg-dev file
           sh packaging/make-deb.sh build "$RUNNER_TEMP/pkg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: farland-deb
           path: ${{ runner.temp }}/pkg/*.deb
@@ -54,7 +54,7 @@ jobs:
     steps:
       - name: Install git, so the checkout is a git checkout
         run: dnf install -y git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the build dependencies from the spec
         run: |
           dnf install -y rpm-build dnf-command\(builddep\)
@@ -66,7 +66,7 @@ jobs:
           package=$(find "$RUNNER_TEMP/pkg" -name '*.rpm' | head -1)
           rpm -qpi "$package"
           rpm -qpl "$package"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: farland-rpm
           path: ${{ runner.temp }}/pkg/*.rpm
@@ -82,7 +82,7 @@ jobs:
     steps:
       - name: Install git, so the checkout is a git checkout
         run: pacman -Syu --noconfirm --needed git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # pkgver() counts the commits, so it needs more than the tip.
           fetch-depth: 0
@@ -128,7 +128,7 @@ jobs:
           package=$(find "$RUNNER_TEMP/aur" -name '*.pkg.tar.*' | head -1)
           pacman -Qip "$package"
           pacman -Qlp "$package"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: farland-aur
           path: ${{ runner.temp }}/aur/*.pkg.tar.*
@@ -148,10 +148,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Every artifact the three builds uploaded, each in a directory of
       # its own: the Debian package, the RPM and the Arch package.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: pkg
       - name: Publish

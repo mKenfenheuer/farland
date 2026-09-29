@@ -121,6 +121,12 @@ if [ -n "${FARLAND_KEYBOARD:-}" ]; then
     echo "$layout${variant:++$variant}" >/run/farland-container/keyboard
 fi
 
+# A user's tasks: systemd allows each user a third of what the container
+# may have, which under a container limit (Podman's is 2048) is too few for
+# a desktop. The container's own limit is the one that counts.
+mkdir -p /etc/systemd/system/user-.slice.d
+printf '[Slice]\nTasksMax=infinity\n' >/etc/systemd/system/user-.slice.d/50-farland-container.conf
+
 # What `farlandctl passwd` would store after asking polkit and PAM, which
 # are not running yet.
 printf '%s\n' "$password" |

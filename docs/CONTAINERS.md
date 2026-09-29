@@ -21,7 +21,7 @@ host yet.
 it: something to point a client at to see the protocol work.
 
 ```sh
-podman build -t farland -f packaging/container/Containerfile .   # or docker build
+podman build -t farland -f packaging/container/Containerfile .
 podman run --rm -p 3389:3389 -e FARLAND_USER=alice -e FARLAND_PASSWORD=secret farland
 xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:ignore /gfx:progressive
 ```
@@ -59,16 +59,12 @@ describes farlandd itself; here it runs as it would anywhere else.
 on 3390, with the options they need and their state on volumes:
 
 ```sh
-FARLAND_USER=alice FARLAND_PASSWORD=secret \
-    docker compose -f packaging/container/compose.yaml up -d            # both
-FARLAND_USER=alice FARLAND_PASSWORD=secret \
-    docker compose -f packaging/container/compose.yaml up -d gnome      # or one
+FARLAND_USER=alice FARLAND_PASSWORD=secret docker compose -f packaging/container/compose.yaml up -d
 xfreerdp3 /v:localhost:3389 /u:alice /p:secret /cert:tofu /dynamic-resolution /timeout:60000
 ```
 
-With Podman, `podman compose` runs the same file (see
-[Docker and Podman](#docker-and-podman)). Without `--build`, compose runs
-the images CI publishes; `up -d --build` builds them from the checkout.
+The images it names are the ones CI publishes; built from the checkout,
+they carry what the working tree holds.
 
 A new session takes 10–20 seconds to start on the first connection, which is
 longer than FreeRDP waits by default, hence `/timeout:60000`. Windows App
@@ -93,19 +89,9 @@ the desktop's, not the client's: farland sends the keys by position, and
 the desktop's layout decides what they type, so it has to match the
 keyboard at the client.
 
-Compose also reads them from `packaging/container/.env`, which git and the
-image build both ignore, because it holds the password. With
-`COMPOSE_FILE` in it as well, compose needs no `-f` options when run from
-that directory:
-
-```sh
-# packaging/container/.env
-FARLAND_USER=alice
-FARLAND_PASSWORD=secret
-COMPOSE_FILE=compose.yaml:compose.home.yaml
-
-cd packaging/container && docker compose up -d
-```
+`packaging/container/.env`, beside the compose files, is the place for
+them: git and the image build both ignore it, because it holds the
+password.
 
 The account is created again at every start, with the password from the
 environment and the user ID its home directory already has. It is in the
@@ -122,27 +108,16 @@ asked for the password at every step; everything else still asks.
 
 `compose.home.yaml` puts the host's Desktop, Documents, Downloads,
 Pictures, Music and Movies (as Videos) into the account's home, for both
-desktops; what the desktop saves there lands on the host. Add it with a
-second `-f`, or in `COMPOSE_FILE`. Folders of your own go in
-`compose.local.yaml` beside it, in the same form, which git ignores. On
-macOS, Docker Desktop and Podman share the Mac's files with whoever reads
-them inside, so the account writes them as the Mac's own user; macOS asks
-once whether Docker or Podman may open those folders. On a Linux host the
-files keep their owners, so the account needs the host user's uid to write
-there.
+desktops; what the desktop saves there lands on the host. Folders of
+your own go in `compose.local.yaml` beside it, in the same form, which git
+ignores. On a Linux host the files keep their owners, so the account needs
+the host user's uid to write there.
 
 ### More software
 
 Packages installed with `apt` inside a container are gone when the container
 is recreated. Software that should stay goes into the image, with
-`FARLAND_PACKAGES`:
-
-```sh
-FARLAND_PACKAGES="code dotnet-sdk-10.0 git build-essential" \
-FARLAND_USER=alice FARLAND_PASSWORD=secret \
-    docker compose -f packaging/container/compose.yaml up -d --build
-```
-
+`FARLAND_PACKAGES`, such as `code dotnet-sdk-10.0 git build-essential`.
 The package list is the last step of each image, so changing it rebuilds
 only that step. Microsoft's repository is set up in the images for VS Code
 (`code`); the .NET SDK comes from Ubuntu's archive. The images CI publishes
@@ -160,9 +135,8 @@ live on a volume (below) and survive a new image.
 | `accounts` / `plasma-accounts` | `/var/lib/AccountsService` | the users' pictures and languages |
 | `systemd` / `plasma-systemd` | `/var/lib/systemd` | systemd's own state; on a volume for Podman's sake (below) |
 
-`docker compose down` keeps the volumes and `down -v` deletes them. The
-two desktops have separate volumes, because they keep different settings
-in the same places.
+The two desktops have separate volumes, because they keep different
+settings in the same places.
 
 ### The GPU
 
@@ -194,31 +168,37 @@ virtual machine they run in on macOS, and one detail of Podman's storage.
 |---|---|---|---|
 | GNOME | works | works | should work |
 | Plasma | does not work: no render node | works | needs a GPU on the host |
-| Render node in the container | none | `renderD128`, a virtio-gpu; Mesa renders with llvmpipe on it | the host's |
-| Compose | `docker compose` | `podman compose` | either |
+| Render node in the container | none | a virtio-gpu, and vgem (below); Mesa renders with llvmpipe | the host's |
 
 - **The render node.** Docker Desktop's Linux VM has no GPU device, and its
   kernel has no DRM at all, not even vkms or vgem, so no render node can be
   made there; that is why Plasma does not run. Podman's libkrun provider
-  (krunkit) gives its VM a virtio-gpu, whose render node is all KWin needs.
-  Its Vulkan path to the Mac's GPU (Venus, MoltenVK, Metal) fails with
+  (krunkit) gives its VM a virtio-gpu, whose render node lets KWin composite
+  with OpenGL. That alone is not enough: Mesa renders into dumb buffers on
+  a GPU that cannot render itself, only a primary node hands those out,
+  and KWin uses the render node, so every other frame fails and the
+  picture freezes. KWin picks the primary node of vgem, the kernel's
+  virtual GPU, so the VM loads vgem (below), and the entrypoint lets the
+  account open it. Mutter manages on the virtio-gpu by itself. The Vulkan
+  path to the Mac's GPU (Venus, MoltenVK, Metal) fails with
   `VK_ERROR_OUT_OF_HOST_MEMORY`, so rendering stays on the CPU either way.
-- **Podman's overlay file system.** Under Podman, systemd cannot set up a
-  service's state directory on the container's own file system
-  (`Failed to set up special execution directory in /var/lib: No such
-  device`), which leaves logind and accounts-daemon down and every session
-  with them. `/var/lib/systemd` and `/var/lib/AccountsService` are on
-  volumes in `compose.yaml` for that reason. Docker does not need them.
+- **Podman's overlay file system.** Under Podman, systemd cannot set up the
+  state, cache or configuration directory a service asks for on the
+  container's own file system (`Failed to set up special execution
+  directory in /var/lib: No such device`), and the service fails. Of those
+  the images run, logind, accounts-daemon and farlandd have their
+  directories on volumes in `compose.yaml` (`/var/lib/systemd`,
+  `/var/lib/AccountsService`, `/var/lib/farland`); without logind, no
+  session starts at all. colord and upower, which a remote session has no
+  use for, are masked in the GNOME image. Docker does not need any of it.
+- **Processes and threads.** Podman allows a container 2048 tasks, and
+  systemd gives each user a third of what the container has: 675, which a
+  desktop with VS Code runs out of at once ("Resource temporarily
+  unavailable" when starting a thread). `compose.yaml` lifts the
+  container's limit (`pids_limit: -1`), and the entrypoint the user's.
+  Docker sets no limit to begin with.
 - **Rootful.** The Podman machine has to be rootful for a privileged systemd
   container.
-- **`podman compose`** runs an external compose provider: Docker's
-  `docker-compose` where Docker Desktop is installed, `podman-compose`
-  otherwise. It starts the containers in the Podman machine either way.
-- **Separate engines.** Docker and Podman keep separate images and volumes.
-  An image built in one reaches the other with
-  `docker save IMAGE | podman load`, or by building or pulling it there.
-  Both forward published ports to the Mac's `localhost`, so running GNOME in
-  Docker and Plasma in Podman at the same time works: their ports differ.
 
 ### Setting up Podman on macOS
 
@@ -228,8 +208,6 @@ from 1.2 on, and `podman machine start` fails with
 `krunkit exited unexpectedly with exit code 2`. krunkit's own release works:
 
 ```sh
-brew install podman
-
 # krunkit and its libraries, from the release made for Podman
 gh release download v1.3.2 -R containers/krunkit -p 'krunkit-podman-unsigned-*.tgz'
 mkdir -p ~/.local/opt/krunkit && tar xzf krunkit-podman-unsigned-*.tgz -C ~/.local/opt/krunkit
@@ -254,11 +232,14 @@ EOF
 
 podman machine init --provider libkrun --rootful --cpus 6 --memory 10240 farland-gpu
 podman machine start farland-gpu
-podman machine ssh farland-gpu ls -l /dev/dri      # renderD128
+# vgem, for Plasma (above), now and at every boot of the VM
+podman machine ssh farland-gpu 'echo vgem | sudo tee /etc/modules-load.d/vgem.conf && sudo modprobe vgem'
+podman machine ssh farland-gpu ls -l /dev/dri      # card0, card1, renderD128, renderD129
 ```
 
-Then `podman compose -f packaging/container/compose.yaml up -d plasma`, with
-the same variables as above.
+The containers see the devices the VM has when they are created, so one
+made before vgem was loaded needs to be made again. Both desktops together
+want more memory than the 10 GB above.
 
 ## Building the images
 
@@ -294,14 +275,16 @@ else can pull it.
 
 ## When it does not work
 
-- **Logs.** `docker exec farland-gnome-1 journalctl -u farlandd -b` (or
-  `farland-plasma-1`, or `podman exec`) shows the connection, the login and
-  the session starting. `systemctl --failed` inside the container lists what
-  did not start.
+- **Logs.** farlandd's journal in the container (`journalctl -u farlandd`)
+  shows the connection, the login and the session starting;
+  `systemctl --failed` lists what did not start.
 - **The client is disconnected right after logging in (Plasma):** no render
   node; see [The GPU](#the-gpu).
 - **Every session fails, and `systemctl --failed` lists logind (Podman):**
   a compose file without the `/var/lib/systemd` volume; see
+  [Docker and Podman](#docker-and-podman).
+- **Applications crash or fail to start, with "Resource temporarily
+  unavailable" (Podman):** the task limit; see
   [Docker and Podman](#docker-and-podman).
 - **FreeRDP gives up while the desktop starts:** `/timeout:60000`.
 - **The client asks about the certificate after every new container:** the

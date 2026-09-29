@@ -37,6 +37,10 @@ x-desktop: &desktop
   # Firefox and GTK share pictures through /dev/shm; Docker's 64 MB is too
   # little for a browser.
   shm_size: 2g
+  # No limit on processes and threads. Podman's default of 2048 is far too
+  # few for a desktop, and systemd gives each user a third of whatever the
+  # container has: 675 tasks, which VS Code alone runs out of.
+  pids_limit: -1
   environment:
     FARLAND_USER: ${FARLAND_USER:-farland}
     FARLAND_PASSWORD: ${FARLAND_PASSWORD:?set FARLAND_PASSWORD, the account's RDP and login password}
