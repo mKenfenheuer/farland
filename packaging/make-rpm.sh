@@ -35,6 +35,11 @@ tar -C "$source_dir" --exclude=.git --exclude='./build*' \
     --exclude='*.deb' --exclude='*.rpm' -cf - . | tar -C "$stage" -xf -
 tar -C "$top" -czf "$top/SOURCES/$name-$version.tar.gz" "$name-$version"
 cp "$spec" "$top/SPECS/"
+# A snapshot build (ci/snapshot-version.sh) goes into the release, which
+# keeps the version the sources carry: 0.0.1-1.r53.gcdaa096.fc44.
+if [ -n "${FARLAND_SNAPSHOT:-}" ]; then
+    sed -i "s/^\(Release: *[0-9][0-9]*\)/\1.$FARLAND_SNAPSHOT/" "$top/SPECS/$(basename "$spec")"
+fi
 
 rpmbuild --define "_topdir $top" -ba "$top/SPECS/$(basename "$spec")" >"$top/build.log" 2>&1 || {
     tail -40 "$top/build.log" >&2
@@ -42,6 +47,8 @@ rpmbuild --define "_topdir $top" -ba "$top/SPECS/$(basename "$spec")" >"$top/bui
 }
 
 mkdir -p "$out"
-package=$(find "$top/RPMS" -name '*.rpm' | head -1)
+# The package itself; rpmbuild also makes -debuginfo and -debugsource.
+package=$(find "$top/RPMS" -name "$name-$version-*.rpm" | head -1)
+[ -n "$package" ] || { echo "rpmbuild made no $name-$version package" >&2; exit 1; }
 cp "$package" "$out/"
 echo "$out/$(basename "$package")"

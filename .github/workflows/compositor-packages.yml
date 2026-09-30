@@ -229,7 +229,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) | sort)
+          # Without the debug symbols, which stay with the run's artifacts:
+          # they are many times the size of the packages.
+          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) \
+            ! -name '*-debug-*' ! -name '*-debuginfo-*' ! -name '*-debugsource-*' | sort)
           [ -n "$packages" ] || { echo "the builds produced no packages" >&2; exit 1; }
           echo "publishing:"; echo "$packages" | sed 's/^/  /'
           tag=continuous
@@ -244,4 +247,15 @@ jobs:
           # it and a run of it must not take it away.
           # shellcheck disable=SC2086 # one argument per package
           gh release upload "$tag" $packages --clobber
-          echo "published the compositor packages as $tag"
+          # The last build's compositor packages go once the new ones are
+          # there, since a new compositor version names its files anew:
+          # every asset that is not farland's own (farland*) and not in
+          # this upload.
+          new=$(for p in $packages; do basename "$p"; done)
+          gh release view "$tag" --json assets --jq '.assets[].name' | grep -v '^farland' |
+            while read -r asset; do
+              if ! echo "$new" | grep -qxF "$asset"; then
+                gh release delete-asset "$tag" "$asset" --yes
+                echo "removed the previous build's $asset"
+              fi
+            done

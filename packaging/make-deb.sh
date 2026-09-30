@@ -26,6 +26,9 @@ meson compile -C "$build"
 
 version=$(meson introspect --projectinfo "$build" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+# A snapshot build (ci/snapshot-version.sh) comes after the version it
+# builds on and before the next: 0.0.1+r53.gcdaa096.
+version=$version${FARLAND_SNAPSHOT:++$FARLAND_SNAPSHOT}
 revision=${DEB_REVISION:-1}
 arch=$(dpkg --print-architecture)
 stage=$(mktemp -d)

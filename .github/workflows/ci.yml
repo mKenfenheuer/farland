@@ -25,6 +25,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The package's snapshot version counts the commits.
+          fetch-depth: 0
       - name: Install dependencies
         run: sudo sh ci/install-deps.sh
       - name: Build (release, warnings as errors)
@@ -38,7 +41,7 @@ jobs:
       - name: Build the Debian package
         run: |
           sudo apt-get install -y --no-install-recommends dpkg-dev file
-          sh packaging/make-deb.sh build "$RUNNER_TEMP/pkg"
+          FARLAND_SNAPSHOT=$(sh ci/snapshot-version.sh) sh packaging/make-deb.sh build "$RUNNER_TEMP/pkg"
       - uses: actions/upload-artifact@v7
         with:
           name: farland-deb
@@ -55,12 +58,15 @@ jobs:
       - name: Install git, so the checkout is a git checkout
         run: dnf install -y git
       - uses: actions/checkout@v7
+        with:
+          # The package's snapshot version counts the commits.
+          fetch-depth: 0
       - name: Install the build dependencies from the spec
         run: |
           dnf install -y rpm-build dnf-command\(builddep\)
           dnf builddep -y packaging/farland.spec
       - name: Build the RPM
-        run: sh packaging/make-rpm.sh "$RUNNER_TEMP/pkg"
+        run: FARLAND_SNAPSHOT=$(sh ci/snapshot-version.sh) sh packaging/make-rpm.sh "$RUNNER_TEMP/pkg"
       - name: Show what the package holds
         run: |
           package=$(find "$RUNNER_TEMP/pkg" -name '*.rpm' | head -1)
@@ -159,8 +165,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          # One release carries what every distribution's build produced.
-          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) | sort)
+          # One release carries what every distribution's build produced,
+          # but not its debug symbols: each build's are ten to twenty times
+          # its package, and they stay with the workflow run's artifacts.
+          packages=$(find pkg -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.*' \) \
+            ! -name '*-debug-*' ! -name '*-debuginfo-*' ! -name '*-debugsource-*' | sort)
           [ -n "$packages" ] || { echo "the builds produced no packages" >&2; exit 1; }
           echo "publishing:"; echo "$packages" | sed 's/^/  /'
           if [ "${GITHUB_REF_TYPE:-branch}" = tag ]; then
@@ -184,5 +193,18 @@ jobs:
             fi
             # shellcheck disable=SC2086 # one argument per package
             gh release upload "$tag" $packages --clobber
+            # Every package name carries its build's version, so the last
+            # build's stay unless they go: farland's own, which are the
+            # assets named farland*, and not the compositor packages that
+            # workflow puts beside them. After the upload, so the release
+            # is never without a package.
+            new=$(for p in $packages; do basename "$p"; done)
+            gh release view "$tag" --json assets --jq '.assets[].name' | grep '^farland' |
+              while read -r asset; do
+                if ! echo "$new" | grep -qxF "$asset"; then
+                  gh release delete-asset "$tag" "$asset" --yes
+                  echo "removed the previous build's $asset"
+                fi
+              done
           fi
           echo "published as $tag"
